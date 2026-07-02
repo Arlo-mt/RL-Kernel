@@ -113,6 +113,7 @@ def get_extensions():
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
+            "csrc/cuda/batch_invariant_logp_kernel_sm90.cu",  # TMA batch-invariant logp
         ]
         enable_sm90 = os.environ.get("KERNEL_ALIGN_FORCE_SM90") == "1"
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]

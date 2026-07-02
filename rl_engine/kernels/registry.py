@@ -56,6 +56,9 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_BATCH_INVARIANT_LOGP = (
         "rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp.NativeBatchInvariantLogpOp"
     )
+    CUDA_BATCH_INVARIANT_LOGP_SM90 = (
+        "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp.BatchInvariantLogpSM90Op"
+    )
 
     # Generic fallback
     TRITON_GENERIC = "rl_engine.kernels.ops.triton.generic.TritonOp"
@@ -181,6 +184,13 @@ class KernelRegistry:
                 ll_list = self._priority_map["cuda"]["linear_logp"]
                 if OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90 not in ll_list:
                     ll_list.insert(0, OpBackend.CUDA_FUSED_LINEAR_LOGP_SM90)
+
+            # Batch-invariant logp SM90 kernel: same sm_90a TMA gating (Hopper only).
+            batch_inv_compiled = _EXT_AVAILABLE and hasattr(_C, "batch_invariant_logp_sm90")
+            if batch_inv_compiled and cc_major == 9:
+                bi_list = self._priority_map["cuda"]["batch_invariant_logp"]
+                if OpBackend.CUDA_BATCH_INVARIANT_LOGP_SM90 not in bi_list:
+                    bi_list.insert(0, OpBackend.CUDA_BATCH_INVARIANT_LOGP_SM90)
             elif cc >= 90:
                 logger.debug(
                     f"SM{cc}: fused TMA LogP kernel not compiled into _C; "
