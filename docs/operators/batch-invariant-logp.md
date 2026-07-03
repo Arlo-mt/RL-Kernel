@@ -71,29 +71,30 @@ benchmark reports Native vs Triton only.
 
 Environment: NVIDIA H200 (Hopper, SM90, cc 9.0), CUDA 12.8 / `nvcc` 12.8.93,
 PyTorch 2.11.0+cu128, `KERNEL_ALIGN_FORCE_SM90=1`. dtype bf16, 20 iters + 5
-warmup. "MB" is peak extra device memory above baseline.
+warmup. "MB" is peak extra device memory above baseline. Both tables are
+reproduced by `benchmarks/benchmark_batch_invariant_logp.py --backward`.
 
 **Forward**
 
 | shape (N x V) | native ms | triton ms | cuda ms | cuda vs native | cuda vs triton | native MB | triton MB | cuda MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4096 x 32768 | 1.341 | 0.148 | 0.090 | 14.8x | 1.64x | 1536 | 0 | 0 |
-| 4096 x 128256 | 4.964 | 0.566 | 0.323 | 15.4x | 1.75x | 6012 | 0 | 0 |
-| 4096 x 151936 | 5.908 | 0.669 | 0.384 | 15.4x | 1.74x | 7122 | 0 | 0 |
-| 8192 x 128256 | 9.904 | 1.056 | 0.597 | 16.6x | 1.77x | 12024 | 0 | 0 |
+| 4096 x 32768 | 1.355 | 0.148 | 0.091 | 14.9x | 1.63x | 1536 | 0 | 0 |
+| 4096 x 128256 | 5.011 | 0.567 | 0.324 | 15.5x | 1.75x | 6012 | 0 | 0 |
+| 4096 x 151936 | 5.961 | 0.669 | 0.384 | 15.5x | 1.74x | 7122 | 0 | 0 |
+| 8192 x 128256 | 9.991 | 1.056 | 0.597 | 16.7x | 1.77x | 12024 | 0 | 0 |
 
 **Forward + backward**
 
 | shape (N x V) | native ms | triton ms | cuda ms | cuda vs native | cuda vs triton | native MB | triton MB | cuda MB |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 4096 x 32768 | 3.549 | 0.463 | 0.407 | 8.7x | 1.14x | 1792 | 512 | 512 |
-| 4096 x 128256 | 13.173 | 1.750 | 1.510 | 8.7x | 1.16x | 7014 | 2004 | 2004 |
-| 4096 x 151936 | 15.632 | 2.072 | 1.788 | 8.7x | 1.16x | 8310 | 2376 | 2376 |
-| 8192 x 128256 | 26.211 | 3.416 | 2.955 | 8.9x | 1.16x | 14028 | 4008 | 4008 |
+| 4096 x 32768 | 3.400 | 0.305 | 0.242 | 14.1x | 1.26x | 1536 | 256 | 256 |
+| 4096 x 128256 | 12.581 | 1.117 | 0.871 | 14.5x | 1.28x | 6012 | 1002 | 1002 |
+| 4096 x 151936 | 14.943 | 1.319 | 1.032 | 14.5x | 1.28x | 7122 | 1188 | 1188 |
+| 8192 x 128256 | 25.036 | 2.144 | 1.684 | 14.9x | 1.27x | 12024 | 2004 | 2004 |
 
 - Forward: ~1.7x vs Triton, ~15x vs native, with ~0 extra VRAM — the vocab is
   reduced to per-row scalars, so no `[N, V]` intermediate is materialized.
-- Forward + backward: ~1.15x vs Triton, ~8.8x vs native, with memory equal to
+- Forward + backward: ~1.27x vs Triton, ~14x vs native, with memory equal to
   Triton. The backward's `[N, V]` cost is `grad_logits` itself (one gradient per
   input logit, unavoidable for any backend); the streamed backends avoid native's
   extra `[N, V]` `softmax` / `log_softmax` intermediates by recomputing from the

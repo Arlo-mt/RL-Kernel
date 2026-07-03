@@ -13,8 +13,13 @@ vocab sweep:
 - CUDA is the Hopper TMA online-softmax kernel (one CTA/row); only present when
   the extension is built with ``KERNEL_ALIGN_FORCE_SM90=1`` on an SM90 device.
 
+By default only the forward pass is timed; pass ``--backward`` to also emit the
+forward+backward table (grad w.r.t. logits). Timing uses ``torch.cuda`` events,
+so the benchmark runs on CUDA/ROCm devices.
+
 Usage:
     python benchmarks/benchmark_batch_invariant_logp.py
+    python benchmarks/benchmark_batch_invariant_logp.py --backward
     python benchmarks/benchmark_batch_invariant_logp.py --configs "4096,128256;8192,151936"
 """
 
@@ -74,7 +79,7 @@ def _time_ms(fn, warmup, iters):
     return start.elapsed_time(end) / iters
 
 
-def _peak_vram_gb(fn, warmup=3, iters=5):
+def _peak_vram_gb(fn, warmup, iters):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -87,75 +92,110 @@ def _peak_vram_gb(fn, warmup=3, iters=5):
     return (torch.cuda.max_memory_allocated() - baseline) / (1024**3)
 
 
-def run_benchmark(args):
-    if device_ctx.device_type not in ["cuda", "xpu", "hip"]:
-        raise RuntimeError("batch_invariant_logp benchmark requires a compatible GPU device.")
+def _forward_closure(op, logits, target):
+    def run():
+        with torch.no_grad():
+            op(logits, target, validate=False)
 
-    device = device_ctx.device
-    dtype = torch.bfloat16
-    native = NativeBatchInvariantLogpOp()
-    triton_op = TritonBatchInvariantLogpOp()
-    sm90_op = _maybe_sm90_op()
+    return run
 
-    logger.info(
-        f"batch_invariant_logp benchmark on {device} (dtype={dtype}); "
-        f"SM90 TMA backend {'enabled' if sm90_op is not None else 'unavailable'}"
-    )
 
+def _forward_backward_closure(op, logits, target):
+    # Fresh leaf each call so the grad is allocated (and freed) per iteration,
+    # matching a real training step and giving an honest peak-VRAM reading.
+    def run():
+        x = logits.detach().requires_grad_(True)
+        op(x, target, validate=False).sum().backward()
+
+    return run
+
+
+def _bench_table(configs, backends, closure_factory, device, dtype, warmup, iters):
+    """Build a github-markdown table timing each backend, plus CUDA speedups.
+
+    ``backends`` is ``(native_op, triton_op, sm90_op_or_None)``; ``closure_factory``
+    maps ``(op, logits, target) -> callable`` (forward-only or forward+backward).
+    """
+    native, triton_op, sm90_op = backends
+    label = "fwd" if closure_factory is _forward_closure else "fwd+bwd"
     rows = []
-    for num_tokens, vocab in args.configs:
+    for num_tokens, vocab in configs:
         logits, target = _make_inputs(num_tokens, vocab, device, dtype)
+        n_c = closure_factory(native, logits, target)
+        t_c = closure_factory(triton_op, logits, target)
 
-        def fwd(op, x=logits, t=target):
-            with torch.no_grad():
-                op(x, t, validate=False)
-
-        n_fwd = _time_ms(lambda: fwd(native), args.warmup, args.iters)
-        t_fwd = _time_ms(lambda: fwd(triton_op), args.warmup, args.iters)
-        n_vram = _peak_vram_gb(lambda: fwd(native))
-        t_vram = _peak_vram_gb(lambda: fwd(triton_op))
+        n_ms = _time_ms(n_c, warmup, iters)
+        t_ms = _time_ms(t_c, warmup, iters)
+        n_mb = _peak_vram_gb(n_c, warmup, iters) * 1024
+        t_mb = _peak_vram_gb(t_c, warmup, iters) * 1024
 
         row = [
             f"{num_tokens}x{vocab}",
-            f"{n_fwd:.3f}",
-            f"{t_fwd:.3f}",
-            f"{n_fwd/t_fwd:.2f}x",
-            f"{n_vram*1024:.0f}",
-            f"{t_vram*1024:.0f}",
+            f"{n_ms:.3f}",
+            f"{t_ms:.3f}",
+            f"{n_ms/t_ms:.2f}x",
+            f"{n_mb:.0f}",
+            f"{t_mb:.0f}",
         ]
         if sm90_op is not None:
-            s_fwd = _time_ms(lambda: fwd(sm90_op), args.warmup, args.iters)
-            s_vram = _peak_vram_gb(lambda: fwd(sm90_op))
-            row += [
-                f"{s_fwd:.3f}",
-                f"{n_fwd/s_fwd:.2f}x",
-                f"{t_fwd/s_fwd:.2f}x",
-                f"{s_vram*1024:.0f}",
-            ]
+            s_c = closure_factory(sm90_op, logits, target)
+            s_ms = _time_ms(s_c, warmup, iters)
+            s_mb = _peak_vram_gb(s_c, warmup, iters) * 1024
+            row += [f"{s_ms:.3f}", f"{n_ms/s_ms:.2f}x", f"{t_ms/s_ms:.2f}x", f"{s_mb:.0f}"]
         rows.append(row)
 
     headers = [
         "shape (N x V)",
-        "native fwd ms",
-        "triton fwd ms",
-        "fwd speedup",
-        "native fwd MB",
-        "triton fwd MB",
+        f"native {label} ms",
+        f"triton {label} ms",
+        f"{label} speedup",
+        f"native {label} MB",
+        f"triton {label} MB",
     ]
     if sm90_op is not None:
-        headers += [
-            "cuda fwd ms",
-            "cuda vs native",
-            "cuda vs triton",
-            "cuda fwd MB",
-        ]
+        headers += [f"cuda {label} ms", "cuda vs native", "cuda vs triton", f"cuda {label} MB"]
     print(tabulate(rows, headers=headers, tablefmt="github"))
+
+
+def run_benchmark(args):
+    if device_ctx.device_type not in ["cuda", "hip"]:
+        raise RuntimeError(
+            "batch_invariant_logp benchmark requires a CUDA/ROCm GPU (uses torch.cuda timing)."
+        )
+
+    device = device_ctx.device
+    dtype = torch.bfloat16
+    backends = (NativeBatchInvariantLogpOp(), TritonBatchInvariantLogpOp(), _maybe_sm90_op())
+
+    logger.info(
+        f"batch_invariant_logp benchmark on {device} (dtype={dtype}); "
+        f"SM90 TMA backend {'enabled' if backends[2] is not None else 'unavailable'}"
+    )
+
+    print("Forward")
+    _bench_table(args.configs, backends, _forward_closure, device, dtype, args.warmup, args.iters)
+    if args.backward:
+        print("\nForward + backward")
+        _bench_table(
+            args.configs,
+            backends,
+            _forward_backward_closure,
+            device,
+            dtype,
+            args.warmup,
+            args.iters,
+        )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        help="Also time and measure a forward+backward pass (grad w.r.t. logits).",
+    )
     parser.add_argument(
         "--configs",
         type=str,

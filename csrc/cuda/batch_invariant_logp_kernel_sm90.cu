@@ -5,6 +5,7 @@
 // logp[n] = logits[n, target[n]] - logsumexp(logits[n, :])
 
 #include "../utils/tma_utils.cuh"
+#include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -31,7 +32,7 @@ __global__ void batch_invariant_logp_sm90_kernel(const __grid_constant__ CUtenso
                                                  float *__restrict__ output_lse, int num_tokens,
                                                  int vocab_size, int ignore_index) {
     constexpr int NUM_THREADS = NUM_WARPS * 32;
-    
+
     // one CTA per row; each warp streams a TMA tile of the row into shared memory
     const int tid = threadIdx.x;
     const int row_idx = blockIdx.x;
@@ -180,6 +181,9 @@ std::vector<torch::Tensor> batch_invariant_logp_sm90_forward(torch::Tensor logit
                                                              torch::Tensor target,
                                                              int64_t ignore_index) {
     TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
+    const c10::cuda::CUDAGuard device_guard(logits.device());
+    TORCH_CHECK(target.is_cuda() && target.device() == logits.device(),
+                "target must be a CUDA tensor on the same device as logits");
     TORCH_CHECK(logits.dim() == 2, "logits must be 2-D [N, V]");
     TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous");
     const int N = logits.size(0);
