@@ -10,8 +10,8 @@ from typing import Any
 
 import torch
 
-from rl_engine.kernels.gtest.operator_inputs import make_operator_inputs, operator_shape_name
 from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase
+from rl_engine.kernels.gtest.operator_inputs import make_operator_inputs, operator_shape_name
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,18 @@ OP_SPECS = {
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op",
         },
         grad_input_names=("hidden", "lm_head_weight"),
+    ),
+    "det_gemm": OperatorSpec(
+        name="det_gemm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+        gold_method="__call__",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+            "cuda": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+            "triton": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+        },
+        grad_input_names=("a", "b"),
     ),
 }
 
