@@ -93,18 +93,41 @@ def _make_attention_inputs(
     args: argparse.Namespace, dtype: torch.dtype, device: torch.device
 ) -> dict[str, Any]:
     batch, seq = _batch_seq(args)
-    return {
+    skv = _arg_int(args, "skv", seq)
+    n_heads = _arg_int(args, "n_heads", DEFAULT_N_HEADS)
+    n_kv_heads = _arg_int(args, "n_kv_heads", DEFAULT_N_KV_HEADS)
+    causal = bool(_arg_int(args, "causal", 1))
+    use_padding = bool(_arg_int(args, "use_padding", 0))
+    scale_mode = _arg_str(args, "scale_mode", "default")
+
+    inputs: dict[str, Any] = {
         "q": _floating_tensor(
-            (batch, DEFAULT_N_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
+            (batch, n_heads, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
         ),
         "k": _floating_tensor(
-            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 1
+            (batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 1
         ),
         "v": _floating_tensor(
-            (batch, DEFAULT_N_KV_HEADS, seq, DEFAULT_HEAD_DIM), args, dtype, device, 2
+            (batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 2
         ),
-        "causal": True,
+        "causal": causal,
     }
+
+    if scale_mode == "zero":
+        inputs["scale"] = 0.0
+    elif scale_mode == "custom":
+        inputs["scale"] = 0.05
+    # else: scale_mode == "default" -> no scale kwarg (uses 1/sqrt(D))
+
+    if use_padding:
+        generator = _generator(args, device, offset=42)
+        key_padding_mask = torch.rand(
+            (batch, skv), generator=generator, device=device
+        ) > 0.3
+        key_padding_mask[:, 0] = True
+        inputs["key_padding_mask"] = key_padding_mask
+
+    return inputs
 
 
 def _make_logp_inputs(
