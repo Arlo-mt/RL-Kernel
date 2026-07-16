@@ -3,32 +3,20 @@
 
 """Tests for the fused masking + pack-and-pad op (issue #42).
 
-The PyTorch-native op is the portable reference that defines the numerical
-contract for the Triton / CUDA / ROCm native kernels. Native correctness is
-checked against ``SyntheticRLKernelBatch.compact_completion_values`` (the
-canonical compaction already used elsewhere in the repo) and a plain
-index-based reference; the Triton op is validated against the native op.
-Native tests run on CPU; Triton tests require a CUDA/ROCm device.
+The PyTorch-native op is checked against
+``SyntheticRLKernelBatch.compact_completion_values`` (the canonical compaction
+already used elsewhere in the repo) and a plain index-based reference. The
+same implementation is registered on CPU, CUDA, and ROCm because the removed
+custom Triton path was slower than PyTorch's optimized indexing primitives.
 """
 
 import pytest
 import torch
 
 from rl_engine.kernels.ops.pytorch.packing.pack import NativePackOp
-from rl_engine.kernels.ops.triton.packing.pack import TritonPackOp
 from rl_engine.testing import make_synthetic_rl_kernel_batch
 
-try:
-    import triton  # noqa: F401
-
-    _HAS_TRITON = True
-except ImportError:  # pragma: no cover
-    _HAS_TRITON = False
-
-requires_triton_cuda = pytest.mark.skipif(
-    not (_HAS_TRITON and torch.cuda.is_available()),
-    reason="Triton pack op requires a CUDA device and Triton.",
-)
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 _NUM_PROMPTS = 3
 _SPP = 4
@@ -119,6 +107,7 @@ def test_pack_all_active_is_identity_flatten():
     packed, _ = op(x, batch.completion_mask)
     assert packed.shape[0] == batch.batch_size * batch.completion_len
     assert torch.equal(packed, x.reshape(-1, x.shape[-1]))
+    assert packed.data_ptr() != x.data_ptr()
 
 
 def test_pack_none_active_is_empty():
@@ -129,6 +118,19 @@ def test_pack_none_active_is_empty():
     packed, cu_seqlens = op(x, batch.completion_mask)
     assert packed.shape[0] == 0
     assert int(cu_seqlens[-1].item()) == 0
+
+
+@pytest.mark.parametrize("valid_density", [0.0, 1.0])
+def test_pack_fast_paths_backward(valid_density):
+    batch = _batch(seed=40, valid_density=valid_density)
+    x = _dense(batch, seed=140).requires_grad_(True)
+    packed, _ = NativePackOp()(x, batch.completion_mask)
+
+    packed.sum().backward()
+
+    expected = batch.completion_mask.unsqueeze(-1).expand_as(x).to(x.dtype)
+    assert x.grad is not None
+    assert torch.equal(x.grad, expected)
 
 
 # unpack / round-trip
@@ -145,6 +147,14 @@ def test_unpack_round_trip_zeros_inactive():
     # Active positions are restored exactly; inactive positions are zeroed.
     assert torch.equal(restored[active], x[active])
     assert torch.all(restored[~active] == 0.0)
+
+
+def test_unpack_rejects_mismatched_explicit_tail_shape():
+    packed = torch.randn(3, 4)
+    mask = torch.tensor([[True, False], [True, True]])
+
+    with pytest.raises(ValueError, match="tail_shape"):
+        NativePackOp.unpack(packed, mask, tail_shape=(2, 2))
 
 
 # backward (scatter) correctness
@@ -199,76 +209,35 @@ def test_pack_rejects_mismatched_mask_shape():
         op(x, bad_mask)
 
 
+@pytest.mark.parametrize("bad_mask", [torch.ones(6, dtype=torch.bool), torch.ones(2, 3, 1)])
+def test_pack_requires_2d_mask(bad_mask):
+    x = torch.randn(2, 3, 4)
+
+    with pytest.raises(ValueError, match=r"\[B, S\]"):
+        NativePackOp()(x, bad_mask)
+
+
+@requires_cuda
+def test_pack_rejects_device_mismatch():
+    x = torch.randn(2, 3, 4, device="cuda")
+    mask = torch.ones(2, 3, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="same device"):
+        NativePackOp()(x, mask)
+
+
+@requires_cuda
+def test_unpack_rejects_device_mismatch():
+    packed = torch.randn(3, 4, device="cuda")
+    mask = torch.tensor([[True, False], [True, True]])
+
+    with pytest.raises(ValueError, match="same device"):
+        NativePackOp.unpack(packed, mask)
+
+
 # registry dispatch
 def test_registry_dispatches_pack():
     from rl_engine.kernels.registry import kernel_registry
 
     op = kernel_registry.get_op("pack")
-    if _HAS_TRITON and torch.cuda.is_available():
-        assert isinstance(op, TritonPackOp)
-    else:
-        assert isinstance(op, NativePackOp)
-
-
-# Triton fused op (validated against the native reference)
-@requires_triton_cuda
-@pytest.mark.parametrize("valid_density", [1.0, 0.7, 0.0])
-def test_triton_forward_matches_native(valid_density):
-    batch = _batch(seed=10, device="cuda", valid_density=valid_density)
-    x = _dense(batch, seed=110, device="cuda")
-    packed_t, cu_t = TritonPackOp()(x, batch.completion_mask)
-    packed_n, cu_n = NativePackOp()(x, batch.completion_mask)
-    assert torch.equal(packed_t, packed_n)
-    assert torch.equal(cu_t, cu_n)
-
-
-@requires_triton_cuda
-def test_triton_backward_matches_native():
-    batch = _batch(seed=11, device="cuda", valid_density=0.7)
-    x0 = _dense(batch, seed=111, device="cuda")
-    g = torch.randn(int(batch.completion_mask.sum()), _VOCAB, device="cuda")
-
-    xt = x0.clone().requires_grad_(True)
-    pt, _ = TritonPackOp()(xt, batch.completion_mask)
-    pt.backward(g)
-
-    xn = x0.clone().requires_grad_(True)
-    pn, _ = NativePackOp()(xn, batch.completion_mask)
-    pn.backward(g)
-
-    assert xt.grad is not None
-    assert torch.equal(xt.grad, xn.grad)
-
-
-@requires_triton_cuda
-def test_triton_supports_multidim_tail():
-    mask = torch.tensor([[True, False, True], [False, True, True]], device="cuda")
-    x = torch.randn(2, 3, 4, 5, device="cuda")
-    packed_t, cu_t = TritonPackOp()(x, mask)
-    packed_n, cu_n = NativePackOp()(x, mask)
-    assert packed_t.shape == (4, 4, 5)
-    assert torch.equal(packed_t, packed_n)
-    assert cu_t.tolist() == [0, 2, 4]
-
-
-@requires_triton_cuda
-def test_triton_inactive_rows_do_not_leak():
-    """Garbage values at masked rows must not appear in the packed output."""
-    batch = _batch(seed=12, device="cuda", valid_density=0.6)
-    x = _dense(batch, seed=112, device="cuda")
-    inactive = ~batch.completion_mask.unsqueeze(-1).expand_as(x)
-    x_pert = x.clone()
-    x_pert[inactive] = 1e9
-
-    base, _ = TritonPackOp()(x, batch.completion_mask)
-    pert, _ = TritonPackOp()(x_pert, batch.completion_mask)
-    assert torch.equal(base, pert)
-
-
-@requires_triton_cuda
-def test_triton_requires_gpu_tensor():
-    op = TritonPackOp()
-    x = torch.randn(2, 3, 4)
-    mask = torch.ones(2, 3, dtype=torch.bool)
-    with pytest.raises(RuntimeError):
-        op(x, mask)
+    assert isinstance(op, NativePackOp)

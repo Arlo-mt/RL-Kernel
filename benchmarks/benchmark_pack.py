@@ -5,8 +5,11 @@
 
 Two measurements per shape:
 
-1. Pack latency: TritonPackOp vs a PyTorch boolean-index baseline
-   (``x.reshape(-1, T)[mask]``), with max-abs drift between the two.
+1. Pack latency: the registered production PackOp vs a PyTorch boolean-index
+   pack-only lower bound (``x.reshape(-1, T)[mask]``), with max-abs drift.
+   The production op also returns ``cu_seqlens``, so the baseline intentionally
+   excludes part of the public contract and should not be read as an equivalent
+   replacement.
 2. End-to-end peak VRAM: the motivation behind #42. Computing selected
    log-probs on the *dense* ``[B, S, V]`` tensor materializes full-sequence
    logits for masked-out tokens; packing first lets the log-prob run only on
@@ -158,7 +161,7 @@ def _selected_logp(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
 
 
 def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
-    candidate_name = "TritonPackOp"
+    candidate_name = "registered PackOp"
 
     batch = make_synthetic_rl_kernel_batch(
         num_prompts=config.num_prompts,
@@ -205,49 +208,54 @@ def _pack_row(config: BenchmarkConfig) -> dict[str, Any]:
         repeat=config.repeat,
     )
 
-    if config.device.type != "cuda":
+    try:
+        from rl_engine.kernels.registry import kernel_registry
+
+        candidate_op = kernel_registry.get_op("pack")
+        candidate_name = candidate_op.__class__.__name__
+    except (ImportError, RuntimeError) as exc:
         status = "blocked"
-        notes = "candidate requires CUDA"
+        notes = f"candidate unavailable: {str(exc).splitlines()[0]}"
     else:
-        try:
-            from rl_engine.kernels.registry import kernel_registry
+        (cand_packed, cand_cu_seqlens), candidate_ms = _time_ms(
+            lambda: candidate_op(hidden, mask),
+            config.device,
+            warmup=config.warmup,
+            repeat=config.repeat,
+        )
+        speedup = baseline_ms / candidate_ms if candidate_ms else float("inf")
+        pack_drift = (cand_packed.float() - base_packed.float()).abs().max().item()
 
-            candidate_op = kernel_registry.get_op("pack")
-            if candidate_op.__class__.__name__ != candidate_name:
-                raise RuntimeError(f"{candidate_name} backend is unavailable")
+        # Timing outputs must not leak into either peak-memory measurement.
+        del base_packed, cand_packed, cand_cu_seqlens
 
-            (cand_packed, _), candidate_ms = _time_ms(
-                lambda: candidate_op(hidden, mask),
-                config.device,
-                warmup=config.warmup,
-                repeat=config.repeat,
-            )
-            speedup = baseline_ms / candidate_ms if candidate_ms else float("inf")
-            pack_drift = (cand_packed.float() - base_packed.float()).abs().max().item()
+        # (2) end-to-end peak VRAM: dense (full logits) vs pack-then-project.
+        flat_ids = ids.reshape(-1)
+        _reset_peak(config.device)
+        dense_logits = hidden.reshape(-1, hidden_dim) @ lm_head
+        dense_logp = _selected_logp(dense_logits, flat_ids)
+        _sync(config.device)
+        dense_logp_mem_gb = _peak_memory_gb(config.device)
+        del dense_logits, dense_logp
 
-            # (2) end-to-end peak VRAM: dense (full logits) vs pack-then-project.
-            flat_ids = ids.reshape(-1)
-            _reset_peak(config.device)
-            dense_logits = hidden.reshape(-1, hidden_dim) @ lm_head
-            _ = _selected_logp(dense_logits, flat_ids)
-            del dense_logits
-            _sync(config.device)
-            dense_logp_mem_gb = _peak_memory_gb(config.device)
+        _reset_peak(config.device)
+        packed_hidden, packed_cu = candidate_op(hidden, mask)
+        packed_ids, packed_ids_cu = candidate_op(ids.unsqueeze(-1), mask)
+        packed_logits = packed_hidden @ lm_head
+        packed_logp = _selected_logp(packed_logits, packed_ids.squeeze(-1))
+        _sync(config.device)
+        packed_logp_mem_gb = _peak_memory_gb(config.device)
+        del (
+            packed_logits,
+            packed_hidden,
+            packed_ids,
+            packed_logp,
+            packed_cu,
+            packed_ids_cu,
+        )
 
-            _reset_peak(config.device)
-            packed_hidden, _ = candidate_op(hidden, mask)
-            packed_ids, _ = candidate_op(ids.unsqueeze(-1), mask)
-            packed_logits = packed_hidden @ lm_head
-            _ = _selected_logp(packed_logits, packed_ids.squeeze(-1))
-            del packed_logits, packed_hidden
-            _sync(config.device)
-            packed_logp_mem_gb = _peak_memory_gb(config.device)
-
-            if dense_logp_mem_gb > 0:
-                mem_saving_pct = 100.0 * (1.0 - packed_logp_mem_gb / dense_logp_mem_gb)
-        except Exception as exc:
-            status = "blocked"
-            notes = f"candidate unavailable: {str(exc).splitlines()[0]}"
+        if dense_logp_mem_gb > 0:
+            mem_saving_pct = 100.0 * (1.0 - packed_logp_mem_gb / dense_logp_mem_gb)
 
     metadata = batch.benchmark_metadata()
     timing_mode = "cuda_event_median_ms" if config.device.type == "cuda" else "wall_median_ms"
@@ -296,6 +304,30 @@ def _write_rows(rows: list[dict[str, Any]], output: Path | None) -> None:
         if not exists:
             writer.writeheader()
         writer.writerows(rows)
+
+
+def _blank_row(
+    config: BenchmarkConfig, *, candidate: str, status: str, notes: str
+) -> dict[str, Any]:
+    row: dict[str, Any] = {column: "" for column in CSV_COLUMNS}
+    row.update(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "case": config.case,
+            "candidate": candidate,
+            "device": str(config.device),
+            "dtype": str(config.dtype),
+            "num_prompts": config.num_prompts,
+            "samples_per_prompt": config.samples_per_prompt,
+            "completion_len": config.completion_len,
+            "vocab_size": config.vocab_size,
+            "hidden_dim": config.hidden_dim,
+            "mask_density": config.mask_density,
+            "status": status,
+            "notes": notes,
+        }
+    )
+    return row
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -364,29 +396,12 @@ def main() -> None:
                         rows.append(_pack_row(config))
                     except torch.cuda.OutOfMemoryError as exc:
                         rows.append(
-                            {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "case": args.case,
-                                "candidate": "TritonPackOp",
-                                "device": str(device),
-                                "dtype": str(dtype),
-                                "num_prompts": num_prompts,
-                                "samples_per_prompt": samples_per_prompt,
-                                "completion_len": completion_len,
-                                "vocab_size": vocab_size,
-                                "hidden_dim": hidden_dim,
-                                "mask_density": mask_density,
-                                "valid_tokens": "",
-                                "baseline_ms": "",
-                                "candidate_ms": "",
-                                "speedup": "",
-                                "pack_drift": "",
-                                "dense_logp_mem_gb": "",
-                                "packed_logp_mem_gb": "",
-                                "mem_saving_pct": "",
-                                "status": "oom",
-                                "notes": str(exc),
-                            }
+                            _blank_row(
+                                config,
+                                candidate="registered PackOp",
+                                status="oom",
+                                notes=str(exc),
+                            )
                         )
 
     _write_rows(rows, args.output)

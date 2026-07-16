@@ -25,8 +25,13 @@ import torch
 
 
 def _validate(x: torch.Tensor, mask: torch.Tensor) -> None:
-    if mask.dim() < 1:
-        raise ValueError("mask must have at least one dimension.")
+    if mask.dim() != 2:
+        raise ValueError(f"mask must have shape [B, S], got {tuple(mask.shape)}.")
+    if x.device != mask.device:
+        raise ValueError(
+            f"x and mask must be on the same device, got x on {x.device} "
+            f"and mask on {mask.device}."
+        )
     if mask.shape != x.shape[: mask.dim()]:
         raise ValueError(
             f"mask shape {tuple(mask.shape)} must match the leading dims of "
@@ -46,9 +51,6 @@ class _PackFunction(torch.autograd.Function):
         flat_mask = mask.reshape(-1).to(torch.bool)
         flat_x = x.reshape(-1, *tail_shape) if tail_shape else x.reshape(-1)
 
-        index = flat_mask.nonzero(as_tuple=False).squeeze(-1)
-        packed = flat_x.index_select(0, index)
-
         # cu_seqlens: prefix-sum of per-row active counts, for varlen consumers.
         # Count from the bool mask so a non-bool mask (e.g. {0, 2}) matches the
         # number of rows actually packed above (nonzero == active).
@@ -57,7 +59,25 @@ class _PackFunction(torch.autograd.Function):
         cu_seqlens = torch.zeros(mask.shape[0] + 1, dtype=torch.int64, device=x.device)
         torch.cumsum(per_row_active, dim=0, out=cu_seqlens[1:])
 
-        ctx.save_for_backward(index)
+        # The packed allocation is data-dependent, so nonzero() is an
+        # intentional synchronization point. Reuse its output shape to select
+        # the all-active/none-active fast paths without a second .item() sync.
+        index = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        active_rows = index.shape[0]
+        ctx.all_active = active_rows == flat_mask.numel()
+        ctx.none_active = active_rows == 0
+        if ctx.all_active:
+            # Preserve the normal pack contract: callers may mutate the packed
+            # tensor without changing the dense input.
+            packed = flat_x.clone()
+            ctx.save_for_backward()
+        elif ctx.none_active:
+            packed = flat_x[:0]
+            ctx.save_for_backward()
+        else:
+            packed = flat_x.index_select(0, index)
+            ctx.save_for_backward(index)
+
         ctx.flat_rows = flat_x.shape[0]
         ctx.tail_shape = tail_shape
         ctx.x_shape = tuple(x.shape)
@@ -66,13 +86,17 @@ class _PackFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_packed: torch.Tensor, grad_cu_seqlens):
-        (index,) = ctx.saved_tensors
         tail_shape = ctx.tail_shape
+
+        if ctx.all_active:
+            return grad_packed.reshape(ctx.x_shape), None
 
         grad_flat = grad_packed.new_zeros(
             (ctx.flat_rows, *tail_shape) if tail_shape else (ctx.flat_rows,)
         )
-        grad_flat.index_copy_(0, index, grad_packed)
+        if not ctx.none_active:
+            (index,) = ctx.saved_tensors
+            grad_flat.index_copy_(0, index, grad_packed)
         grad_x = grad_flat.reshape(ctx.x_shape)
         # grad w.r.t. mask is undefined (boolean selector).
         return grad_x, None
@@ -103,8 +127,20 @@ class NativePackOp:
         This is the explicit (non-autograd) inverse used by diagnostics; the
         backward pass of :class:`_PackFunction` performs the same scatter.
         """
+        if mask.dim() != 2:
+            raise ValueError(f"mask must have shape [B, S], got {tuple(mask.shape)}.")
+        if packed.device != mask.device:
+            raise ValueError(
+                f"packed and mask must be on the same device, got packed on "
+                f"{packed.device} and mask on {mask.device}."
+            )
         flat_mask = mask.reshape(-1).to(torch.bool)
         tail = tuple(packed.shape[1:]) if tail_shape is None else tuple(tail_shape)
+        if tail_shape is not None and tail != tuple(packed.shape[1:]):
+            raise ValueError(
+                f"tail_shape {tail} must match packed trailing shape "
+                f"{tuple(packed.shape[1:])}."
+            )
         out = packed.new_zeros((flat_mask.numel(), *tail))
         index = flat_mask.nonzero(as_tuple=False).squeeze(-1)
         out.index_copy_(0, index, packed)
