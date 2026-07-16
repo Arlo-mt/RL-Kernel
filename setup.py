@@ -153,7 +153,7 @@ setup(
         "tabulate",
         "numpy",
         "accelerate",
-        "transformers",
+        "transformers<5",
     ],
     ext_modules=get_extensions(),
     cmdclass=get_cmdclass(),
