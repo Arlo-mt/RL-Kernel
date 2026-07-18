@@ -78,6 +78,7 @@ def get_extensions():
             "csrc/ops.cpp",
             "csrc/fused_logp_kernel.cu",
             "csrc/deterministic_logp_kernel.cu",
+            "csrc/rope_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
         ]
 

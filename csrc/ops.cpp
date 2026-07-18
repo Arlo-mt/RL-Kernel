@@ -61,6 +61,8 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
+// RoPE (rotate-half) apply; cos/sin precomputed fp32, sin_sign = +1 fwd / -1 bwd.
+torch::Tensor rope_apply_cuda(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, double sin_sign);
 torch::Tensor fused_logp_forward_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor output);
 torch::Tensor fused_logp_forward_fp32(torch::Tensor logits, torch::Tensor token_ids);
 torch::Tensor fused_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
@@ -166,6 +168,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_fp32", &deterministic_logp_forward_fp32, "Batch-invariant deterministic logp fp32");
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
+
+    // RoPE rotate-half apply (forward and backward share the kernel via sin_sign)
+    m.def("rope_apply", &rope_apply_cuda, "RoPE rotate-half apply (GPT-NeoX), CUDA");
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
