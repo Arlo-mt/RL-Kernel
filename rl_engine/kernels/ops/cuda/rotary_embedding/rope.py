@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Custom CUDA RoPE op (GPT-NeoX rotate-half), matching NativeRoPEOp.
+"""Custom CUDA RoPE op for SM90 (GPT-NeoX rotate-half), matching NativeRoPEOp.
 
 cos/sin are built in fp32 with the exact reference math and passed to a small
-CUDA kernel (``_C.rope_apply``) that does the per-position rotation. Backward
+CUDA kernel (``_C.rope_apply_sm90``) that does the per-position rotation. Backward
 reuses the same kernel with the sine negated (RoPE is an orthogonal rotation, so
 ``grad_x = grad_out * cos - rotate_half(grad_out) * sin``).
 """
@@ -47,7 +47,7 @@ class _RoPEFunction(torch.autograd.Function):
             )
         cos, sin = _build_cos_sin(positions, D // 2, float(theta), x.device)
         ctx.save_for_backward(cos, sin)
-        out = _C.rope_apply(x_2d, cos, sin, 1.0)
+        out = _C.rope_apply_sm90(x_2d, cos, sin, 1.0)
         return out.reshape(x.shape)
 
     @staticmethod
@@ -58,33 +58,33 @@ class _RoPEFunction(torch.autograd.Function):
             D = grad_out.shape[-1]
             g_2d = grad_out.contiguous().reshape(-1, D)
             # Inverse rotation: same kernel with the sine negated.
-            grad_x = _C.rope_apply(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
+            grad_x = _C.rope_apply_sm90(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
         # Inputs: x, positions, theta.
         return grad_x, None, None
 
 
-class RoPECudaOp:
-    """Custom CUDA RoPE op (GPT-NeoX rotate-half), differentiable w.r.t. ``x``.
+class RoPESM90Op:
+    """Custom CUDA RoPE op for SM90 (GPT-NeoX rotate-half), differentiable w.r.t. ``x``.
 
     Qwen3 defaults: theta=1e6, head_dim=128, full-dimension rotation. cos/sin are
     computed in fp32 from ``positions`` and ``theta`` (matching the reference); the
-    rotation runs in the precompiled ``_C.rope_apply`` CUDA kernel.
+    rotation runs in the precompiled ``_C.rope_apply_sm90`` CUDA kernel.
     """
 
     op_class = "elementwise"
 
     def __init__(self) -> None:
-        if not _EXT_AVAILABLE or not hasattr(_C, "rope_apply"):
+        if not _EXT_AVAILABLE or not hasattr(_C, "rope_apply_sm90"):
             raise RuntimeError(
-                "CUDA RoPE kernel 'rope_apply' is not compiled into _C. "
-                "Rebuild the extension with 'pip install -e .'."
+                "CUDA RoPE kernel 'rope_apply_sm90' is not compiled into _C. "
+                "Rebuild the extension with 'KERNEL_ALIGN_FORCE_SM90=1 pip install -e .'."
             )
-        logger.info("Successfully linked to precompiled _C.rope_apply kernel.")
+        logger.info("Successfully linked to precompiled _C.rope_apply_sm90 kernel.")
 
     def __call__(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
         return self.forward(x, positions, theta=theta)
 
     def forward(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
         if x.device.type != "cuda":
-            raise RuntimeError(f"RoPECudaOp requires a CUDA tensor, got device '{x.device}'.")
+            raise RuntimeError(f"RoPESM90Op requires a CUDA tensor, got device '{x.device}'.")
         return _RoPEFunction.apply(x, positions, theta)

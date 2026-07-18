@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 RL-Kernel Contributors
 //
-// CUDA RoPE kernel (GPT-NeoX / HF rotate-half), matching NativeRoPEOp.
+// CUDA RoPE kernel for SM90 (GPT-NeoX / HF rotate-half), matching NativeRoPEOp.
 //
 // For a row (one [B, H, S] token vector of width D, half = D / 2) at sequence
 // index s = row % S and pair index i in [0, half):
@@ -22,7 +22,7 @@
 namespace {
 
 template <typename scalar_t>
-__global__ void rope_apply_kernel(
+__global__ void rope_apply_sm90_kernel(
     const scalar_t* __restrict__ x,   // [n_rows, D]
     const float* __restrict__ cos,    // [S, half]
     const float* __restrict__ sin,    // [S, half]
@@ -55,7 +55,7 @@ __global__ void rope_apply_kernel(
 }  // namespace
 
 // x: [n_rows, D] contiguous (any float dtype); cos/sin: [S, half] fp32 contiguous.
-torch::Tensor rope_apply_cuda(
+torch::Tensor rope_apply_sm90(
     torch::Tensor x,
     torch::Tensor cos,
     torch::Tensor sin,
@@ -87,8 +87,8 @@ torch::Tensor rope_apply_cuda(
   auto stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "rope_apply_cuda", [&] {
-        rope_apply_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+      at::ScalarType::Half, at::ScalarType::BFloat16, x.scalar_type(), "rope_apply_sm90", [&] {
+        rope_apply_sm90_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
             x.data_ptr<scalar_t>(),
             cos.data_ptr<float>(),
             sin.data_ptr<float>(),
