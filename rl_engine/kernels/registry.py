@@ -72,6 +72,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_KV_CACHE_ATTN = (
         "rl_engine.kernels.ops.pytorch.attention.kv_cache.NativeKVCacheAttnOp"
     )
+    # WS2 correctness-first context-parallel attention reference. It emulates
+    # CP prefill/chunked-prefill with fp32 attention-domain LSE merges.
+    PYTORCH_CP_ATTENTION = (
+        "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+        "DeterministicCPAttentionReferenceOp"
+    )
     # WS1 pure-PyTorch ground-truth linear ops
     PYTORCH_NATIVE_LM_HEAD = "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp"
     # WS1 pure-PyTorch ground-truth embedding ops
@@ -165,6 +171,7 @@ class KernelRegistry:
                 ],
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
@@ -188,6 +195,7 @@ class KernelRegistry:
                     OpBackend.TRITON_GENERIC,
                 ],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
@@ -206,6 +214,7 @@ class KernelRegistry:
                 "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],

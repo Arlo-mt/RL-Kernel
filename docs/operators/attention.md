@@ -83,6 +83,15 @@ path. When fused attention kernels land, they are prepended to the priority list
 op becomes the fallback. The production `"attn"` op_type (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is
 a separate dispatch chain and is unaffected.
 
+`kernel_registry.get_op("cp_attention")` resolves to
+`DeterministicCPAttentionReferenceOp`, the WS2 correctness-first context-parallel
+reference. It emulates CP prefill and chunked-prefill by splitting logical query
+and KV sequence blocks, computing per-block `(out, lse)` partial states, and
+merging them in fp32 by global KV block index. This path is not a production
+fused backend; it defines the CP/LSE merge behavior that downstream fused paths
+must match. Optional per-batch `query_position_offsets` / `key_position_offsets`
+cover varlen causal-mask metadata while keeping the dense tensor layout.
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):
@@ -135,6 +144,7 @@ memory.
 
 ```bash
 python -m pytest tests/test_attention.py -v
+python -m pytest tests/test_cp_attention.py -v
 ```
 
 Covers: `forward_fp32` vs an independent fp32 reference (bitwise), strict-fp32 under hostile
@@ -144,15 +154,27 @@ invariance (slice + chunked, bitwise; padding is near-equality only, see below),
 gradient flow, registry dispatch, and a
 GPU-only LARGE Qwen3-8B real-shape smoke test.
 
+`tests/test_cp_attention.py` covers the WS2 CP reference: CP=1 vs standard
+attention, CP=2 prefill vs CP=1, chunked-prefill replay, global-position causal
+masking across CP boundaries, order-independent LSE merge by global block index,
+padding/all-masked stability, BF16 final-write behavior, input purity, argument
+validation, and registry dispatch.
+`make_operator_inputs("cp_attention", ...)` also emits a CP=2 chunked-prefill
+synthetic case for local harnesses.
+
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/attention/standard_attn.py`
+- `rl_engine/kernels/ops/pytorch/attention/cp_attention.py`
 - `rl_engine/kernels/registry.py`
 - `tests/test_attention.py`
+- `tests/test_cp_attention.py`
 
 ## Known Limitations
 
 - PyTorch fallback only; no fused CUDA/Triton backend yet (downstream work).
+- `cp_attention` is a PyTorch reference for CP prefill/chunked-prefill semantics,
+  not a distributed runtime or fused kernel.
 - `Hq` must be divisible by `Hkv` (raises `ValueError` otherwise).
 - The naive path materializes the full `[B, Hq, Sq, Skv]` scores tensor — no query-chunking,
   so the LARGE load point is memory-heavy and GPU-only.
