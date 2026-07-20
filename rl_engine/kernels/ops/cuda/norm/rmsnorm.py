@@ -62,7 +62,7 @@ class RMSNormCuda(torch.autograd.Function):
 
         dx = _C.rmsnorm_backward_dx(dy, x, weight, rstd)
 
-        dw = _C.rmsnorm_backward_dw(dy, x, rstd, mask)
+        dw = _C.rmsnorm_backward_dw(dy, x, rstd, mask).to(weight.dtype)
 
         return dx, dw, None, None
 
@@ -74,3 +74,16 @@ def rmsnorm_cuda(x, weight, eps=1e-6, mask=None):
         y = rmsnorm_cuda(x, weight, mask=mask)
     """
     return RMSNormCuda.apply(x, weight, mask, eps)
+
+
+class RMSNormCudaOp:
+    """CUDA RMSNorm wrapper compatible with the shared operator harness."""
+
+    def __call__(self, x, weight, *, eps=1e-6):
+        return self.forward(x, weight, eps=eps)
+
+    def forward(self, x, weight, *, eps=1e-6):
+        hidden = x.shape[-1]
+        x_2d = x.contiguous().view(-1, hidden)
+        y_2d = rmsnorm_cuda(x_2d, weight.contiguous(), eps=eps)
+        return y_2d.view_as(x)

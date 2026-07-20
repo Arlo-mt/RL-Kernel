@@ -102,6 +102,8 @@ void rmsnorm_backward_reduce_dw_cuda(
   torch::Tensor partial_dw,
   torch::Tensor dw);
 
+int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows);
+
 static void rmsnorm_check_input(const torch::Tensor& x, const char* name) {
   TORCH_CHECK(x.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
@@ -173,8 +175,9 @@ torch::Tensor rmsnorm_backward_dw(
 
   auto T = x.size(0);
   auto H = x.size(1);
+  auto chunks = rmsnorm_backward_dw_chunks_cuda(T);
 
-  auto partial_dw = torch::empty({T, H}, x.options().dtype(torch::kFloat32));
+  auto partial_dw = torch::empty({chunks, H}, x.options().dtype(torch::kFloat32));
   auto dw = torch::empty({H}, x.options().dtype(torch::kFloat32));
 
   rmsnorm_backward_partial_dw_cuda(dy, x, rstd, mask, partial_dw);

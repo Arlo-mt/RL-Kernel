@@ -3,14 +3,15 @@ import time
 
 import torch
 
-from rl_engine.kernels.ops.pytorch.norm.rmsnorm_ref import rmsnorm_ref_custom
+from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
 
 try:
+    from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
     from rl_engine.kernels.ops.cuda.norm.rmsnorm import rmsnorm_cuda
 
-    HAS_CUDA_EXT = True
-except Exception:
+    HAS_CUDA_EXT = _EXT_AVAILABLE and hasattr(_C, "rmsnorm_forward")
+except ImportError:
     HAS_CUDA_EXT = False
 
 
@@ -54,8 +55,10 @@ def main():
             w_base.detach().clone().requires_grad_(True),
         )
 
+    native = NativeRMSNormOp()
+
     x, w = make_inputs()
-    t_ref = bench(lambda a, b: rmsnorm_ref_custom(a, b), x, w, dy)
+    t_ref = bench(lambda a, b: native.forward(a, b), x, w, dy)
     print(f"pytorch ref : {t_ref:.4f} ms")
 
     x, w = make_inputs()

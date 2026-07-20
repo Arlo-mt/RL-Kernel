@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <assert.h>
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* ptr) {
@@ -44,6 +45,7 @@ __device__ __forceinline__ void store_from_float<at::BFloat16>(at::BFloat16* ptr
 __device__ __forceinline__ float block_reduce_sum(float v) {
     extern __shared__ float smem[];
     int tid = threadIdx.x;
+    assert((blockDim.x & (blockDim.x - 1)) == 0);
 
     smem[tid] = v;
     __syncthreads();
@@ -66,6 +68,12 @@ static int choose_threads(int H) {
     return 512;
 }
 
+constexpr int RMSNORM_DW_ROWS_PER_CHUNK = 256;
+constexpr int RMSNORM_DW_H_TILE = 128;
+
+int64_t rmsnorm_backward_dw_chunks_cuda(int64_t rows) {
+    return (rows + RMSNORM_DW_ROWS_PER_CHUNK - 1) / RMSNORM_DW_ROWS_PER_CHUNK;
+}
 
 template <typename scalar_t, typename weight_t>
 __global__ void rmsnorm_fwd_kernel(
@@ -164,46 +172,48 @@ __global__ void rmsnorm_partial_dw_kernel(
     int T,
     int H
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * H;
-
-    if (idx >= total) return;
-
-    int row = idx / H;
-
-    if (!mask[row]) {
-        partial_dw[idx] = 0.0f;
+    int chunk = blockIdx.x;
+    int h = blockIdx.y * RMSNORM_DW_H_TILE + threadIdx.x;
+    if (h >= H) {
         return;
     }
 
-    float dyv = load_as_float<scalar_t>(dy + idx);
-    float xv = load_as_float<scalar_t>(x + idx);
-    float r = rstd[row];
+    int t0 = chunk * RMSNORM_DW_ROWS_PER_CHUNK;
+    float acc = 0.0f;
 
-    partial_dw[idx] = dyv * xv * r;
+#pragma unroll
+    for (int i = 0; i < RMSNORM_DW_ROWS_PER_CHUNK; ++i) {
+        int row = t0 + i;
+        float contrib = 0.0f;
+        if (row < T && mask[row]) {
+            int idx = row * H + h;
+            float dyv = load_as_float<scalar_t>(dy + idx);
+            float xv = load_as_float<scalar_t>(x + idx);
+            contrib = dyv * xv * rstd[row];
+        }
+        acc += contrib;
+    }
+
+    partial_dw[chunk * H + h] = acc;
 }
 
 
 __global__ void rmsnorm_reduce_dw_kernel(
     const float* __restrict__ partial_dw,
     float* __restrict__ dw,
-    int T,
+    int chunks,
     int H
 ) {
-    int h = blockIdx.x;
-    int tid = threadIdx.x;
-
-    float local_sum = 0.0f;
-
-    for (int t = tid; t < T; t += blockDim.x) {
-        local_sum += partial_dw[t * H + h];
+    int h = blockIdx.x * RMSNORM_DW_H_TILE + threadIdx.x;
+    if (h >= H) {
+        return;
     }
 
-    float sum = block_reduce_sum(local_sum);
-
-    if (tid == 0) {
-        dw[h] = sum;
+    float acc = 0.0f;
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        acc += partial_dw[chunk * H + h];
     }
+    dw[h] = acc;
 }
 
 
@@ -280,10 +290,10 @@ void rmsnorm_backward_partial_dw_cuda(
 ) {
     int T = x.size(0);
     int H = x.size(1);
-    int total = T * H;
 
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int chunks = (T + RMSNORM_DW_ROWS_PER_CHUNK - 1) / RMSNORM_DW_ROWS_PER_CHUNK;
+    dim3 blocks(chunks, (H + RMSNORM_DW_H_TILE - 1) / RMSNORM_DW_H_TILE);
+    dim3 threads(RMSNORM_DW_H_TILE);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -305,18 +315,18 @@ void rmsnorm_backward_reduce_dw_cuda(
     torch::Tensor partial_dw,
     torch::Tensor dw
 ) {
-    int T = partial_dw.size(0);
+    int chunks = partial_dw.size(0);
     int H = partial_dw.size(1);
 
-    int threads = choose_threads(T);
-    size_t smem = threads * sizeof(float);
+    dim3 blocks((H + RMSNORM_DW_H_TILE - 1) / RMSNORM_DW_H_TILE);
+    dim3 threads(RMSNORM_DW_H_TILE);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    rmsnorm_reduce_dw_kernel<<<H, threads, smem, stream>>>(
+    rmsnorm_reduce_dw_kernel<<<blocks, threads, 0, stream>>>(
         partial_dw.data_ptr<float>(),
         dw.data_ptr<float>(),
-        T,
+        chunks,
         H
     );
 }
