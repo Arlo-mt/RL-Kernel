@@ -140,6 +140,7 @@ def deterministic_attention_forward(
 ) -> list[torch.Tensor]:
     """Returns [out, lse, P]."""
     ...
+
 def deterministic_attention_backward(
     grad_output: torch.Tensor,
     q: torch.Tensor,

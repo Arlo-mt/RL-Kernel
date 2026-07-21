@@ -23,20 +23,12 @@ import math
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 try:
-    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
-        DeterministicAttentionOp,
-    )
+    from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
+    from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionOp
     from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
-    from rl_engine.kernels.gtest.op_checks import (
-        CandidateSpec,
-        OperatorCase,
-        run_operator_suite,
-    )
 
     _OP_AVAILABLE = True
 except (ImportError, RuntimeError):
@@ -71,6 +63,7 @@ def _tol(dtype):
 # §8.4 — #108 Harness integration: forward + backward via run_operator_suite
 # =============================================================================
 
+
 def _make_case(name, dtype, hq, hkv, sq, skv, causal, scale=None, padding=False):
     torch.manual_seed(42)
     B = 2
@@ -84,13 +77,16 @@ def _make_case(name, dtype, hq, hkv, sq, skv, causal, scale=None, padding=False)
         inputs["scale"] = scale
     if padding:
         mask = torch.ones(B, skv, device=DEVICE, dtype=torch.bool)
-        mask[0, skv // 2:] = False
-        mask[1, skv * 3 // 4:] = False
+        mask[0, skv // 2 :] = False
+        mask[1, skv * 3 // 4 :] = False
         inputs["key_padding_mask"] = mask
     gold = NativeAttentionOp()
     return OperatorCase(
-        name=name, op_class="attention", dtype=dtype,
-        inputs=inputs, gold_fn=gold.forward_fp32,
+        name=name,
+        op_class="attention",
+        dtype=dtype,
+        inputs=inputs,
+        gold_fn=gold.forward_fp32,
         grad_input_names=("q", "k", "v"),
     )
 
@@ -118,8 +114,11 @@ def test_harness_forward():
     for cr in report.candidates:
         for case in cr.cases:
             if not case.passed:
-                msgs = [o.message or f"idx={o.output_index} max_abs={o.max_abs_error}"
-                        for o in case.outputs if not o.passed]
+                msgs = [
+                    o.message or f"idx={o.output_index} max_abs={o.max_abs_error}"
+                    for o in case.outputs
+                    if not o.passed
+                ]
                 pytest.fail(f"Forward failed {case.case_name}: {msgs}")
     assert report.passed
 
@@ -129,14 +128,20 @@ def test_harness_backward():
     cuda = DeterministicAttentionOp()
     candidate = CandidateSpec(name="cuda-attention", fn=cuda, backend="cuda")
     report = run_operator_suite(
-        "attention", candidates=[candidate], cases=HARNESS_CASES,
-        check_grad=True, grad_mode="random",
+        "attention",
+        candidates=[candidate],
+        cases=HARNESS_CASES,
+        check_grad=True,
+        grad_mode="random",
     )
     for cr in report.candidates:
         for case in cr.cases:
             if not case.passed:
-                msgs = [o.message or f"idx={o.output_index} max_abs={o.max_abs_error}"
-                        for o in case.outputs if not o.passed]
+                msgs = [
+                    o.message or f"idx={o.output_index} max_abs={o.max_abs_error}"
+                    for o in case.outputs
+                    if not o.passed
+                ]
                 pytest.fail(f"Backward failed {case.case_name}: {msgs}")
     assert report.passed
 
@@ -175,6 +180,7 @@ def test_forward_sweep(cuda_op, gold_op, dtype, hq, hkv, sq, skv, causal):
 # §7.1 — Scale tests (None, 0.0, custom)
 # =============================================================================
 
+
 @pytest.mark.parametrize("scale", [None, 0.0, 0.05])
 def test_scale(cuda_op, gold_op, scale):
     B, hq, hkv, sq, skv = 2, 4, 1, 8, 16
@@ -193,6 +199,7 @@ def test_scale(cuda_op, gold_op, scale):
 # =============================================================================
 # Padding and fully-masked row
 # =============================================================================
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_forward_with_padding(cuda_op, gold_op, dtype):
@@ -228,6 +235,7 @@ def test_fully_masked_row(cuda_op):
 # §7.2/8.5 — LSE correctness
 # =============================================================================
 
+
 def test_lse_correctness(cuda_op):
     B, hq, hkv, sq, skv = 2, 4, 1, 8, 16
     torch.manual_seed(99)
@@ -254,6 +262,7 @@ def test_lse_correctness(cuda_op):
 # §7.2 — Valid-only vs padded: near-equal, NOT bitwise
 # =============================================================================
 
+
 def test_valid_only_vs_padded_accuracy(cuda_op):
     """Padding changes reduction width; result is near-equal, not bitwise.
 
@@ -268,8 +277,20 @@ def test_valid_only_vs_padded_accuracy(cuda_op):
     k_valid = torch.randn(B, hkv, skv_valid, D, device=DEVICE, dtype=torch.bfloat16)
     v_valid = torch.randn(B, hkv, skv_valid, D, device=DEVICE, dtype=torch.bfloat16)
 
-    k_padded = torch.cat([k_valid, torch.zeros(B, hkv, skv_padded - skv_valid, D, device=DEVICE, dtype=torch.bfloat16)], dim=2)
-    v_padded = torch.cat([v_valid, torch.zeros(B, hkv, skv_padded - skv_valid, D, device=DEVICE, dtype=torch.bfloat16)], dim=2)
+    k_padded = torch.cat(
+        [
+            k_valid,
+            torch.zeros(B, hkv, skv_padded - skv_valid, D, device=DEVICE, dtype=torch.bfloat16),
+        ],
+        dim=2,
+    )
+    v_padded = torch.cat(
+        [
+            v_valid,
+            torch.zeros(B, hkv, skv_padded - skv_valid, D, device=DEVICE, dtype=torch.bfloat16),
+        ],
+        dim=2,
+    )
     mask = torch.ones(B, skv_padded, device=DEVICE, dtype=torch.bool)
     mask[:, skv_valid:] = False
 
@@ -284,6 +305,7 @@ def test_valid_only_vs_padded_accuracy(cuda_op):
 # §7.3 — Batch invariance (Axis-A bitwise)
 # =============================================================================
 
+
 def test_batch_invariance_single(cuda_op):
     """Same sample in full batch vs extracted single — bitwise."""
     B, hq, hkv, sq, skv = 4, 4, 1, 8, 16
@@ -296,10 +318,10 @@ def test_batch_invariance_single(cuda_op):
 
     for i in range(B):
         out_single, lse_single = cuda_op.forward_with_lse(
-            q[i:i+1], k[i:i+1], v[i:i+1], causal=True
+            q[i : i + 1], k[i : i + 1], v[i : i + 1], causal=True
         )
-        assert torch.equal(out_full[i:i+1], out_single), f"Output batch invariance failed i={i}"
-        assert torch.equal(lse_full[i:i+1], lse_single), f"LSE batch invariance failed i={i}"
+        assert torch.equal(out_full[i : i + 1], out_single), f"Output batch invariance failed i={i}"
+        assert torch.equal(lse_full[i : i + 1], lse_single), f"LSE batch invariance failed i={i}"
 
 
 def test_batch_invariance_position_permutation(cuda_op):
@@ -319,9 +341,9 @@ def test_batch_invariance_position_permutation(cuda_op):
     out_perm = cuda_op.forward(q_perm, k_perm, v_perm, causal=True)
 
     for new_pos, orig_pos in enumerate(perm):
-        assert torch.equal(out_full[orig_pos], out_perm[new_pos]), (
-            f"Position permutation invariance failed: orig={orig_pos} new={new_pos}"
-        )
+        assert torch.equal(
+            out_full[orig_pos], out_perm[new_pos]
+        ), f"Position permutation invariance failed: orig={orig_pos} new={new_pos}"
 
 
 def test_batch_invariance_chunk(cuda_op):
@@ -333,10 +355,13 @@ def test_batch_invariance_chunk(cuda_op):
     v = torch.randn(B, hkv, skv, D, device=DEVICE, dtype=torch.bfloat16)
 
     out_full = cuda_op.forward(q, k, v, causal=True)
-    out_chunk = torch.cat([
-        cuda_op.forward(q[:2], k[:2], v[:2], causal=True),
-        cuda_op.forward(q[2:], k[2:], v[2:], causal=True),
-    ], dim=0)
+    out_chunk = torch.cat(
+        [
+            cuda_op.forward(q[:2], k[:2], v[:2], causal=True),
+            cuda_op.forward(q[2:], k[2:], v[2:], causal=True),
+        ],
+        dim=0,
+    )
     assert torch.equal(out_full, out_chunk), "Batch-chunk invariance failed"
 
 
@@ -344,10 +369,17 @@ def test_batch_invariance_chunk(cuda_op):
 # §7.4 — Sequence-dim chunked-prefill invariance
 # =============================================================================
 
-@pytest.mark.parametrize("chunk_size,hq,hkv", [
-    (1, 4, 1), (3, 4, 1), (8, 4, 1),
-    (1, 32, 8), (3, 32, 8),
-])
+
+@pytest.mark.parametrize(
+    "chunk_size,hq,hkv",
+    [
+        (1, 4, 1),
+        (3, 4, 1),
+        (8, 4, 1),
+        (1, 32, 8),
+        (3, 32, 8),
+    ],
+)
 def test_chunked_prefill(cuda_op, chunk_size, hq, hkv):
     B, T = 1, 16
     torch.manual_seed(22)
@@ -360,13 +392,13 @@ def test_chunked_prefill(cuda_op, chunk_size, hq, hkv):
     outs = []
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
-        outs.append(cuda_op.forward(
-            q[:, :, t:t+c], k[:, :, :t+c], v[:, :, :t+c], causal=True
-        ))
+        outs.append(
+            cuda_op.forward(q[:, :, t : t + c], k[:, :, : t + c], v[:, :, : t + c], causal=True)
+        )
     out_chunked = torch.cat(outs, dim=2)
-    assert torch.equal(out_full, out_chunked), (
-        f"Chunked-prefill invariance failed chunk={chunk_size} hq={hq} hkv={hkv}"
-    )
+    assert torch.equal(
+        out_full, out_chunked
+    ), f"Chunked-prefill invariance failed chunk={chunk_size} hq={hq} hkv={hkv}"
 
 
 @pytest.mark.parametrize("chunk_size", [1, 3, 8])
@@ -385,14 +417,19 @@ def test_chunked_prefill_with_padding(cuda_op, chunk_size):
     outs = []
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
-        outs.append(cuda_op.forward(
-            q[:, :, t:t+c], k[:, :, :t+c], v[:, :, :t+c],
-            causal=True, key_padding_mask=mask[:, :t+c],
-        ))
+        outs.append(
+            cuda_op.forward(
+                q[:, :, t : t + c],
+                k[:, :, : t + c],
+                v[:, :, : t + c],
+                causal=True,
+                key_padding_mask=mask[:, : t + c],
+            )
+        )
     out_chunked = torch.cat(outs, dim=2)
-    assert torch.equal(out_full, out_chunked), (
-        f"Chunked-prefill with padding failed chunk={chunk_size}"
-    )
+    assert torch.equal(
+        out_full, out_chunked
+    ), f"Chunked-prefill with padding failed chunk={chunk_size}"
 
 
 @pytest.mark.parametrize("chunk_size", [1, 3])
@@ -410,7 +447,7 @@ def test_chunked_prefill_lse(cuda_op, chunk_size):
     for t in range(0, T, chunk_size):
         c = min(chunk_size, T - t)
         _, lse_chunk = cuda_op.forward_with_lse(
-            q[:, :, t:t+c], k[:, :, :t+c], v[:, :, :t+c], causal=True
+            q[:, :, t : t + c], k[:, :, : t + c], v[:, :, : t + c], causal=True
         )
         lses.append(lse_chunk)
     lse_chunked = torch.cat(lses, dim=2)
@@ -420,6 +457,7 @@ def test_chunked_prefill_lse(cuda_op, chunk_size):
 # =============================================================================
 # §7.5 — Prefill/decode handoff
 # =============================================================================
+
 
 def test_prefill_decode_slice(cuda_op):
     """§7.5.1: prefill[:, :, -1:] == decode(q[-1:], k_full, v_full)."""
@@ -434,9 +472,15 @@ def test_prefill_decode_slice(cuda_op):
     assert torch.equal(prefill[:, :, -1:], decode)
 
 
-@pytest.mark.parametrize("S_new,hq,hkv", [
-    (1, 4, 1), (1, 32, 8), (3, 4, 1), (3, 32, 8),
-])
+@pytest.mark.parametrize(
+    "S_new,hq,hkv",
+    [
+        (1, 4, 1),
+        (1, 32, 8),
+        (3, 4, 1),
+        (3, 32, 8),
+    ],
+)
 def test_kv_cache_handoff(cuda_op, S_new, hq, hkv):
     """§7.5.2: cat(k_cache, k_new) handoff == prefill tail."""
     B, S_past = 1, 12
@@ -463,7 +507,9 @@ def test_kv_cache_handoff_with_padding(cuda_op):
     mask[0, 8:10] = False
 
     q_new = q_full[:, :, -S_new:]
-    prefill_tail = cuda_op.forward(q_full, k_full, v_full, causal=True, key_padding_mask=mask)[:, :, -S_new:]
+    prefill_tail = cuda_op.forward(q_full, k_full, v_full, causal=True, key_padding_mask=mask)[
+        :, :, -S_new:
+    ]
     decode_path = cuda_op.forward(q_new, k_full, v_full, causal=True, key_padding_mask=mask)
     assert torch.equal(decode_path, prefill_tail)
 
@@ -471,6 +517,7 @@ def test_kv_cache_handoff_with_padding(cuda_op):
 # =============================================================================
 # §7.6 — Backward
 # =============================================================================
+
 
 def test_backward_smoke(cuda_op):
     """Backward runs and produces gradients with correct shapes."""
@@ -545,14 +592,14 @@ def test_gradient_batch_invariance(cuda_op):
     out_full.backward(grad_out)
 
     for i in range(B):
-        qi = q[i:i+1].clone().requires_grad_(True)
-        ki = k[i:i+1].clone().requires_grad_(True)
-        vi = v[i:i+1].clone().requires_grad_(True)
+        qi = q[i : i + 1].clone().requires_grad_(True)
+        ki = k[i : i + 1].clone().requires_grad_(True)
+        vi = v[i : i + 1].clone().requires_grad_(True)
         out_i = cuda_op.forward(qi, ki, vi, causal=True)
-        out_i.backward(grad_out[i:i+1])
-        assert torch.equal(q_full.grad[i:i+1], qi.grad), f"dQ batch invariance failed i={i}"
-        assert torch.equal(k_full.grad[i:i+1], ki.grad), f"dK batch invariance failed i={i}"
-        assert torch.equal(v_full.grad[i:i+1], vi.grad), f"dV batch invariance failed i={i}"
+        out_i.backward(grad_out[i : i + 1])
+        assert torch.equal(q_full.grad[i : i + 1], qi.grad), f"dQ batch invariance failed i={i}"
+        assert torch.equal(k_full.grad[i : i + 1], ki.grad), f"dK batch invariance failed i={i}"
+        assert torch.equal(v_full.grad[i : i + 1], vi.grad), f"dV batch invariance failed i={i}"
 
 
 def test_gqa_dk_dv_order(cuda_op):

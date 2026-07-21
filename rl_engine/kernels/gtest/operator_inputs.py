@@ -101,15 +101,9 @@ def _make_attention_inputs(
     scale_mode = _arg_str(args, "scale_mode", "default")
 
     inputs: dict[str, Any] = {
-        "q": _floating_tensor(
-            (batch, n_heads, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0
-        ),
-        "k": _floating_tensor(
-            (batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 1
-        ),
-        "v": _floating_tensor(
-            (batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 2
-        ),
+        "q": _floating_tensor((batch, n_heads, seq, DEFAULT_HEAD_DIM), args, dtype, device, 0),
+        "k": _floating_tensor((batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 1),
+        "v": _floating_tensor((batch, n_kv_heads, skv, DEFAULT_HEAD_DIM), args, dtype, device, 2),
         "causal": causal,
     }
 
@@ -121,9 +115,7 @@ def _make_attention_inputs(
 
     if use_padding:
         generator = _generator(args, device, offset=42)
-        key_padding_mask = torch.rand(
-            (batch, skv), generator=generator, device=device
-        ) > 0.3
+        key_padding_mask = torch.rand((batch, skv), generator=generator, device=device) > 0.3
         key_padding_mask[:, 0] = True
         inputs["key_padding_mask"] = key_padding_mask
 

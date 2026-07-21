@@ -434,7 +434,7 @@ def test_gradient_matches_reference():
 
 
 def test_registry_dispatches_native_attention_op():
-    """The registry resolves "attention" to an attention op (CUDA deterministic or native fallback)."""
+    """Resolve attention to the deterministic CUDA op or native fallback."""
     op = kernel_registry.get_op("attention")
     # On CUDA with the extension built, the registry prefers DeterministicAttentionOp.
     # On CPU or without the CUDA extension, it falls back to NativeAttentionOp.

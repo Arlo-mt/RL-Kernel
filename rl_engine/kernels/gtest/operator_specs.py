@@ -64,7 +64,10 @@ OP_SPECS = {
         gold_method="forward_fp32",
         candidate_paths={
             "pytorch": "rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp",
-            "cuda": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+            "cuda": (
+                "rl_engine.kernels.ops.cuda.attention.deterministic_attn."
+                "DeterministicAttentionOp"
+            ),
         },
         grad_input_names=("q", "k", "v"),
     ),

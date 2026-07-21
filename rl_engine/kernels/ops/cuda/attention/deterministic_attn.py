@@ -38,9 +38,7 @@ class _DeterministicAttentionFn(Function):
         v_c = v.contiguous()
         mask_c = key_padding_mask.contiguous() if key_padding_mask is not None else None
 
-        results = _C.deterministic_attention_forward(
-            q_c, k_c, v_c, causal, float(scale), mask_c
-        )
+        results = _C.deterministic_attention_forward(q_c, k_c, v_c, causal, float(scale), mask_c)
         out, lse, P = results[0], results[1], results[2]
 
         ctx.save_for_backward(q_c, k_c, v_c, P)
@@ -57,8 +55,13 @@ class _DeterministicAttentionFn(Function):
 
         dQ, dK, dV = _C.deterministic_attention_backward(
             grad_out.contiguous(),
-            q_c, k_c, v_c, P,
-            ctx.causal, float(ctx.scale), ctx.key_padding_mask,
+            q_c,
+            k_c,
+            v_c,
+            P,
+            ctx.causal,
+            float(ctx.scale),
+            ctx.key_padding_mask,
         )
 
         return dQ, dK, dV, None, None, None
@@ -94,9 +97,7 @@ class DeterministicAttentionOp:
         scale: Optional[float] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.forward(
-            q, k, v, causal=causal, scale=scale, key_padding_mask=key_padding_mask
-        )
+        return self.forward(q, k, v, causal=causal, scale=scale, key_padding_mask=key_padding_mask)
 
     def forward(
         self,
