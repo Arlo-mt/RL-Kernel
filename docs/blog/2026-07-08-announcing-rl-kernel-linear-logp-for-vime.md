@@ -2,7 +2,7 @@
 layout: post
 title: "Announcing RL-Kernel for vime: Faster and Leaner linear_logp for Full RL Rollouts"
 author: "RL-Kernel Contributors and the vime Team"
-image: "../assets/RL-Kernel%20underlying%20operator%20library%20technical%20architecture.png"
+image: "../../assets/blog/rlk-global-architecture.png"
 summary: "RL-Kernel brings a fused SM90 tensor-parallel linear_logp operator into vime, cutting selected-logprob CUDA time and peak reserved memory in full 8xH100 rollout training."
 read_time_minutes: 7
 tags:
@@ -43,7 +43,7 @@ RL-Kernel is not designed around a single path for every workload. Instead, oper
 RL-Kernel is designed as an operator-layer bridge between high-level RL orchestration and low-level GPU backends. It integrates with rollout engines and training engines through custom operator hooks, while the actual kernels are implemented through CUDA, Triton, ROCm, and related backend libraries.
 
 <p align="center">
-<img src="../assets/RL-Kernel%20underlying%20operator%20library%20technical%20architecture.png" alt="RL-Kernel Global Architecture" width="80%">
+<img src="../../assets/blog/rlk-global-architecture.png" alt="RL-Kernel Global Architecture" width="80%">
 <br>
 <em>RL-Kernel sits at the operator layer between RL orchestration frameworks and hardware-specific kernel backends. This is the architecture diagram from the RL-Kernel README.</em>
 </p>
@@ -57,7 +57,7 @@ For `linear_logp`, the vime integration follows this path:
 - The CUDA extension computes selected logprob and the state needed for backward without exposing a full `[tokens, vocab]` logits tensor to the Python framework layer.
 
 <p align="center">
-<img src="../assets/blog/rlk-linear-logp-dataflow.svg" alt="RL-Kernel linear_logp data flow" width="90%">
+<img src="../../assets/blog/rlk-linear-logp-dataflow.svg" alt="RL-Kernel linear_logp data flow" width="90%">
 <br>
 <em>The vime path materializes full logits; the vime + RL-Kernel path fuses selected-logprob computation into the operator layer.</em>
 </p>
@@ -96,7 +96,7 @@ and reported `fallback=0`.
 The strongest single-operator result is T3: the forward plus backward CUDA time drops from **33.96 ms** to **18.50 ms**. T2 shows the best forward-only speedup at **2.32x**.
 
 <p align="center">
-<img src="../assets/blog/rlk-linear-logp-speedup.svg" alt="RL-Kernel linear_logp fwd+bwd CUDA time speedup" width="90%">
+<img src="../../assets/blog/rlk-linear-logp-speedup.svg" alt="RL-Kernel linear_logp fwd+bwd CUDA time speedup" width="90%">
 <br>
 <em>vime + RL-Kernel reduces forward plus backward CUDA time across the completed no-trace configurations.</em>
 </p>
@@ -114,7 +114,7 @@ The memory comparison also uses operator-level probes. It tracks the peak reserv
 T3 is the clearest single-operator memory result: the peak reserved delta drops from **32342 MB** to **26710 MB**, saving **5632 MB** during the `linear_logp` operator window.
 
 <p align="center">
-<img src="../assets/blog/rlk-linear-logp-memory.svg" alt="RL-Kernel linear_logp single-operator memory comparison" width="90%">
+<img src="../../assets/blog/rlk-linear-logp-memory.svg" alt="RL-Kernel linear_logp single-operator memory comparison" width="90%">
 <br>
 <em>The memory comparison is scoped to the `linear_logp` operator, matching the timing comparison.</em>
 </p>
@@ -161,13 +161,15 @@ Fourth, full-gradient backward also moves onto a faster path. RL-Kernel organize
 
 ## Roadmap
 
+For the detailed integration plan, see the [RL-Kernel and vime Integration Roadmap](https://github.com/RL-Align/vime/issues/6).
+
 RL-Kernel and vime will continue to evolve along several practical directions:
 
-- **Train-inference consistency first**: We will prioritize operator-level rollout-training consistency, then push operator performance to the limit under that guarantee.
-- **Observable path selection**: Continue improving selection among fast paths, consistency-first paths, and native fallbacks so workloads can make clear tradeoffs among performance, coverage, and rollout-training consistency.
-- **Deeper vime integration**: Improve operator selection, fallback visibility, timing counters, and weight-sync instrumentation for long-running RL jobs.
-- **More RL-specific kernels**: Extend fused and memory-efficient paths beyond `linear_logp` to other GRPO, PPO, DPO, attention, sampling, and MoE hot spots.
-- **Broader hardware coverage**: Continue maturing CUDA paths while expanding Triton and ROCm backends so the same operator-level API can serve more accelerator environments.
+- **Consistency contracts**: make rollout-training `dlogp`, provenance, batch-invariance checks, and strict/audit modes first-class vime diagnostics.
+- **Fast-path expansion**: extend contract-preserving RL-Kernel backends beyond `linear_logp` only where profiling shows real bottlenecks.
+- **Compute/communication decoupling**: separate compute kernels, collective scheduling, and overlap telemetry so TP/NCCL bottlenecks can be optimized without hiding numeric-contract changes.
+- **Operator coverage**: add targeted paths for logprob reference scoring, attention/reductions, matmul projections, normalization, embeddings, and RL loss fragments.
+- **Release discipline**: keep operator-level, actor-window, and full-step claims separate, with structured fallback reporting and reproducible benchmark slices.
 
 ## Quick Start
 
