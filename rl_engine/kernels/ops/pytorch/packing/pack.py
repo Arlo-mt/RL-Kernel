@@ -29,8 +29,7 @@ def _validate(x: torch.Tensor, mask: torch.Tensor) -> None:
         raise ValueError(f"mask must have shape [B, S], got {tuple(mask.shape)}.")
     if x.device != mask.device:
         raise ValueError(
-            f"x and mask must be on the same device, got x on {x.device} "
-            f"and mask on {mask.device}."
+            f"x and mask must be on the same device, got x on {x.device} and mask on {mask.device}."
         )
     if mask.shape != x.shape[: mask.dim()]:
         raise ValueError(
@@ -49,7 +48,7 @@ class _PackFunction(torch.autograd.Function):
         tail_shape = x.shape[lead:]
 
         flat_mask = mask.reshape(-1).to(torch.bool)
-        flat_x = x.reshape(-1, *tail_shape) if tail_shape else x.reshape(-1)
+        flat_x = x.reshape(-1, *tail_shape)
 
         # cu_seqlens: prefix-sum of per-row active counts, for varlen consumers.
         # Count from the bool mask so a non-bool mask (e.g. {0, 2}) matches the
@@ -72,7 +71,7 @@ class _PackFunction(torch.autograd.Function):
             packed = flat_x.clone()
             ctx.save_for_backward()
         elif ctx.none_active:
-            packed = flat_x[:0]
+            packed = flat_x[:0].clone()
             ctx.save_for_backward()
         else:
             packed = flat_x.index_select(0, index)
@@ -91,9 +90,7 @@ class _PackFunction(torch.autograd.Function):
         if ctx.all_active:
             return grad_packed.reshape(ctx.x_shape), None
 
-        grad_flat = grad_packed.new_zeros(
-            (ctx.flat_rows, *tail_shape) if tail_shape else (ctx.flat_rows,)
-        )
+        grad_flat = grad_packed.new_zeros((ctx.flat_rows, *tail_shape))
         if not ctx.none_active:
             (index,) = ctx.saved_tensors
             grad_flat.index_copy_(0, index, grad_packed)
@@ -138,8 +135,7 @@ class NativePackOp:
         tail = tuple(packed.shape[1:]) if tail_shape is None else tuple(tail_shape)
         if tail_shape is not None and tail != tuple(packed.shape[1:]):
             raise ValueError(
-                f"tail_shape {tail} must match packed trailing shape "
-                f"{tuple(packed.shape[1:])}."
+                f"tail_shape {tail} must match packed trailing shape {tuple(packed.shape[1:])}."
             )
         out = packed.new_zeros((flat_mask.numel(), *tail))
         index = flat_mask.nonzero(as_tuple=False).squeeze(-1)
