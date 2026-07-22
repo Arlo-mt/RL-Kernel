@@ -55,8 +55,12 @@ Reference semantics (`forward_fp32`):
 
 ```python
 flat_hidden = hidden.float().reshape(-1, hidden.size(-1))
-rows = [torch.mv(weight.float(), row) for row in flat_hidden]
-out = torch.stack(rows).reshape(*hidden.shape[:-1], weight.size(0))
+if flat_hidden.size(0) == 0:
+    flat_out = flat_hidden @ weight.float().t()
+else:
+    rows = [torch.mv(weight.float(), row) for row in flat_hidden]
+    flat_out = torch.stack(rows)
+out = flat_out.reshape(*hidden.shape[:-1], weight.size(0))
 if bias is not None:
     out = out + bias.float()
 ```

@@ -237,14 +237,21 @@ def test_embedding_backward_weight_gradient_is_layout_invariant() -> None:
             assert torch.allclose(grad, canonical_grad, atol=1e-6)
 
 
-def test_lm_head_linear_logp_handoff_is_layout_invariant_for_rl_batches() -> None:
-    torch.manual_seed(2031)
+@pytest.mark.parametrize("device,dtype", [("cpu", torch.float32), CUDA_CASE])
+def test_lm_head_linear_logp_handoff_is_layout_invariant_for_rl_batches(
+    device: str, dtype: torch.dtype
+) -> None:
+    target_device = torch.device(device)
+    generator = torch.Generator(device=target_device)
+    generator.manual_seed(2031)
     op = NativeLinearLogpOp()
-    weight = torch.randn(29, 7)
-    bias = torch.randn(29)
-    base_hidden = torch.randn(6, 7)
-    base_target = torch.tensor([3, 7, 1, 9, 4, 6], dtype=torch.long)
-    base_mask = torch.tensor([True, False, True, True, False, True], dtype=torch.bool)
+    weight = torch.randn(29, 7, device=target_device, dtype=dtype, generator=generator)
+    bias = torch.randn(29, device=target_device, dtype=dtype, generator=generator)
+    base_hidden = torch.randn(6, 7, device=target_device, dtype=dtype, generator=generator)
+    base_target = torch.tensor([3, 7, 1, 9, 4, 6], device=target_device, dtype=torch.long)
+    base_mask = torch.tensor(
+        [True, False, True, True, False, True], device=target_device, dtype=torch.bool
+    )
     layouts = [
         ((2, 3), [0, 1, 2, 3, 4, 5]),
         ((3, 2), [5, 1, 3, 0, 4, 2]),
@@ -253,19 +260,29 @@ def test_lm_head_linear_logp_handoff_is_layout_invariant_for_rl_batches() -> Non
 
     canonical = None
     for lead_shape, order in layouts:
-        order_t = torch.tensor(order, dtype=torch.long)
+        order_t = torch.tensor(order, device=target_device, dtype=torch.long)
         hidden = base_hidden.index_select(0, order_t).reshape(*lead_shape, -1)
         target = base_target.index_select(0, order_t).reshape(lead_shape)
         mask = base_mask.index_select(0, order_t).reshape(lead_shape)
         safe_target = target.masked_fill(~mask, 0)
+        padded_hidden = hidden.clone()
+        padding_values = torch.randn(
+            padded_hidden.shape,
+            device=target_device,
+            dtype=dtype,
+            generator=generator,
+        )
+        padded_hidden[~mask] = padding_values[~mask]
 
-        logps = op(hidden, weight, safe_target, bias).masked_fill(~mask, 0.0)
-        logits = torch.nn.functional.linear(hidden.float(), weight.float(), bias.float())
+        logps = op(padded_hidden, weight, safe_target, bias).masked_fill(~mask, 0.0)
+        logits = torch.nn.functional.linear(padded_hidden.float(), weight.float(), bias.float())
         expected = selected_logprobs_reference(logits, target, mask=mask)
 
-        assert torch.allclose(logps, expected, atol=1e-5)
-        recovered = logps.reshape(-1)[torch.argsort(order_t)]
+        assert torch.allclose(logps, expected, atol=5e-2 if dtype is torch.bfloat16 else 1e-5)
+        recovered = logps.reshape(-1)[torch.argsort(order_t)].float()
         if canonical is None:
             canonical = recovered
         else:
-            assert torch.allclose(recovered, canonical, atol=1e-6)
+            assert torch.allclose(
+                recovered, canonical, atol=5e-2 if dtype is torch.bfloat16 else 1e-6
+            )

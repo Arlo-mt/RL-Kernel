@@ -116,7 +116,8 @@ class NativeLMHeadOp:
     def _fixed_k_projection(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         flat_hidden = hidden.reshape(-1, hidden.size(-1))
         if flat_hidden.size(0) == 0:
-            return hidden.new_empty(*hidden.shape[:-1], weight.size(0))
+            flat_out = flat_hidden @ weight.t()
+            return flat_out.reshape(*hidden.shape[:-1], weight.size(0))
         rows = [torch.mv(weight, row) for row in flat_hidden]
         flat_out = torch.stack(rows, dim=0)
         return flat_out.reshape(*hidden.shape[:-1], weight.size(0))

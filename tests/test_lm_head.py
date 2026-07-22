@@ -93,7 +93,10 @@ def _rand_weight(vocab=_VOCAB, hidden=_HIDDEN, *, seed, dtype=torch.float32):
 
 def _fixed_k_reference(hidden: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Tensor:
     flat_hidden = hidden.reshape(-1, hidden.size(-1))
-    flat_out = torch.stack([torch.mv(weight, row) for row in flat_hidden], dim=0)
+    if flat_hidden.size(0) == 0:
+        flat_out = flat_hidden @ weight.t()
+    else:
+        flat_out = torch.stack([torch.mv(weight, row) for row in flat_hidden], dim=0)
     out = flat_out.reshape(*hidden.shape[:-1], weight.size(0))
     if bias is not None:
         out = out + bias
@@ -207,6 +210,21 @@ def test_native_lm_head_output_shape():
     weight = _rand_weight(seed=3)
     out = NativeLMHeadOp().forward(hidden, weight)
     assert out.shape == (3, 7, _VOCAB)
+
+
+def test_native_lm_head_zero_rows_preserve_autograd_edges():
+    op = NativeLMHeadOp()
+    hidden = torch.empty(0, _HIDDEN, requires_grad=True)
+    weight = _rand_weight(seed=31).requires_grad_(True)
+
+    out = op.forward_fp32(hidden, weight)
+    out.sum().backward()
+
+    assert out.shape == (0, _VOCAB)
+    assert hidden.grad is not None
+    assert hidden.grad.shape == hidden.shape
+    assert weight.grad is not None
+    assert torch.equal(weight.grad, torch.zeros_like(weight))
 
 
 # Bias: None (Qwen3 default) is a plain matmul; a provided [vocab] bias is added.
