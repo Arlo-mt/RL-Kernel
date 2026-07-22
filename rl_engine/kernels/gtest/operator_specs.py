@@ -57,6 +57,26 @@ OP_SPECS = {
         },
         grad_input_names=("hidden", "lm_head_weight"),
     ),
+    "embedding": OperatorSpec(
+        name="embedding",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+        },
+        grad_input_names=("weight",),
+    ),
+    "lm_head": OperatorSpec(
+        name="lm_head",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+        },
+        grad_input_names=("hidden", "weight"),
+    ),
 }
 
 

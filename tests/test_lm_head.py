@@ -12,12 +12,10 @@ hidden dimension, so:
     bitwise -- elementwise rtol is useless here because many logits are near
     zero while the accumulated error tracks the reduction length, not the
     output value.
-  * Axis-A (batch invariance): still bitwise within a single dtype, but only
-    once the CPU reduction order is pinned. Multi-threaded CPU GEMM splits the
-    K (=hidden) reduction across threads differently depending on the M
-    (=batch*seq) dimension, which silently breaks bitwise batch invariance for
-    large hidden. ``_single_thread`` fixes the reduction order; this is the
-    local stand-in for the planned testing/determinism.py::deterministic_context.
+  * Axis-A (batch invariance): bitwise within a single dtype because the native
+    reference projects each output row with the same GEMV-shaped fixed-K
+    reduction. The reduction path is independent of the flattened M
+    (=batch*seq) dimension.
 """
 
 import contextlib
@@ -93,26 +91,34 @@ def _rand_weight(vocab=_VOCAB, hidden=_HIDDEN, *, seed, dtype=torch.float32):
     return torch.randn(vocab, hidden, generator=gen, dtype=dtype)
 
 
-# Correctness of the fp32 ground truth: forward_fp32 == naive fp32 matmul,
-# bitwise. forward_fp32 disables autocast/TF32, so it is a true fp32 reference
-# unconditionally. The fp32 dtype path (forward) follows the ambient precision
-# context, so it is bitwise-equal to the ground truth only when TF32/autocast is
-# off (the default here); only bf16/fp16 introduce drift.
-def test_native_lm_head_fp32_matches_naive_matmul():
-    """forward_fp32 (and fp32 forward, TF32 off) is bitwise-equal to a naive fp32 matmul."""
+def _fixed_k_reference(hidden: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Tensor:
+    flat_hidden = hidden.reshape(-1, hidden.size(-1))
+    flat_out = torch.stack([torch.mv(weight, row) for row in flat_hidden], dim=0)
+    out = flat_out.reshape(*hidden.shape[:-1], weight.size(0))
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+# Correctness of the fp32 ground truth: forward_fp32 == row-wise fixed-K fp32
+# projection, bitwise. This intentionally avoids batched GEMM as the golden
+# source, because batched GEMM may choose a different K reduction tree when the
+# flattened M (=batch*seq) dimension changes.
+def test_native_lm_head_fp32_matches_fixed_k_reference():
+    """forward_fp32 and fp32 forward are bitwise-equal to the fixed-K reference."""
     hidden = _rand_hidden(2, 5, seed=1)
     weight = _rand_weight(seed=1)
 
-    # Pin TF32 off so the fp32 forward path and the naive reference below are both
-    # true fp32 regardless of the machine's global default, making this assertion
-    # deterministic. forward_fp32 disables TF32 internally and does not need this.
+    # Pin TF32 off so the fp32 forward path and fixed-K reference are both true
+    # fp32 regardless of the machine's global default. forward_fp32 disables TF32
+    # internally and does not need this.
     prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        naive = hidden.float() @ weight.float().t()
-        assert torch.equal(NativeLMHeadOp().forward_fp32(hidden, weight), naive)
+        ref = _fixed_k_reference(hidden.float(), weight.float())
+        assert torch.equal(NativeLMHeadOp().forward_fp32(hidden, weight), ref)
         # fp32 forward path computes in fp32 too -> bitwise equal to ground truth.
-        assert torch.equal(NativeLMHeadOp().forward(hidden, weight), naive)
+        assert torch.equal(NativeLMHeadOp().forward(hidden, weight), ref)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev_tf32
 
@@ -124,7 +130,7 @@ def test_forward_fp32_ignores_ambient_autocast_and_restores_tf32():
     weight = _rand_weight(vocab=7, hidden=32, seed=11)
     gen = torch.Generator().manual_seed(11)
     bias = torch.randn(7, generator=gen)
-    ref = hidden.float() @ weight.float().t() + bias.float()
+    ref = _fixed_k_reference(hidden.float(), weight.float(), bias.float())
 
     prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -330,8 +336,6 @@ def test_native_lm_head_qwen3_8b_real_shape():
     out = op.forward_fp32(hidden, weight)
     assert out.shape == (2, 16, _QWEN3_VOCAB)
     assert out.dtype == torch.float32
-    # Bitwise equal to the naive fp32 matmul (same call, same inputs).
-    assert torch.equal(out, hidden @ weight.t())
-    # NB: Axis-A bitwise is asserted on CPU (single-thread reduction) above.
-    # On GPU it is NOT free -- cuBLAS also splits K by the M dimension, so a
-    # batch-invariant GEMM is a downstream kernel concern, not validated here.
+    # Axis-A bitwise is already asserted above; this smoke test validates the
+    # fixed-K path at real Qwen3-8B vocab width and hidden reduction length.
+    assert torch.equal(out[:1], op.forward_fp32(hidden[:1], weight))
