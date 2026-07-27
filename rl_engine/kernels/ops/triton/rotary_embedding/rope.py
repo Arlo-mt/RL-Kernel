@@ -68,17 +68,13 @@ def _rope_kernel(
 
 def _build_cos_sin(positions: Tensor, half: int, theta: float, device: torch.device):
     """fp32 cos/sin caches of shape [S, half], identical math to NativeRoPEOp."""
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half)
-    )
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half))
     pos = positions.to(device=device, dtype=torch.float32).reshape(-1, 1)
     freqs = pos * inv_freq  # [S, half]
     return freqs.cos().contiguous(), freqs.sin().contiguous()
 
 
-def _launch_rope(
-    x: Tensor, cos: Tensor, sin: Tensor, S: int, sin_sign: float
-) -> Tensor:
+def _launch_rope(x: Tensor, cos: Tensor, sin: Tensor, S: int, sin_sign: float) -> Tensor:
     D = x.shape[-1]
     half = D // 2
     x_2d = x.contiguous().reshape(-1, D)
