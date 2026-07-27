@@ -52,6 +52,13 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
 
     # Variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
     PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
+    # Batch-invariant selected-logprob (WS1 #148: locked reduction order)
+    TRITON_BATCH_INVARIANT_LOGP = (
+        "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp"
+    )
+    PYTORCH_BATCH_INVARIANT_LOGP = (
+        "rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp.NativeBatchInvariantLogpOp"
+    )
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
 
@@ -172,6 +179,10 @@ class KernelRegistry:
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
+                "batch_invariant_logp": [
+                    OpBackend.TRITON_BATCH_INVARIANT_LOGP,
+                    OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+                ],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
@@ -197,6 +208,10 @@ class KernelRegistry:
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
+                "batch_invariant_logp": [
+                    OpBackend.TRITON_BATCH_INVARIANT_LOGP,
+                    OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+                ],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
@@ -216,6 +231,7 @@ class KernelRegistry:
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
+                "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
