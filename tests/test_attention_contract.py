@@ -27,14 +27,14 @@ from rl_engine.kernels.registry import KernelRegistry, OpBackend
 def _sharding(
     *,
     tp_rank: int = 0,
-    tp_world_size: int = 4,
+    tp_world_size: int = 2,
     cp_rank: int = 0,
-    cp_world_size: int = 4,
+    cp_world_size: int = 2,
     global_sequence_length: int = 4096,
-    local_sequence_length: int = 1024,
+    local_sequence_length: int = 2048,
     global_block_indices: tuple[int, ...] = (0,),
     global_block_token_starts: tuple[int, ...] = (0,),
-    local_block_offsets: tuple[int, ...] = (0, 1024),
+    local_block_offsets: tuple[int, ...] = (0, 2048),
     packed_sequence_offsets: tuple[int, ...] | None = None,
 ) -> ShardingSpec:
     local_q_heads = 32 // tp_world_size
@@ -97,8 +97,8 @@ def _declared_cp_backend() -> AttentionBackendCapability:
             {AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL, AttentionMode.DECODE}
         ),
         dtypes=frozenset({AttentionDType.BF16}),
-        tp_world_sizes=(4,),
-        cp_world_sizes=(1, 2, 4),
+        tp_world_sizes=(2,),
+        cp_world_sizes=(1, 2),
         exports_attention_lse=True,
         deterministic_cp_merge=True,
         supports_packed_varlen=True,
@@ -107,11 +107,13 @@ def _declared_cp_backend() -> AttentionBackendCapability:
     )
 
 
-def test_qwen3_tp4_cp4_contract_is_representable_and_serializable():
+def test_qwen3_tp2_cp2_contract_is_representable_and_serializable():
     contract = _contract()
 
-    assert contract.sharding.local_q_heads == 8
-    assert contract.sharding.local_kv_heads == 2
+    assert contract.sharding.local_q_heads == 16
+    assert contract.sharding.local_kv_heads == 4
+    assert contract.sharding.tp_world_size == 2
+    assert contract.sharding.cp_world_size == 2
     assert contract.reduction.acc_dtype is AttentionDType.FP32
     assert contract.to_dict()["reduction"] == {
         "merge": "online_softmax_lse",
@@ -126,8 +128,8 @@ def test_qwen3_tp4_cp4_contract_is_representable_and_serializable():
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("tp_rank", 4, "tp_rank=4"),
-        ("cp_rank", 4, "cp_rank=4"),
+        ("tp_rank", 2, "tp_rank=2"),
+        ("cp_rank", 2, "cp_rank=2"),
         ("global_block_indices", (), "must not be empty"),
         ("global_block_indices", (1, 0), "strictly increasing"),
     ],
@@ -135,20 +137,20 @@ def test_qwen3_tp4_cp4_contract_is_representable_and_serializable():
 def test_invalid_rank_and_cp_order_metadata_fail_loudly(field, value, message):
     values = {
         "tp_rank": 0,
-        "tp_world_size": 4,
+        "tp_world_size": 2,
         "cp_rank": 0,
-        "cp_world_size": 4,
+        "cp_world_size": 2,
         "global_q_heads": 32,
         "global_kv_heads": 8,
         "local_q_head_start": 0,
-        "local_q_heads": 8,
+        "local_q_heads": 16,
         "local_kv_head_start": 0,
-        "local_kv_heads": 2,
+        "local_kv_heads": 4,
         "global_sequence_length": 4096,
-        "local_sequence_length": 1024,
+        "local_sequence_length": 2048,
         "global_block_indices": (0,),
         "global_block_token_starts": (0,),
-        "local_block_offsets": (0, 1024),
+        "local_block_offsets": (0, 2048),
     }
     values[field] = value
 
@@ -171,26 +173,26 @@ def test_sequence_range_and_packed_offsets_are_validated():
     with pytest.raises(AttentionContractError, match="final packed_sequence_offsets"):
         _sharding(packed_sequence_offsets=(0, 512))
 
-    sharding = _sharding(packed_sequence_offsets=(0, 256, 1024))
-    assert sharding.packed_sequence_offsets == (0, 256, 1024)
+    sharding = _sharding(packed_sequence_offsets=(0, 512, 2048))
+    assert sharding.packed_sequence_offsets == (0, 512, 2048)
 
 
 def test_non_contiguous_cp_blocks_have_explicit_global_and_local_offsets():
     sharding = _sharding(
-        global_block_indices=(0, 7),
-        global_block_token_starts=(0, 3584),
-        local_block_offsets=(0, 512, 1024),
+        global_block_indices=(0, 3),
+        global_block_token_starts=(0, 3072),
+        local_block_offsets=(0, 1024, 2048),
     )
 
-    assert sharding.global_block_indices == (0, 7)
-    assert sharding.global_block_token_starts == (0, 3584)
-    assert sharding.local_block_offsets == (0, 512, 1024)
+    assert sharding.global_block_indices == (0, 3)
+    assert sharding.global_block_token_starts == (0, 3072)
+    assert sharding.local_block_offsets == (0, 1024, 2048)
 
     with pytest.raises(AttentionContractError, match="non-overlapping and ordered"):
         _sharding(
             global_block_indices=(0, 1),
-            global_block_token_starts=(0, 256),
-            local_block_offsets=(0, 512, 1024),
+            global_block_token_starts=(0, 512),
+            local_block_offsets=(0, 1024, 2048),
         )
 
 
@@ -207,7 +209,7 @@ def test_causal_attention_requires_explicit_offset():
 
 def test_full_prefill_query_length_must_match_local_sequence_length():
     with pytest.raises(AttentionContractError, match="prefill query_sequence_length must equal"):
-        _contract(mode="prefill", query_sequence_length=2048)
+        _contract(mode="prefill", query_sequence_length=1024)
 
     chunked = _contract(mode="chunked_prefill", query_sequence_length=512)
     decode = _contract(
@@ -410,7 +412,7 @@ def test_current_ws1_backend_rejects_strict_cp_contract_without_fallback():
         registry.get_attention_op(_contract())
 
     message = str(exc_info.value)
-    assert "CP=4 is unsupported" in message
+    assert "CP=2 is unsupported" in message
     assert "attention-domain LSE export is unsupported" in message
     assert "deterministic CP (out, lse) merge is unsupported" in message
 
@@ -435,7 +437,8 @@ def test_declared_compatible_backend_resolves_and_records_provenance():
     assert result.provenance["requested_backend"] == "deterministic"
     assert result.provenance["actual_backend"] == "test-deterministic-cp-attention"
     assert result.provenance["fallback"] is False
-    assert result.provenance["contract"]["sharding"]["cp_world_size"] == 4
+    assert result.provenance["contract"]["sharding"]["tp_world_size"] == 2
+    assert result.provenance["contract"]["sharding"]["cp_world_size"] == 2
     json.dumps(result.provenance)
 
 
@@ -455,7 +458,7 @@ def test_requested_stable_backend_id_is_enforced():
 def test_packed_layout_requires_declared_backend_support():
     capability = replace(_declared_cp_backend(), supports_packed_varlen=False)
     contract = _contract(
-        sharding=_sharding(packed_sequence_offsets=(0, 512, 1024)),
+        sharding=_sharding(packed_sequence_offsets=(0, 512, 2048)),
         causal_offsets=(0, 0),
         batch_size=2,
     )
@@ -464,7 +467,7 @@ def test_packed_layout_requires_declared_backend_support():
 
 
 def test_packed_sequence_count_must_match_logical_batch_size():
-    sharding = _sharding(packed_sequence_offsets=(0, 512, 1024))
+    sharding = _sharding(packed_sequence_offsets=(0, 512, 2048))
 
     with pytest.raises(AttentionContractError, match="must equal logical batch_size"):
         _contract(sharding=sharding, causal_offsets=(0, 0), batch_size=1)

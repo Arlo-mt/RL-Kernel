@@ -43,7 +43,7 @@ For full `prefill`, `query_sequence_length` equals the local sequence length des
 `ShardingSpec`. Chunked prefill and decode may use shorter query lengths than their available KV
 context.
 
-## Qwen3-8B TP=4 CP=4 Example
+## Qwen3-8B TP=2 CP=2 Example
 
 ```python
 from rl_engine.kernels.attention_contract import (
@@ -54,20 +54,20 @@ from rl_engine.kernels.attention_contract import (
 
 sharding = ShardingSpec(
     tp_rank=0,
-    tp_world_size=4,
+    tp_world_size=2,
     cp_rank=0,
-    cp_world_size=4,
+    cp_world_size=2,
     global_q_heads=32,
     global_kv_heads=8,
     local_q_head_start=0,
-    local_q_heads=8,
+    local_q_heads=16,
     local_kv_head_start=0,
-    local_kv_heads=2,
+    local_kv_heads=4,
     global_sequence_length=4096,
-    local_sequence_length=1024,
+    local_sequence_length=2048,
     global_block_indices=(0,),
     global_block_token_starts=(0,),
-    local_block_offsets=(0, 1024),
+    local_block_offsets=(0, 2048),
 )
 
 contract = AttentionContract(
@@ -75,7 +75,7 @@ contract = AttentionContract(
     mode="prefill",
     dtype="bf16",
     batch_size=1,
-    query_sequence_length=1024,
+    query_sequence_length=2048,
     head_dim=128,
     causal=True,
     causal_offsets=(0,),
@@ -84,14 +84,14 @@ contract = AttentionContract(
 )
 ```
 
-The TP fields preserve the global Qwen3 GQA mapping: each rank owns 8 of 32 query heads and 2 of
+The TP fields preserve the global Qwen3 GQA mapping: each rank owns 16 of 32 query heads and 4 of
 8 KV heads. The CP fields map local tensor slices to stable logical global block ids. A rank that
 owns non-contiguous blocks uses one global token start per block and one extra local boundary:
 
 ```python
-global_block_indices=(0, 7)
-global_block_token_starts=(0, 3584)
-local_block_offsets=(0, 512, 1024)
+global_block_indices=(0, 3)
+global_block_token_starts=(0, 3072)
+local_block_offsets=(0, 1024, 2048)
 ```
 
 This metadata is sufficient for a later implementation to restore logical global order without
@@ -183,6 +183,6 @@ Contract and dispatch behavior are covered by:
 python -m pytest tests/test_attention_contract.py -q
 ```
 
-The tests include Qwen3 TP=4/CP=4 construction, GQA ownership errors, non-contiguous CP blocks,
+The tests include Qwen3 TP=2/CP=2 construction, GQA ownership errors, non-contiguous CP blocks,
 packed varlen metadata, decode cache identity, undeclared backend rejection, no incompatible
 fallback, and JSON-compatible provenance.
