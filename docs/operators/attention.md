@@ -171,7 +171,7 @@ exactly one writer thread.
 
 **Backward dK/dV**: Per `(b, hkv, k, d)` output element, a single thread accumulates over
 query heads in group order then query positions:
-```
+```text
 for local = 0 .. g-1:       # g = Hq / Hkv
   hq = hkv * g + local
   for q = 0 .. Sq-1:

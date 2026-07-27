@@ -266,6 +266,8 @@ std::vector<torch::Tensor> deterministic_attention_forward(
     torch::optional<torch::Tensor> key_padding_mask) {
   check_deterministic_attention_inputs(q, k, v, key_padding_mask);
 
+  const at::cuda::OptionalCUDAGuard device_guard(at::device_of(q));
+
   auto q_contig = q.contiguous();
   auto k_contig = k.contiguous();
   auto v_contig = v.contiguous();
@@ -302,6 +304,7 @@ std::vector<torch::Tensor> deterministic_attention_forward(
               scores.data_ptr<float>(),
               B, Hq, Hkv, Sq, Skv, D,
               (float)scale);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
@@ -320,6 +323,7 @@ std::vector<torch::Tensor> deterministic_attention_forward(
         lse.data_ptr<float>(),
         pad_mask_ptr,
         B, Hq, Sq, Skv, causal);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // --- Launch PV kernel ---
@@ -338,6 +342,7 @@ std::vector<torch::Tensor> deterministic_attention_forward(
               v_contig.data_ptr<scalar_t>(),
               out.data_ptr<scalar_t>(),
               B, Hq, Hkv, Sq, Skv, D);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
@@ -544,6 +549,8 @@ std::vector<torch::Tensor> deterministic_attention_backward(
     double scale,
     torch::optional<torch::Tensor> key_padding_mask) {
 
+  const at::cuda::OptionalCUDAGuard device_guard(at::device_of(q));
+
   auto dO = grad_output.contiguous();
   auto q_c = q.contiguous();
   auto k_c = k.contiguous();
@@ -575,6 +582,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
               v_c.data_ptr<scalar_t>(),
               dP.data_ptr<float>(),
               B, Hq, Hkv, Sq, Skv, D);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
@@ -585,6 +593,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
         dP.data_ptr<float>(),
         P_c.data_ptr<float>(),
         Skv);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   // dP buffer now contains dS
 
@@ -605,6 +614,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
               dQ.data_ptr<scalar_t>(),
               B, Hq, Hkv, Sq, Skv, D,
               (float)scale);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
@@ -625,6 +635,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
               dK.data_ptr<scalar_t>(),
               B, Hq, Hkv, Sq, Skv, D,
               (float)scale);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 
@@ -644,6 +655,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
               dO.data_ptr<scalar_t>(),
               dV.data_ptr<scalar_t>(),
               B, Hq, Hkv, Sq, Skv, D);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
   }
 

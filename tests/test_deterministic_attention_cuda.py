@@ -91,26 +91,27 @@ def _make_case(name, dtype, hq, hkv, sq, skv, causal, scale=None, padding=False)
     )
 
 
-HARNESS_CASES = [
-    _make_case("bf16-gqa4x1-16x32-causal", torch.bfloat16, 4, 1, 16, 32, True),
-    _make_case("bf16-gqa32x8-16x32-causal", torch.bfloat16, 32, 8, 16, 32, True),
-    _make_case("bf16-gqa1x1-3x31-nocausal", torch.bfloat16, 1, 1, 3, 31, False),
-    _make_case("fp16-gqa4x2-17x33-causal", torch.float16, 4, 2, 17, 33, True),
-    _make_case("fp16-gqa32x8-1x64-decode", torch.float16, 32, 8, 1, 64, True),
-    _make_case("bf16-gqa4x1-16x16-nocausal", torch.bfloat16, 4, 1, 16, 16, False),
-    _make_case("bf16-gqa32x8-64x65-causal", torch.bfloat16, 32, 8, 64, 65, True),
-    _make_case("fp16-gqa4x1-65x127-causal", torch.float16, 4, 1, 65, 127, True),
-    _make_case("bf16-pad-gqa4x1-8x16", torch.bfloat16, 4, 1, 8, 16, True, padding=True),
-    _make_case("bf16-scale0-4x1-8x16", torch.bfloat16, 4, 1, 8, 16, True, scale=0.0),
-    _make_case("fp16-scale-custom-4x1-8x16", torch.float16, 4, 1, 8, 16, True, scale=0.05),
-]
+def _build_harness_cases():
+    return [
+        _make_case("bf16-gqa4x1-16x32-causal", torch.bfloat16, 4, 1, 16, 32, True),
+        _make_case("bf16-gqa32x8-16x32-causal", torch.bfloat16, 32, 8, 16, 32, True),
+        _make_case("bf16-gqa1x1-3x31-nocausal", torch.bfloat16, 1, 1, 3, 31, False),
+        _make_case("fp16-gqa4x2-17x33-causal", torch.float16, 4, 2, 17, 33, True),
+        _make_case("fp16-gqa32x8-1x64-decode", torch.float16, 32, 8, 1, 64, True),
+        _make_case("bf16-gqa4x1-16x16-nocausal", torch.bfloat16, 4, 1, 16, 16, False),
+        _make_case("bf16-gqa32x8-64x65-causal", torch.bfloat16, 32, 8, 64, 65, True),
+        _make_case("fp16-gqa4x1-65x127-causal", torch.float16, 4, 1, 65, 127, True),
+        _make_case("bf16-pad-gqa4x1-8x16", torch.bfloat16, 4, 1, 8, 16, True, padding=True),
+        _make_case("bf16-scale0-4x1-8x16", torch.bfloat16, 4, 1, 8, 16, True, scale=0.0),
+        _make_case("fp16-scale-custom-4x1-8x16", torch.float16, 4, 1, 8, 16, True, scale=0.05),
+    ]
 
 
 def test_harness_forward():
     """§8.4: run_operator_suite forward — candidate vs gold (accuracy tolerance)."""
     cuda = DeterministicAttentionOp()
     candidate = CandidateSpec(name="cuda-attention", fn=cuda, backend="cuda")
-    report = run_operator_suite("attention", candidates=[candidate], cases=HARNESS_CASES)
+    report = run_operator_suite("attention", candidates=[candidate], cases=_build_harness_cases())
     for cr in report.candidates:
         for case in cr.cases:
             if not case.passed:
@@ -130,7 +131,7 @@ def test_harness_backward():
     report = run_operator_suite(
         "attention",
         candidates=[candidate],
-        cases=HARNESS_CASES,
+        cases=_build_harness_cases(),
         check_grad=True,
         grad_mode="random",
     )

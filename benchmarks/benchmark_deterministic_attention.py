@@ -27,14 +27,15 @@ def benchmark_attention(
 
     torch.cuda.reset_peak_memory_stats()
 
-    for _ in range(warmup):
-        op.forward(q, k, v, causal=True)
-    torch.cuda.synchronize()
+    with torch.no_grad():
+        for _ in range(warmup):
+            op.forward(q, k, v, causal=True)
+        torch.cuda.synchronize()
 
-    start = time.perf_counter()
-    for _ in range(iters):
-        op.forward(q, k, v, causal=True)
-    torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(iters):
+            op.forward(q, k, v, causal=True)
+        torch.cuda.synchronize()
     elapsed = (time.perf_counter() - start) / iters
 
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
@@ -72,9 +73,15 @@ def main():
     print("-" * 65)
 
     for shape in QWEN3_8B_SHAPES:
-        label = shape.pop("label")
+        kwargs = shape.copy()
+        label = kwargs.pop("label")
         try:
-            result = benchmark_attention(**shape, dtype=dtype, warmup=args.warmup, iters=args.iters)
+            result = benchmark_attention(
+                **kwargs,
+                dtype=dtype,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
             print(
                 f"{label:<25} {result['latency_ms']:>12.3f} "
                 f"{result['peak_memory_mb']:>12.1f} "
@@ -82,7 +89,8 @@ def main():
             )
         except RuntimeError as exc:
             print(f"{label:<25} {'OOM' if 'out of memory' in str(exc) else 'ERROR':>12}")
-        shape["label"] = label
+            if "out of memory" in str(exc):
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from typing import Optional
 
 import torch
 from torch.autograd import Function
+from torch.autograd.function import once_differentiable
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
@@ -41,17 +42,17 @@ class _DeterministicAttentionFn(Function):
         results = _C.deterministic_attention_forward(q_c, k_c, v_c, causal, float(scale), mask_c)
         out, lse, P = results[0], results[1], results[2]
 
-        ctx.save_for_backward(q_c, k_c, v_c, P)
+        ctx.save_for_backward(q_c, k_c, v_c, P, mask_c)
         ctx.causal = causal
         ctx.scale = scale
-        ctx.key_padding_mask = mask_c
         ctx.mark_non_differentiable(lse)
 
         return out, lse
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_out: torch.Tensor, grad_lse: torch.Tensor):
-        q_c, k_c, v_c, P = ctx.saved_tensors
+        q_c, k_c, v_c, P, mask_c = ctx.saved_tensors
 
         dQ, dK, dV = _C.deterministic_attention_backward(
             grad_out.contiguous(),
@@ -61,7 +62,7 @@ class _DeterministicAttentionFn(Function):
             P,
             ctx.causal,
             float(ctx.scale),
-            ctx.key_padding_mask,
+            mask_c,
         )
 
         return dQ, dK, dV, None, None, None
