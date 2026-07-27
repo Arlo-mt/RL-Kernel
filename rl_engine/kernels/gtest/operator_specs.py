@@ -70,6 +70,19 @@ OP_SPECS = {
             ),
         },
         grad_input_names=("q", "k", "v"),
+    "batch_invariant_logp": OperatorSpec(
+        name="batch_invariant_logp",
+        op_class="logprob",
+        gold_path="rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp."
+        "NativeBatchInvariantLogpOp",
+        gold_method="apply",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp."
+            "NativeBatchInvariantLogpOp",
+            "triton": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp."
+            "TritonBatchInvariantLogpOp",
+        },
+        grad_input_names=("logits",),
     ),
 }
 
