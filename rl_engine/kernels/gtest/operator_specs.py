@@ -70,6 +70,7 @@ OP_SPECS = {
             ),
         },
         grad_input_names=("q", "k", "v"),
+    ),
     "batch_invariant_logp": OperatorSpec(
         name="batch_invariant_logp",
         op_class="logprob",
