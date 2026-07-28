@@ -140,6 +140,7 @@ def get_extensions():
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
             "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
+            "csrc/cuda/rope_sm90.cu",  # RoPE rotate-half apply, gated to SM90 build
         ]
         enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
         present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
