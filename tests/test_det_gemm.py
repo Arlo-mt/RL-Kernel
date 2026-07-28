@@ -83,8 +83,8 @@ def test_forward_correctness(name, gemm):
     out = gemm(a, b).float()
     ref = a.float() @ b.float()
     contract = load_contract()
-    thresholds = contract.accuracy.default.reduction.bfloat16
-    torch.testing.assert_close(out, ref, atol=thresholds.atol, rtol=thresholds.rtol)
+    thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
+    torch.testing.assert_close(out, ref, atol=thresholds["atol"], rtol=thresholds["rtol"])
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -115,9 +115,13 @@ def test_backward_correctness(name, gemm):
     bf = b.detach().float().requires_grad_(True)
     (af @ bf).backward(g.float())
     contract = load_contract()
-    thresholds = contract.accuracy.default.reduction.bfloat16
-    torch.testing.assert_close(a.grad.float(), af.grad, atol=thresholds.atol, rtol=thresholds.rtol)
-    torch.testing.assert_close(b.grad.float(), bf.grad, atol=thresholds.atol, rtol=thresholds.rtol)
+    thresholds = contract["accuracy"]["default"]["reduction"]["bfloat16"]
+    torch.testing.assert_close(
+        a.grad.float(), af.grad, atol=thresholds["atol"], rtol=thresholds["rtol"]
+    )
+    torch.testing.assert_close(
+        b.grad.float(), bf.grad, atol=thresholds["atol"], rtol=thresholds["rtol"]
+    )
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
