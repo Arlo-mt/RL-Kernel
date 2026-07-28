@@ -27,3 +27,10 @@ def test_logprob_bfloat16_tolerance_covers_observed_reference_drift():
     tolerance = contract["accuracy"]["default"]["logprob"]["bfloat16"]
     assert tolerance["atol"] >= 5.0e-2
     assert tolerance["rtol"] == 0.0
+
+
+def test_attention_bfloat16_tolerance_matches_contract():
+    contract = load_contract()
+    tolerance = contract["accuracy"]["default"]["attention"]["bfloat16"]
+    assert tolerance["atol"] >= 5.0e-2
+    assert tolerance["rtol"] >= 2.0e-2
