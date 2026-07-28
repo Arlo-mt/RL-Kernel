@@ -88,6 +88,18 @@ OP_SPECS = {
         },
         grad_input_names=("hidden", "lm_head_weight"),
     ),
+    "rope": OperatorSpec(
+        name="rope",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+            "triton": "rl_engine.kernels.ops.triton.rotary_embedding.rope.TritonRoPEOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op",
+        },
+        grad_input_names=("x",),
+    ),
     "batch_invariant_logp": OperatorSpec(
         name="batch_invariant_logp",
         op_class="logprob",
