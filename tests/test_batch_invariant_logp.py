@@ -832,9 +832,8 @@ class TestCudaSM90Correctness:
     """Compiled SM90 TMA kernel output must match log_softmax + gather."""
 
     def _get_op(self):
-        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import (
-            BatchInvariantLogpSM90Op,
-        )
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
         return BatchInvariantLogpSM90Op()
 
     def test_matches_reference_fp32(self):
@@ -902,9 +901,8 @@ class TestCudaSM90BatchInvariance:
     """SM90 kernel must be bitwise batch-invariant (one CTA per row)."""
 
     def _get_op(self):
-        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import (
-            BatchInvariantLogpSM90Op,
-        )
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
         return BatchInvariantLogpSM90Op()
 
     def test_batch_size_1_vs_n(self):
@@ -936,9 +934,9 @@ class TestCudaSM90BatchInvariance:
             batch_logits[pos] = row.squeeze(0)
             batch_target[pos] = target.squeeze(0)
             results.append(op(batch_logits, batch_target)[pos].item())
-        assert all(r == results[0] for r in results), (
-            f"SM90 position drift: unique = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"SM90 position drift: unique = {set(results)}"
 
     def test_repeated_runs(self):
         op = self._get_op()
@@ -954,9 +952,8 @@ class TestCudaSM90Backward:
     """Gradient through the SM90 op must match reference."""
 
     def _get_op(self):
-        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import (
-            BatchInvariantLogpSM90Op,
-        )
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
         return BatchInvariantLogpSM90Op()
 
     def test_backward_matches_reference(self):
@@ -983,9 +980,8 @@ class TestCudaSM90Backward:
 class TestCudaSM90IgnoreIndex:
 
     def _get_op(self):
-        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import (
-            BatchInvariantLogpSM90Op,
-        )
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
         return BatchInvariantLogpSM90Op()
 
     def test_ignore_outputs_zero(self):
@@ -1004,9 +1000,8 @@ class TestCudaSM90Fallback:
     """Inputs the TMA path can't take must silently fall back and stay correct."""
 
     def _get_op(self):
-        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import (
-            BatchInvariantLogpSM90Op,
-        )
+        from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
+
         return BatchInvariantLogpSM90Op()
 
     def test_fp16_falls_back(self):
