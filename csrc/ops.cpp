@@ -79,6 +79,24 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torc
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+// Deterministic standard-softmax attention (issue #147)
+std::vector<torch::Tensor> deterministic_attention_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
+std::vector<torch::Tensor> deterministic_attention_backward(
+    torch::Tensor grad_output,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor P,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
 
 // Prefix-Shared Attention Declarations & Wrappers
 
@@ -179,5 +197,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
+    // Deterministic standard-softmax attention (issue #147)
+    m.def(
+        "deterministic_attention_forward",
+        &deterministic_attention_forward,
+        "Deterministic standard softmax attention forward (out, lse)");
+    m.def(
+        "deterministic_attention_backward",
+        &deterministic_attention_backward,
+        "Deterministic standard softmax attention backward (dQ, dK, dV)");
 #endif
 }
