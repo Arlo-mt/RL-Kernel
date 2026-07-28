@@ -77,6 +77,25 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
+// Deterministic standard-softmax attention (issue #147)
+std::vector<torch::Tensor> deterministic_attention_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
+std::vector<torch::Tensor> deterministic_attention_backward(
+    torch::Tensor grad_output,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor P,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
 // Prefix-Shared Attention Declarations & Wrappers
 
 void prefix_shared_attention_forward(
@@ -174,5 +193,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+
+    // Deterministic standard-softmax attention (issue #147)
+    m.def(
+        "deterministic_attention_forward",
+        &deterministic_attention_forward,
+        "Deterministic standard softmax attention forward (out, lse)");
+    m.def(
+        "deterministic_attention_backward",
+        &deterministic_attention_backward,
+        "Deterministic standard softmax attention backward (dQ, dK, dV)");
 #endif
 }

@@ -79,6 +79,7 @@ def get_extensions():
             "csrc/fused_logp_kernel.cu",
             "csrc/deterministic_logp_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
+            "csrc/cuda/attention/deterministic_attention.cu",
         ]
 
         cc_major, cc_minor = torch.cuda.get_device_capability()
