@@ -9,12 +9,12 @@ from rl_engine.kernels.gtest.tolerance import load_contract
 def test_load_contract_contains_expected_operator_classes():
     contract = load_contract()
     accuracy = contract["accuracy"]["default"]
-    assert set(accuracy) == {"elementwise", "reduction", "logprob"}
+    assert set(accuracy) == {"elementwise", "reduction", "logprob", "attention"}
 
 
 def test_load_contract_contains_expected_dtypes():
     contract = load_contract()
-    for op_class in ("elementwise", "reduction", "logprob"):
+    for op_class in ("elementwise", "reduction", "logprob", "attention"):
         assert set(contract["accuracy"]["default"][op_class]) == {
             "float32",
             "bfloat16",
