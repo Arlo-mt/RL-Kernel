@@ -42,6 +42,24 @@ def _run_backward(op, q, k, v, dy, *, causal=True, key_padding_mask=None):
     return out.detach(), q_req.grad.detach(), k_req.grad.detach(), v_req.grad.detach()
 
 
+def _run_chunked_prefill(q, k, v, *, chunk_size: int, key_padding_mask=None):
+    outs = []
+    lses = []
+    for start in range(0, q.size(2), chunk_size):
+        end = min(q.size(2), start + chunk_size)
+        chunk_mask = None if key_padding_mask is None else key_padding_mask[:, :end]
+        out, lse = triton_batch_invariant_attention_with_lse(
+            q[:, :, start:end],
+            k[:, :, :end],
+            v[:, :, :end],
+            causal=True,
+            key_padding_mask=chunk_mask,
+        )
+        outs.append(out)
+        lses.append(lse)
+    return torch.cat(outs, dim=2), torch.cat(lses, dim=2)
+
+
 @requires_cuda
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
@@ -171,6 +189,64 @@ def test_triton_attention_lse_padding_layout_invariant():
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "q_heads, kv_heads, head_dim",
+    [
+        pytest.param(4, 4, 32, id="mha"),
+        pytest.param(4, 2, 32, id="gqa-small"),
+        pytest.param(8, 2, 64, id="gqa-wide"),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 13])
+def test_triton_attention_chunked_prefill_matches_full_prefill(
+    q_heads, kv_heads, head_dim, chunk_size
+):
+    q, k, v = _qkv(
+        2,
+        13,
+        13,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        seed=20,
+    )
+
+    full, full_lse = triton_batch_invariant_attention_with_lse(q, k, v, causal=True)
+    chunked, chunked_lse = _run_chunked_prefill(q, k, v, chunk_size=chunk_size)
+
+    assert torch.equal(full, chunked)
+    assert torch.equal(full_lse, chunked_lse)
+
+
+@requires_cuda
+@pytest.mark.parametrize("chunk_size", [1, 4, 6])
+def test_triton_attention_chunked_prefill_with_key_padding_mask(chunk_size):
+    q, k, v = _qkv(2, 13, 13, dtype=torch.bfloat16, seed=21)
+    mask = torch.ones((2, 13), device="cuda", dtype=torch.bool)
+    mask[0, 9:] = False
+    mask[1, 11:] = False
+
+    full, full_lse = triton_batch_invariant_attention_with_lse(
+        q,
+        k,
+        v,
+        causal=True,
+        key_padding_mask=mask,
+    )
+    chunked, chunked_lse = _run_chunked_prefill(
+        q,
+        k,
+        v,
+        chunk_size=chunk_size,
+        key_padding_mask=mask,
+    )
+
+    assert torch.equal(full, chunked)
+    assert torch.equal(full_lse, chunked_lse)
+
+
+@requires_cuda
 def test_triton_attention_decode_matches_prefill_suffix_context():
     dtype = torch.bfloat16
     q_full, k_full, v_full = _qkv(1, 12, 12, dtype=dtype, seed=6)
@@ -180,6 +256,55 @@ def test_triton_attention_decode_matches_prefill_suffix_context():
     decode = op(q_full[:, :, -1:], k_full, v_full, causal=True)
 
     assert torch.equal(prefill[:, :, -1:], decode)
+
+
+@requires_cuda
+@pytest.mark.parametrize("s_new", [1, 3])
+def test_triton_attention_kv_cache_handoff_matches_prefill_suffix(s_new):
+    dtype = torch.bfloat16
+    q_full, k_full, v_full = _qkv(2, 12, 12, dtype=dtype, seed=22)
+    op = TritonBatchInvariantAttentionOp()
+
+    prefill = op(q_full, k_full, v_full, causal=True)
+    decode = op(q_full[:, :, -s_new:], k_full, v_full, causal=True)
+
+    assert torch.equal(prefill[:, :, -s_new:], decode)
+
+
+@requires_cuda
+def test_triton_attention_all_false_key_padding_mask_row_matches_native():
+    dtype = torch.bfloat16
+    q, k, v = _qkv(2, 5, 5, dtype=dtype, seed=23)
+    mask = torch.ones((2, 5), device="cuda", dtype=torch.bool)
+    mask[1] = False
+    q_req = q.detach().clone().requires_grad_(True)
+    k_req = k.detach().clone().requires_grad_(True)
+    v_req = v.detach().clone().requires_grad_(True)
+
+    out, lse = triton_batch_invariant_attention_with_lse(
+        q_req,
+        k_req,
+        v_req,
+        causal=False,
+        key_padding_mask=mask,
+    )
+    ref = NativeAttentionOp().forward_fp32(q, k, v, causal=False, key_padding_mask=mask)
+
+    assert torch.equal(out[1], torch.zeros_like(out[1]))
+    assert torch.isfinite(out).all()
+    assert torch.isneginf(lse[1]).all()
+    assert torch.equal(ref[1], torch.zeros_like(ref[1]))
+    torch.testing.assert_close(out.float(), ref, atol=5e-2, rtol=2e-2)
+
+    dy = torch.randn_like(out)
+    out.backward(dy)
+
+    assert torch.isfinite(q_req.grad).all()
+    assert torch.isfinite(k_req.grad).all()
+    assert torch.isfinite(v_req.grad).all()
+    assert torch.equal(q_req.grad[1], torch.zeros_like(q_req.grad[1]))
+    assert torch.equal(k_req.grad[1], torch.zeros_like(k_req.grad[1]))
+    assert torch.equal(v_req.grad[1], torch.zeros_like(v_req.grad[1]))
 
 
 @requires_cuda
