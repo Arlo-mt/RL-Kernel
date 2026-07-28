@@ -102,9 +102,7 @@ class NativeBatchInvariantLogpOp:
 
         selected_logp = selected_logit - log_sum_exp
 
-        selected_logp = selected_logp.where(
-            valid_mask, torch.zeros_like(selected_logp)
-        )
+        selected_logp = selected_logp.where(valid_mask, torch.zeros_like(selected_logp))
 
         return selected_logp
 

@@ -12,11 +12,8 @@ The test suite validates two orthogonal properties:
 import pytest
 import torch
 
-from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
-    NativeBatchInvariantLogpOp,
-)
+from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import NativeBatchInvariantLogpOp
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
-
 
 _V = 300
 
@@ -27,6 +24,7 @@ requires_cuda = pytest.mark.skipif(
 
 try:
     import triton  # noqa: F401
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -198,7 +196,6 @@ class TestBatchInvariance:
 
     def test_different_positions_in_batch(self):
         """Same row at different positions in the same batch must be bitwise equal."""
-        op = NativeBatchInvariantLogpOp()
         row = _make_row(99)
         target = torch.tensor([13])
 
@@ -208,9 +205,9 @@ class TestBatchInvariance:
             val = self._get_row_result_in_batch(row, target, batch_size, pos).item()
             results.append(val)
 
-        assert all(r == results[0] for r in results), (
-            f"Position-dependent drift detected: unique values = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"Position-dependent drift detected: unique values = {set(results)}"
 
     def test_mixed_batch_content(self):
         """Changing *other* rows in the batch must not affect our row's result."""
@@ -229,9 +226,9 @@ class TestBatchInvariance:
             out = op(batch_logits, batch_target)
             results.append(out[3].item())
 
-        assert all(r == results[0] for r in results), (
-            f"Mixed-batch drift: unique values = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"Mixed-batch drift: unique values = {set(results)}"
 
     def test_padding_layout_invariance(self):
         """Left-padding vs right-padding must not affect real rows."""
@@ -251,9 +248,7 @@ class TestBatchInvariance:
         out_left = op(batch_left, target_left)
         out_right = op(batch_right, target_right)
 
-        assert out_left[2].item() == out_right[0].item(), (
-            "Padding layout changed the result"
-        )
+        assert out_left[2].item() == out_right[0].item(), "Padding layout changed the result"
 
     def test_repeated_runs_deterministic(self):
         """Same input repeated N times must produce bitwise-identical output."""
@@ -278,9 +273,7 @@ class TestBatchInvariance:
         target_b = torch.tensor([target_val, -100, -100, -100])
         out_b = op(batch_a, target_b)
 
-        assert out_a[0].item() == out_b[0].item(), (
-            "ignore_index on other rows changed row 0"
-        )
+        assert out_a[0].item() == out_b[0].item(), "ignore_index on other rows changed row 0"
         assert out_b[1].item() == 0.0
         assert out_b[2].item() == 0.0
         assert out_b[3].item() == 0.0
@@ -375,9 +368,9 @@ class TestBackward:
             batch_target[0] = target.squeeze(0)
             op(batch_logits, batch_target).sum().backward()
             grad_in_batch = batch_logits.grad[0:1].detach().clone()
-            assert torch.equal(grad_alone, grad_in_batch), (
-                f"Gradient drift at batch_size={batch_size}"
-            )
+            assert torch.equal(
+                grad_alone, grad_in_batch
+            ), f"Gradient drift at batch_size={batch_size}"
 
 
 # ---------------------------------------------------------------------------
@@ -475,9 +468,9 @@ class TestCUDABatchInvariance:
             batch_logits[pos] = row.squeeze(0)
             batch_target[pos] = target.squeeze(0)
             results.append(op(batch_logits, batch_target)[pos].item())
-        assert all(r == results[0] for r in results), (
-            f"CUDA position drift: unique = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"CUDA position drift: unique = {set(results)}"
 
     def test_repeated_runs_cuda(self):
         op = NativeBatchInvariantLogpOp()
@@ -494,10 +487,9 @@ class TestCUDABatchInvariance:
         target_cpu = torch.randint(0, _V, (8,))
         out_cpu = op(logits_cpu, target_cpu)
         out_cuda = op(logits_cpu.cuda(), target_cpu.cuda())
-        assert torch.allclose(out_cpu, out_cuda.cpu(), atol=1e-6, rtol=1e-6), (
-            "CPU vs CUDA result mismatch"
-        )
-
+        assert torch.allclose(
+            out_cpu, out_cuda.cpu(), atol=1e-6, rtol=1e-6
+        ), "CPU vs CUDA result mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +509,7 @@ class TestTritonCorrectness:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_matches_reference_fp32(self):
@@ -576,6 +569,7 @@ class TestTritonCorrectness:
         from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
             NativeBatchInvariantLogpOp,
         )
+
         triton_op = self._get_op()
         pytorch_op = NativeBatchInvariantLogpOp()
         logits = torch.randn(16, _V, device="cuda")
@@ -598,6 +592,7 @@ class TestTritonBatchInvariance:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_batch_size_1_vs_n(self):
@@ -629,9 +624,9 @@ class TestTritonBatchInvariance:
             batch_logits[pos] = row.squeeze(0)
             batch_target[pos] = target.squeeze(0)
             results.append(op(batch_logits, batch_target)[pos].item())
-        assert all(r == results[0] for r in results), (
-            f"Triton position drift: unique = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"Triton position drift: unique = {set(results)}"
 
     def test_repeated_runs(self):
         op = self._get_op()
@@ -654,9 +649,9 @@ class TestTritonBatchInvariance:
             batch_logits[3] = row.squeeze(0)
             batch_target[3] = target.squeeze(0)
             results.append(op(batch_logits, batch_target)[3].item())
-        assert all(r == results[0] for r in results), (
-            f"Triton mixed-batch drift: unique = {set(results)}"
-        )
+        assert all(
+            r == results[0] for r in results
+        ), f"Triton mixed-batch drift: unique = {set(results)}"
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +667,7 @@ class TestTritonBackward:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_backward_matches_reference(self):
@@ -706,9 +702,9 @@ class TestTritonBackward:
             batch_target[0] = target.squeeze(0)
             op(batch_logits, batch_target).sum().backward()
             grad_in_batch = batch_logits.grad[0:1].detach().clone()
-            assert torch.allclose(grad_alone, grad_in_batch, atol=1e-5), (
-                f"Triton gradient drift at batch_size={batch_size}"
-            )
+            assert torch.allclose(
+                grad_alone, grad_in_batch, atol=1e-5
+            ), f"Triton gradient drift at batch_size={batch_size}"
 
     def test_ignored_row_grad_is_zero(self):
         """Ignored rows must have zero gradient across the entire vocab."""
@@ -760,6 +756,7 @@ class TestTritonIgnoreIndex:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_ignore_outputs_zero(self):
@@ -793,6 +790,7 @@ class TestTritonCPUValidation:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_rejects_cpu_tensor(self):
@@ -808,6 +806,7 @@ class TestTritonValidation:
         from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
             TritonBatchInvariantLogpOp,
         )
+
         return TritonBatchInvariantLogpOp()
 
     def test_rejects_1d_logits(self):

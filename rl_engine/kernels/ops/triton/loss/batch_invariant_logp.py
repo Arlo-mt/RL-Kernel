@@ -124,9 +124,7 @@ class _BatchInvariantLogpFunction(torch.autograd.Function):
         vocab_size = logits.size(-1)
 
         logits_2d = logits.reshape(-1, vocab_size).contiguous()
-        target_1d = target_ids.reshape(-1).to(
-            device=logits.device, dtype=torch.int64
-        ).contiguous()
+        target_1d = target_ids.reshape(-1).to(device=logits.device, dtype=torch.int64).contiguous()
 
         num_tokens = logits_2d.shape[0]
         output = torch.empty(num_tokens, device=logits.device, dtype=torch.float32)
@@ -218,8 +216,7 @@ class TritonBatchInvariantLogpOp:
             )
         if logits.dim() < 2:
             raise ValueError(
-                f"logits must be at least 2-D ([*lead, V]), got shape "
-                f"{tuple(logits.shape)}"
+                f"logits must be at least 2-D ([*lead, V]), got shape " f"{tuple(logits.shape)}"
             )
         if logits.shape[:-1] != target_ids.shape:
             raise ValueError(
@@ -234,12 +231,9 @@ class TritonBatchInvariantLogpOp:
             if valid_targets.numel() > 0 and (
                 (valid_targets < 0).any() or (valid_targets >= vocab_size).any()
             ):
-                bad = valid_targets[
-                    (valid_targets < 0) | (valid_targets >= vocab_size)
-                ]
+                bad = valid_targets[(valid_targets < 0) | (valid_targets >= vocab_size)]
                 raise ValueError(
-                    f"target_ids contains values outside [0, {vocab_size}): "
-                    f"{bad.tolist()}"
+                    f"target_ids contains values outside [0, {vocab_size}): " f"{bad.tolist()}"
                 )
 
         return _BatchInvariantLogpFunction.apply(logits, target_ids, ignore_index)
