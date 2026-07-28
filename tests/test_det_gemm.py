@@ -10,6 +10,7 @@ non-deterministic reference baseline and would fail batch-invariance by design.
 import pytest
 import torch
 
+from rl_engine.kernels.gtest.tolerance import load_contract
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
 
 try:
@@ -76,13 +77,14 @@ def test_forward_padding_invariance(name, gemm):
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
 def test_forward_correctness(name, gemm):
-    # vs FP32 reference. Placeholder tolerance; PR3 swaps for #108 contract.
     torch.manual_seed(3)
     M, K, N = 128, 2048, 2048
     a, b = _rand(M, K), _rand(K, N)
     out = gemm(a, b).float()
     ref = a.float() @ b.float()
-    assert (out - ref).abs().max().item() < 1.0  # TODO(#108): contract threshold
+    contract = load_contract()
+    thresholds = contract.accuracy.default.reduction.bfloat16
+    torch.testing.assert_close(out, ref, atol=thresholds.atol, rtol=thresholds.rtol)
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
@@ -103,7 +105,6 @@ def test_backward_batch_invariance(name, gemm):
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)
 def test_backward_correctness(name, gemm):
-    # dA / dB vs FP32 reference gradients. Placeholder tolerance; PR3 -> #108.
     torch.manual_seed(5)
     M, K, N = 64, 1024, 1024
     a = _rand(M, K).requires_grad_(True)
@@ -113,8 +114,10 @@ def test_backward_correctness(name, gemm):
     af = a.detach().float().requires_grad_(True)
     bf = b.detach().float().requires_grad_(True)
     (af @ bf).backward(g.float())
-    assert (a.grad.float() - af.grad).abs().max().item() < 2.0  # TODO(#108)
-    assert (b.grad.float() - bf.grad).abs().max().item() < 2.0  # TODO(#108)
+    contract = load_contract()
+    thresholds = contract.accuracy.default.reduction.bfloat16
+    torch.testing.assert_close(a.grad.float(), af.grad, atol=thresholds.atol, rtol=thresholds.rtol)
+    torch.testing.assert_close(b.grad.float(), bf.grad, atol=thresholds.atol, rtol=thresholds.rtol)
 
 
 @pytest.mark.parametrize("name,gemm", _BACKENDS)

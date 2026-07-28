@@ -68,6 +68,7 @@ OP_SPECS = {
             "triton": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
         },
         grad_input_names=("a", "b"),
+    ),
     "attention": OperatorSpec(
         name="attention",
         op_class="attention",
