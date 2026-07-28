@@ -45,6 +45,24 @@ OP_SPECS = {
         },
         grad_input_names=("x", "weight"),
     ),
+    "attention": OperatorSpec(
+        name="attention",
+        op_class="attention",
+        gold_path="rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp",
+            "triton": (
+                "rl_engine.kernels.ops.triton.attention.standard_attn."
+                "TritonBatchInvariantAttentionOp"
+            ),
+            "cuda": (
+                "rl_engine.kernels.ops.cuda.attention.deterministic_attn."
+                "DeterministicAttentionOp"
+            ),
+        },
+        grad_input_names=("q", "k", "v"),
+    ),
     "logp": OperatorSpec(
         name="logp",
         op_class="logprob",

@@ -186,6 +186,25 @@ torch::Tensor rmsnorm_backward_dw(
   return dw;
 }
 
+// Deterministic standard-softmax attention (issue #147)
+std::vector<torch::Tensor> deterministic_attention_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
+std::vector<torch::Tensor> deterministic_attention_backward(
+    torch::Tensor grad_output,
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor P,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
 // Prefix-Shared Attention Declarations & Wrappers
 
 void prefix_shared_attention_forward(
@@ -285,5 +304,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
+
+    // Deterministic standard-softmax attention (issue #147)
+    m.def(
+        "deterministic_attention_forward",
+        &deterministic_attention_forward,
+        "Deterministic standard softmax attention forward (out, lse)");
+    m.def(
+        "deterministic_attention_backward",
+        &deterministic_attention_backward,
+        "Deterministic standard softmax attention backward (dQ, dK, dV)");
 #endif
 }
