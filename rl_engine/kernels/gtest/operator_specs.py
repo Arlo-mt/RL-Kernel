@@ -32,6 +32,19 @@ def _load_object(path: str) -> Any:
 
 
 OP_SPECS = {
+    "rms_norm": OperatorSpec(
+        name="rms_norm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+            "triton": "rl_engine.kernels.ops.triton.rmsnorm_triton.RMSNormTritonOp",
+            "cuda": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+        },
+        grad_input_names=("x", "weight"),
+    ),
     "attention": OperatorSpec(
         name="attention",
         op_class="attention",
@@ -42,6 +55,10 @@ OP_SPECS = {
             "triton": (
                 "rl_engine.kernels.ops.triton.attention.standard_attn."
                 "TritonBatchInvariantAttentionOp"
+            ),
+            "cuda": (
+                "rl_engine.kernels.ops.cuda.attention.deterministic_attn."
+                "DeterministicAttentionOp"
             ),
         },
         grad_input_names=("q", "k", "v"),
