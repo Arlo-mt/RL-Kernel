@@ -123,6 +123,8 @@ OP_SPECS = {
             "NativeBatchInvariantLogpOp",
             "triton": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp."
             "TritonBatchInvariantLogpOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.batch_invariant_logp."
+            "BatchInvariantLogpSM90Op",
         },
         grad_input_names=("logits",),
     ),

@@ -13,6 +13,9 @@ std::vector<torch::Tensor> fused_linear_logp_sm90_forward(torch::Tensor hidden,
                                                           torch::Tensor weight,
                                                           torch::Tensor target,
                                                           torch::optional<torch::Tensor> bias);
+std::vector<torch::Tensor> batch_invariant_logp_sm90_forward(torch::Tensor logits,
+                                                             torch::Tensor target,
+                                                             int64_t ignore_index);
 std::vector<torch::Tensor> fused_linear_logp_sm90_global_target_forward(
     torch::Tensor hidden,
     torch::Tensor weight,
@@ -267,6 +270,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_logp_sm90", &fused_logp_sm90_forward, "TMA-accelerated Online Softmax Fused LogP");
     m.def("fused_linear_logp_sm90", &fused_linear_logp_sm90_forward,
           "TMA+WGMMA fused linear log-prob (hidden @ W^T -> selected-token logp), SM90");
+    m.def("batch_invariant_logp_sm90", &batch_invariant_logp_sm90_forward,
+          "TMA online-softmax batch-invariant selected-token log-prob from logits, SM90");
     m.def("fused_linear_logp_sm90_global_target", &fused_linear_logp_sm90_global_target_forward,
           "TMA+WGMMA local-shard target-logit/lse for vocab-parallel linear log-prob, SM90");
     m.def("fused_linear_logp_sm90_backward", &fused_linear_logp_sm90_backward,

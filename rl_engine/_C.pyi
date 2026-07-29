@@ -4,6 +4,11 @@ import torch
 
 def fused_logp(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor: ...
 def fused_logp_sm90(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor: ...
+def batch_invariant_logp_sm90(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_index: int,
+) -> list[torch.Tensor]: ...
 def fused_linear_logp_sm90(
     hidden: torch.Tensor,
     weight: torch.Tensor,
