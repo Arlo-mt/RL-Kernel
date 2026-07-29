@@ -198,7 +198,7 @@ def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(mon
     flat_hidden = hidden.detach().reshape(-1, hidden.size(-1))
     flat_dy = dy.reshape(-1, weight.size(0))
     expected_hidden = flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16)
-    expected_weight = flat_dy.float().t().matmul(flat_hidden.float()).to(torch.bfloat16)
+    expected_weight = flat_hidden.float().t().matmul(flat_dy.float()).to(torch.bfloat16).t()
 
     assert calls == [("da", (6, 7), (5, 7)), ("db", (6, 5), (6, 7))]
     assert torch.equal(hidden.grad, expected_hidden.reshape_as(hidden))

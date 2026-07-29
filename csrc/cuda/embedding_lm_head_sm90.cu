@@ -12,13 +12,19 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <array>
 #include <limits>
+#include <mutex>
 #include <torch/extension.h>
 #include <vector>
 
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kMaxCachedDevices = 64;
+
+// Reference path: one CTA per logit is intentionally throughput-heavy for large
+// vocab prefill. It exists to preserve a fixed K reduction order for WS1.
 
 template <typename T>
 __device__ __forceinline__ float to_float(T value) {
@@ -134,10 +140,29 @@ bool is_supported_float_dtype(at::ScalarType dtype) {
 void check_sm90_device() {
     int device = 0;
     C10_CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    TORCH_CHECK(prop.major == 9, "SM90 embedding/lm_head kernels require Hopper, got sm_",
-                prop.major, prop.minor);
+    static std::array<int, kMaxCachedDevices> cached_major{};
+    static std::array<int, kMaxCachedDevices> cached_minor{};
+    static std::array<std::once_flag, kMaxCachedDevices> cached_once{};
+
+    if (device >= 0 && device < kMaxCachedDevices) {
+        std::call_once(cached_once[device], [device]() {
+            C10_CUDA_CHECK(cudaDeviceGetAttribute(&cached_major[device],
+                                                  cudaDevAttrComputeCapabilityMajor, device));
+            C10_CUDA_CHECK(cudaDeviceGetAttribute(&cached_minor[device],
+                                                  cudaDevAttrComputeCapabilityMinor, device));
+        });
+        TORCH_CHECK(cached_major[device] == 9,
+                    "SM90 embedding/lm_head kernels require Hopper, got sm_",
+                    cached_major[device], cached_minor[device]);
+        return;
+    }
+
+    int major = 0;
+    int minor = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    TORCH_CHECK(major == 9, "SM90 embedding/lm_head kernels require Hopper, got sm_",
+                major, minor);
 }
 
 void check_cuda_same_device(torch::Tensor a, torch::Tensor b, const char *a_name,
