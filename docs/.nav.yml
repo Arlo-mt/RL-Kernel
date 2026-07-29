@@ -25,6 +25,7 @@ nav:
       - operators/ratio-kl.md
       - operators/pack-and-pad.md
       - operators/sampling.md
+      - operators/det-gemm.md
       - operators/embedding.md
   - Developer Guide:
     - contributing/README.md
