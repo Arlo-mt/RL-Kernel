@@ -538,11 +538,8 @@ def _kv_block_bounds(
     return bounds
 
 
-CPAttentionReferenceOp = DeterministicCPAttentionReferenceOp
-
 __all__ = [
     "AttentionPartialState",
-    "CPAttentionReferenceOp",
     "DeterministicCPAttentionReferenceOp",
     "merge_attention_partial_states",
 ]

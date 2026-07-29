@@ -39,6 +39,7 @@ def _args(**overrides):
         "cp_attention",
         "logp",
         "linear_logp",
+        "batch_invariant_logp",
         "rope",
         "silu",
         "swiglu",
@@ -61,6 +62,14 @@ def test_constant_logp_inputs_are_deterministic():
 
     assert torch.equal(inputs["logits"], torch.full((1, 2, 17), 0.5))
     assert torch.equal(inputs["token_ids"], torch.full((1, 2), 3, dtype=torch.long))
+
+
+def test_constant_batch_invariant_logp_inputs_match_operator_contract():
+    args = _args(input_mode="constant", constant_value=0.5, token_value=3)
+    inputs = make_operator_inputs("batch_invariant_logp", args, torch.float32, torch.device("cpu"))
+
+    assert torch.equal(inputs["logits"], torch.full((1, 2, 17), 0.5))
+    assert torch.equal(inputs["target_ids"], torch.full((1, 2), 3, dtype=torch.long))
 
 
 def test_random_logp_inputs_are_seeded():
