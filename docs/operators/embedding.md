@@ -32,7 +32,7 @@ The op exposes the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeEmbeddingOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA SM90 (H200/Hopper) | `SM90EmbeddingOp` | `_C.embedding_sm90_forward` | Single-card batch-invariant forward backend. |
+| CUDA SM90 (H200/Hopper) | `SM90EmbeddingOp` | `_C.embedding_sm90_forward` | Single-card batch-invariant forward backend; deterministic duplicate-id backward in the wrapper. |
 | ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
@@ -78,7 +78,10 @@ out = F.embedding(token_ids.long(), weight).to(torch.float32)
 
 The SM90 backend is a simple single-card forward gather for H200/Hopper builds. It is
 not a TP/vocab-parallel integration path; downstream fused kernels carry their own
-benchmarks and are measured against the PyTorch reference for correctness.
+benchmarks and are measured against the PyTorch reference for correctness. Its backward
+path is intentionally conservative: token ids are sorted, duplicate ids are reduced in
+a fixed order, and only unique rows are written back. That avoids CUDA atomic-add
+nondeterminism for repeated token ids at the cost of throughput.
 
 ## Tests
 
@@ -102,15 +105,8 @@ test at the real Qwen3-8B dims (`vocab=151936, hidden=4096`, boundary ids `0` an
 
 ## Known Limitations
 
-- The CUDA SM90 path is single-card forward coverage only; TP/vocab-parallel and Triton
-  embedding backends are outside this PR.
-- Out-of-range token ids are not validated; callers must keep ids in `[0, vocab)`.
-- **GPU backward is bitwise-reproducible only under deterministic algorithms.** The
-  forward is a lossless gather (always reproducible), but `dL/dweight` is a scatter-add:
-  every repeated token id (padding, common tokens) accumulates into the same `weight.grad`
-  row. On CUDA that accumulation uses atomic adds, whose ordering is nondeterministic, so
-  the weight gradient is not bit-exact across runs when ids collide. PyTorch documents
-  `embedding` backward as a nondeterministic CUDA op for this reason. Since `forward_fp32`
-  is the backward golden source, callers that need a reproducible GPU gradient must enable
-  `torch.use_deterministic_algorithms(True)` (the gradient test does this). CPU backward is
-  always deterministic.
+- The CUDA SM90 path is single-card coverage; TP/vocab-parallel and Triton embedding
+  backends are outside this PR.
+- Token ids must be in `[0, vocab)`. The SM90 host path validates the range before the
+  kernel launch and raises instead of masking invalid ids.
+- The deterministic SM90 backward is a reference path, not a tuned training kernel.

@@ -36,7 +36,7 @@ The op exposes the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeLMHeadOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA SM90 (H200/Hopper) | `SM90LMHeadOp` | `_C.lm_head_sm90_forward` | Single-card batch-invariant forward backend; no Split-K. |
+| CUDA SM90 (H200/Hopper) | `SM90LMHeadOp` | `_C.lm_head_sm90_forward` | Single-card batch-invariant forward backend; no Split-K; bf16 backward uses deterministic GEMM. |
 | ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
@@ -83,6 +83,16 @@ CPU, ROCm, and CUDA devices without the SM90 extension, dispatch uses the PyTorc
 (`PYTORCH_NATIVE_LM_HEAD`). On H200/Hopper-class builds that expose `_C.lm_head_sm90_forward`,
 the CUDA SM90 single-card batch-invariant backend is prepended. Its forward path assigns
 one CTA to each output logit and performs the full K reduction without Split-K.
+
+The one-CTA-per-logit design is a deliberate invariance tradeoff: CTAs re-read the
+hidden row and vocab weight row independently, so large-vocab projections are expected
+to be memory-bandwidth bound compared with a tiled GEMM. This path exists to preserve a
+fixed hidden-dimension accumulation order for the WS1/H200 correctness gate.
+
+For bf16 H200 training, `SM90LMHeadOp.backward` routes `dhidden` through
+`_C.det_gemm_da` and `dweight` through `_C.det_gemm_db` (`hidden.T @ dlogits`, transposed
+back to the HF `[vocab, hidden]` layout). The wrapper fails fast if those deterministic
+GEMM symbols are missing instead of silently falling back to cuBLAS for bf16 gradients.
 
 ## Tests
 

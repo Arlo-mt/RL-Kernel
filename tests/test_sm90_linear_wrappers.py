@@ -39,12 +39,12 @@ def test_sm90_embedding_wrapper_calls_extension_symbol(monkeypatch):
         @staticmethod
         def embedding_sm90_forward(token_ids, weight):
             calls.append(("forward", token_ids, weight))
-            return torch.empty((*token_ids.shape, weight.size(1)), dtype=weight.dtype)
+            return weight[token_ids.long()]
 
         @staticmethod
         def embedding_sm90_forward_fp32(token_ids, weight):
             calls.append(("forward_fp32", token_ids, weight))
-            return torch.empty((*token_ids.shape, weight.size(1)), dtype=torch.float32)
+            return weight[token_ids.long()].float()
 
     monkeypatch.setattr(embedding_module, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(embedding_module, "_C", FakeExtension)
@@ -63,6 +63,47 @@ def test_sm90_embedding_wrapper_calls_extension_symbol(monkeypatch):
     assert [name for name, *_ in calls] == ["forward", "forward_fp32"]
 
 
+def test_sm90_embedding_backward_accumulates_duplicate_ids_deterministically(monkeypatch):
+    from rl_engine.kernels.ops.cuda.linear import embedding as embedding_module
+
+    class FakeExtension:
+        @staticmethod
+        def embedding_sm90_forward(token_ids, weight):
+            return weight[token_ids.long()]
+
+        @staticmethod
+        def embedding_sm90_forward_fp32(token_ids, weight):
+            return weight[token_ids.long()].float()
+
+    monkeypatch.setattr(embedding_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(embedding_module, "_C", FakeExtension)
+    monkeypatch.setattr(
+        embedding_module.SM90EmbeddingOp,
+        "_can_use_sm90",
+        staticmethod(lambda token_ids, weight: True),
+    )
+
+    token_ids = torch.tensor([[2, 1, 2], [3, 1, 2]])
+    weight = torch.randn(5, 4, requires_grad=True)
+    upstream = torch.arange(token_ids.numel() * weight.size(1), dtype=torch.float32).reshape(
+        *token_ids.shape, weight.size(1)
+    )
+
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        (embedding_module.SM90EmbeddingOp().forward(token_ids, weight) * upstream).sum().backward()
+    finally:
+        torch.use_deterministic_algorithms(prev)
+
+    expected = torch.zeros_like(weight)
+    flat_ids = token_ids.reshape(-1)
+    flat_upstream = upstream.reshape(-1, weight.size(1))
+    for row, token_id in enumerate(flat_ids.tolist()):
+        expected[token_id] += flat_upstream[row]
+    assert torch.equal(weight.grad, expected)
+
+
 def test_sm90_lm_head_wrapper_calls_extension_symbol(monkeypatch):
     from rl_engine.kernels.ops.cuda.linear import lm_head as lm_head_module
 
@@ -72,12 +113,18 @@ def test_sm90_lm_head_wrapper_calls_extension_symbol(monkeypatch):
         @staticmethod
         def lm_head_sm90_forward(hidden, weight, bias):
             calls.append(("forward", hidden, weight, bias))
-            return torch.empty((*hidden.shape[:-1], weight.size(0)), dtype=hidden.dtype)
+            out = hidden.float().matmul(weight.float().t())
+            if bias is not None:
+                out = out + bias.float()
+            return out.to(hidden.dtype)
 
         @staticmethod
         def lm_head_sm90_forward_fp32(hidden, weight, bias):
             calls.append(("forward_fp32", hidden, weight, bias))
-            return torch.empty((*hidden.shape[:-1], weight.size(0)), dtype=torch.float32)
+            out = hidden.float().matmul(weight.float().t())
+            if bias is not None:
+                out = out + bias.float()
+            return out.float()
 
     monkeypatch.setattr(lm_head_module, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(lm_head_module, "_C", FakeExtension)
@@ -95,6 +142,68 @@ def test_sm90_lm_head_wrapper_calls_extension_symbol(monkeypatch):
     assert op.forward(hidden, weight, bias=bias).shape == (2, 3, 11)
     assert op.forward_fp32(hidden, weight, bias=bias).dtype == torch.float32
     assert [name for name, *_ in calls] == ["forward", "forward_fp32"]
+
+
+def test_sm90_lm_head_bf16_backward_routes_projection_grads_through_det_gemm(monkeypatch):
+    from rl_engine.kernels.ops.cuda.linear import lm_head as lm_head_module
+
+    calls = []
+
+    class FakeExtension:
+        @staticmethod
+        def lm_head_sm90_forward(hidden, weight, bias):
+            out = hidden.float().matmul(weight.float().t())
+            if bias is not None:
+                out = out + bias.float()
+            return out.to(hidden.dtype)
+
+        @staticmethod
+        def lm_head_sm90_forward_fp32(hidden, weight, bias):
+            out = hidden.float().matmul(weight.float().t())
+            if bias is not None:
+                out = out + bias.float()
+            return out.float()
+
+        @staticmethod
+        def det_gemm_da(dc, b):
+            calls.append(("da", tuple(dc.shape), tuple(b.shape)))
+            return dc.float().matmul(b.float().t()).to(torch.bfloat16)
+
+        @staticmethod
+        def det_gemm_db(a, dc):
+            calls.append(("db", tuple(a.shape), tuple(dc.shape)))
+            return a.float().t().matmul(dc.float()).to(torch.bfloat16)
+
+    monkeypatch.setattr(lm_head_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(lm_head_module, "_C", FakeExtension)
+    monkeypatch.setattr(
+        lm_head_module.SM90LMHeadOp,
+        "_can_use_sm90",
+        staticmethod(lambda hidden, weight, bias: True),
+    )
+    monkeypatch.setattr(
+        lm_head_module,
+        "_can_use_det_gemm_backward",
+        lambda hidden, weight: True,
+    )
+
+    hidden = torch.randn(2, 3, 5, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(7, 5, dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.randn(7, dtype=torch.bfloat16, requires_grad=True)
+    dy = torch.randn(2, 3, 7, dtype=torch.bfloat16)
+
+    out = lm_head_module.SM90LMHeadOp().forward(hidden, weight, bias=bias)
+    out.backward(dy)
+
+    flat_hidden = hidden.detach().reshape(-1, hidden.size(-1))
+    flat_dy = dy.reshape(-1, weight.size(0))
+    expected_hidden = flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16)
+    expected_weight = flat_dy.float().t().matmul(flat_hidden.float()).to(torch.bfloat16)
+
+    assert calls == [("da", (6, 7), (5, 7)), ("db", (6, 5), (6, 7))]
+    assert torch.equal(hidden.grad, expected_hidden.reshape_as(hidden))
+    assert torch.equal(weight.grad, expected_weight)
+    assert torch.equal(bias.grad, flat_dy.float().sum(0).to(torch.bfloat16))
 
 
 @requires_sm90_linear

@@ -62,7 +62,7 @@ __global__ void embedding_sm90_forward_kernel(const int64_t *__restrict__ token_
                                               const input_t *__restrict__ weight,
                                               output_t *__restrict__ output,
                                               int64_t num_tokens, int64_t hidden_size,
-                                              int64_t vocab_size) {
+                                              int64_t /*vocab_size*/) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = num_tokens * hidden_size;
     if (idx >= total) {
@@ -72,10 +72,6 @@ __global__ void embedding_sm90_forward_kernel(const int64_t *__restrict__ token_
     const int64_t token_row = idx / hidden_size;
     const int64_t hidden_col = idx - token_row * hidden_size;
     const int64_t token_id = token_ids[token_row];
-    if (token_id < 0 || token_id >= vocab_size) {
-        output[idx] = from_float<output_t>(0.0f);
-        return;
-    }
     output[idx] = static_cast<output_t>(weight[token_id * hidden_size + hidden_col]);
 }
 

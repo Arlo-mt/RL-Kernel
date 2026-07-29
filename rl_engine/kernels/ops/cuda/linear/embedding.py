@@ -19,6 +19,52 @@ def _is_hopper(device: torch.device) -> bool:
         return False
 
 
+def _deterministic_embedding_grad_weight(
+    ids: torch.Tensor,
+    grad_rows: torch.Tensor,
+    *,
+    weight_shape: tuple[int, ...],
+    weight_dtype: torch.dtype,
+) -> torch.Tensor:
+    vocab_size = int(weight_shape[0])
+    grad_weight = torch.zeros(
+        weight_shape,
+        device=grad_rows.device,
+        dtype=grad_rows.dtype,
+    )
+    if ids.numel() == 0:
+        return grad_weight.to(weight_dtype)
+
+    valid = (ids >= 0) & (ids < vocab_size)
+    if not bool(valid.all().item()):
+        ids = ids[valid]
+        grad_rows = grad_rows[valid]
+        if ids.numel() == 0:
+            return grad_weight.to(weight_dtype)
+
+    order = torch.argsort(ids, stable=True)
+    sorted_ids = ids.index_select(0, order)
+    sorted_rows = grad_rows.index_select(0, order)
+    unique_ids, counts = torch.unique_consecutive(sorted_ids, return_counts=True)
+
+    segment_sums = []
+    start = 0
+    for count in counts.tolist():
+        end = start + int(count)
+        acc = torch.zeros(
+            sorted_rows.size(1),
+            device=sorted_rows.device,
+            dtype=sorted_rows.dtype,
+        )
+        for row in range(start, end):
+            acc = acc + sorted_rows[row]
+        segment_sums.append(acc)
+        start = end
+
+    grad_weight[unique_ids] = torch.stack(segment_sums, dim=0)
+    return grad_weight.to(weight_dtype)
+
+
 class _SM90EmbeddingFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, token_ids: torch.Tensor, weight: torch.Tensor, output_fp32: bool):
@@ -38,17 +84,12 @@ class _SM90EmbeddingFunction(torch.autograd.Function):
             ids = token_ids.reshape(-1).to(device=grad_output.device, dtype=torch.long)
             hidden_size = int(ctx.weight_shape[1])
             grad_rows = grad_output.reshape(ids.numel(), hidden_size)
-            valid = (ids >= 0) & (ids < int(ctx.weight_shape[0]))
-            if not bool(valid.all().item()):
-                ids = ids[valid]
-                grad_rows = grad_rows[valid]
-            grad_weight = torch.zeros(
-                ctx.weight_shape,
-                device=grad_output.device,
-                dtype=grad_rows.dtype,
+            grad_weight = _deterministic_embedding_grad_weight(
+                ids,
+                grad_rows,
+                weight_shape=ctx.weight_shape,
+                weight_dtype=ctx.weight_dtype,
             )
-            grad_weight.index_add_(0, ids, grad_rows)
-            grad_weight = grad_weight.to(ctx.weight_dtype)
         return None, grad_weight, None
 
 
