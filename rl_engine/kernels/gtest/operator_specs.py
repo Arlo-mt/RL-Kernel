@@ -86,6 +86,7 @@ OP_SPECS = {
             "triton": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
         },
         grad_input_names=("a", "b"),
+    ),
     "rope": OperatorSpec(
         name="rope",
         op_class="elementwise",
