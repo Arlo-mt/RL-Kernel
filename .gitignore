@@ -209,3 +209,6 @@ __marimo__/
 
 # Cross-configuration alignment local run artifacts
 /runs/
+
+# Local dev notes (not for upstream)
+_dev_notes/
