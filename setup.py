@@ -80,6 +80,7 @@ def get_extensions():
             "csrc/deterministic_logp_kernel.cu",
             "csrc/cuda/attention/prefix_shared_attention.cu",
             "csrc/cuda/gemm/det_gemm_kernel.cu",
+            "csrc/cuda/rmsnorm.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
         ]
 
