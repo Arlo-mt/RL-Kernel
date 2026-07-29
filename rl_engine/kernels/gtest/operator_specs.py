@@ -32,6 +32,19 @@ def _load_object(path: str) -> Any:
 
 
 OP_SPECS = {
+    "rms_norm": OperatorSpec(
+        name="rms_norm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+            "triton": "rl_engine.kernels.ops.triton.rmsnorm_triton.RMSNormTritonOp",
+            "cuda": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+        },
+        grad_input_names=("x", "weight"),
+    ),
     "attention": OperatorSpec(
         name="attention",
         op_class="attention",
@@ -74,6 +87,30 @@ OP_SPECS = {
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.linear_logp.FusedLinearLogpSM90Op",
         },
         grad_input_names=("hidden", "lm_head_weight"),
+    ),
+    "det_gemm": OperatorSpec(
+        name="det_gemm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+        gold_method="__call__",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.matmul.det_gemm.NativeGemmOp",
+            "cuda": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+            "triton": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+        },
+        grad_input_names=("a", "b"),
+    ),
+    "rope": OperatorSpec(
+        name="rope",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.rotary_embedding.rope.NativeRoPEOp",
+            "triton": "rl_engine.kernels.ops.triton.rotary_embedding.rope.TritonRoPEOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op",
+        },
+        grad_input_names=("x",),
     ),
     "batch_invariant_logp": OperatorSpec(
         name="batch_invariant_logp",

@@ -27,6 +27,7 @@ def make_operator_inputs(
     builders = {
         "rms_norm": _make_rms_norm_inputs,
         "matmul": _make_matmul_inputs,
+        "det_gemm": _make_det_gemm_inputs,
         "attention": _make_attention_inputs,
         "logp": _make_logp_inputs,
         "linear_logp": _make_linear_logp_inputs,
@@ -50,6 +51,7 @@ def operator_shape_name(op_name: str, args: argparse.Namespace) -> str:
     names = {
         "rms_norm": f"{batch}x{seq}x{_normalized_dim(args)}",
         "matmul": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
+        "det_gemm": f"{batch}x{seq}x{_matmul_k(args)}x{_matmul_n(args)}",
         "attention": f"{batch}x{DEFAULT_N_HEADS}x{seq}x{DEFAULT_HEAD_DIM}",
         "logp": f"{batch}x{seq}x{vocab}",
         "linear_logp": f"{batch}x{seq}x{_normalized_dim(args)}x{vocab}",
@@ -87,6 +89,19 @@ def _make_matmul_inputs(
     n_dim = _matmul_n(args)
     return {
         "a": _floating_tensor((batch, seq, k_dim), args, dtype, device, offset=0),
+        "b": _floating_tensor((k_dim, n_dim), args, dtype, device, offset=1),
+    }
+
+
+def _make_det_gemm_inputs(
+    args: argparse.Namespace, dtype: torch.dtype, device: torch.device
+) -> dict[str, Any]:
+    batch, seq = _batch_seq(args)
+    k_dim = _matmul_k(args)
+    n_dim = _matmul_n(args)
+    m_dim = batch * seq
+    return {
+        "a": _floating_tensor((m_dim, k_dim), args, dtype, device, offset=0),
         "b": _floating_tensor((k_dim, n_dim), args, dtype, device, offset=1),
     }
 
