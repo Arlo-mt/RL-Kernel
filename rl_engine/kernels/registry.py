@@ -54,6 +54,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
 
+    # Variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
+    PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
     # Batch-invariant deterministic GEMM (WS1 #146)
     CUDA_DET_GEMM = "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp"
     TRITON_DET_GEMM = "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp"
@@ -195,6 +197,7 @@ class KernelRegistry:
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.CUDA_DET_GEMM, OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
@@ -228,6 +231,7 @@ class KernelRegistry:
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
+                "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
                 "batch_invariant_logp": [
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
@@ -251,6 +255,7 @@ class KernelRegistry:
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "pack": [OpBackend.PYTORCH_PACK],
                 "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
