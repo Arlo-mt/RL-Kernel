@@ -103,6 +103,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_LM_HEAD = "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp"
     # WS1 pure-PyTorch ground-truth embedding ops
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
+    CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
+    CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
 
 
 def resolve_logp_op_type(
@@ -344,6 +346,18 @@ class KernelRegistry:
                     f"SM{cc}: fused linear-logp SM90 kernel not compiled into _C; "
                     "using generic linear-logp backend."
                 )
+
+            sm90_embedding_compiled = _EXT_AVAILABLE and hasattr(_C, "embedding_sm90_forward")
+            if sm90_embedding_compiled and cc_major == 9:
+                embedding_list = self._priority_map["cuda"]["embedding"]
+                if OpBackend.CUDA_SM90_EMBEDDING not in embedding_list:
+                    embedding_list.insert(0, OpBackend.CUDA_SM90_EMBEDDING)
+
+            sm90_lm_head_compiled = _EXT_AVAILABLE and hasattr(_C, "lm_head_sm90_forward")
+            if sm90_lm_head_compiled and cc_major == 9:
+                lm_head_list = self._priority_map["cuda"]["lm_head"]
+                if OpBackend.CUDA_SM90_LM_HEAD not in lm_head_list:
+                    lm_head_list.insert(0, OpBackend.CUDA_SM90_LM_HEAD)
         except Exception as e:
             logger.warning(f"Failed to probe device capability: {e}")
 

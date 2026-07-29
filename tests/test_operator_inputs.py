@@ -35,6 +35,7 @@ def _args(**overrides):
     [
         "rms_norm",
         "matmul",
+        "det_gemm",
         "attention",
         "logp",
         "linear_logp",

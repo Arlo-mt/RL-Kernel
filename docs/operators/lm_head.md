@@ -36,7 +36,8 @@ The op exposes the WS1 dual-path contract:
 | Backend | Wrapper | Native symbol | Status |
 | --- | --- | --- | --- |
 | PyTorch fallback | `NativeLMHeadOp` | None | fp32 ground-truth reference; CPU and any GPU. |
-| CUDA / ROCm / Triton | N/A | N/A | Planned: downstream fused kernels validate against this reference. |
+| CUDA SM90 (H200/Hopper) | `SM90LMHeadOp` | `_C.lm_head_sm90_forward` | Single-card batch-invariant forward backend; no Split-K. |
+| ROCm / Triton | N/A | N/A | Falls back to the PyTorch native reference. |
 
 ## Tensor Contract
 
@@ -78,9 +79,10 @@ if bias is not None:
 ## Dispatch Behavior
 
 `kernel_registry.get_op("lm_head")` resolves through the `OpBackend` priority map. On
-`cuda`, `rocm`, and `cpu`, the only registered backend today is the PyTorch native op
-(`PYTORCH_NATIVE_LM_HEAD`), so every device dispatches to this reference. When fused
-kernels land, they should preserve the same batch-invariant contract.
+CPU, ROCm, and CUDA devices without the SM90 extension, dispatch uses the PyTorch native op
+(`PYTORCH_NATIVE_LM_HEAD`). On H200/Hopper-class builds that expose `_C.lm_head_sm90_forward`,
+the CUDA SM90 single-card batch-invariant backend is prepended. Its forward path assigns
+one CTA to each output logit and performs the full K reduction without Split-K.
 
 ## Tests
 
@@ -96,5 +98,7 @@ Qwen3-8B dimensions.
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/linear/lm_head.py`
+- `rl_engine/kernels/ops/cuda/linear/lm_head.py`
+- `csrc/cuda/embedding_lm_head_sm90.cu`
 - `rl_engine/kernels/registry.py`
 - `tests/test_lm_head.py`

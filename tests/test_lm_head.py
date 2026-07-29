@@ -313,7 +313,7 @@ def test_lm_head_gradient_flows():
 # Registry dispatch -- "lm_head" resolves to NativeLMHeadOp.
 def test_registry_dispatches_native_lm_head_op():
     """The registry resolves "lm_head" to NativeLMHeadOp."""
-    assert isinstance(kernel_registry.get_op("lm_head"), NativeLMHeadOp)
+    assert isinstance(kernel_registry.get_op("lm_head", device="cpu"), NativeLMHeadOp)
 
 
 # --------------------------------------------------------------------------- #
