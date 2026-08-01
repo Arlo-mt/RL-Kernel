@@ -216,6 +216,10 @@ def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
         repeat=config.repeat,
     )
 
+    direct_output = torch.version.hip is None and config.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
     return {
         "shape": list(shape),
         "dtype": str(config.dtype),
@@ -226,22 +230,28 @@ def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
         "forward_backward_ms": forward_backward_samples,
         "forward_backward_median_ms": statistics.median(forward_backward_samples),
         "incremental_peak_bytes": isolated_peak,
-        "expected_direct_output_bytes": policy.numel() * policy.element_size(),
-        "expected_staging_saving_bytes": 4 * policy.numel(),
+        "expected_direct_output_bytes": (
+            policy.numel() * policy.element_size() if direct_output else 0
+        ),
+        "expected_staging_saving_bytes": 4 * policy.numel() if direct_output else 0,
     }
+
+
+def _metadata_value(command: list[str]) -> str:
+    try:
+        return subprocess.check_output(command, text=True).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return "unknown"
 
 
 def _write_backward_results(
     rows: list[dict[str, Any]], config: BenchmarkConfig, output: Path | None
 ) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    sha = _metadata_value(["git", "rev-parse", "HEAD"])
     output = output or REPO_ROOT / ".cache/benchmarks/ratio_kl" / f"raw-{sha[:8]}-{stamp}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    driver = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-        text=True,
-    ).strip()
+    driver = _metadata_value(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
     payload = {
         "metadata": {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
