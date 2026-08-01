@@ -172,28 +172,34 @@ def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
     grad_kl = torch.randn(*shape[:-1], 2, device=config.device)[:, :, 0]
     op = TritonRatioKLOp()
 
-    isolated_policy = policy.detach().requires_grad_(True)
-    ratio, kl = op(
-        isolated_policy,
-        ref,
-        batch.token_ids,
-        batch.completion_mask,
-        batch.old_logps,
-    )
+    def measure_isolated_backward():
+        isolated_policy = policy.detach().requires_grad_(True)
+        ratio, kl = op(
+            isolated_policy,
+            ref,
+            batch.token_ids,
+            batch.completion_mask,
+            batch.old_logps,
+        )
 
-    def isolated_backward():
+        def isolated_backward():
+            isolated_policy.grad = None
+            torch.autograd.backward((ratio, kl), (grad_ratio, grad_kl), retain_graph=True)
+            return isolated_policy.grad
+
+        last_grad, samples = _time_samples_ms(
+            isolated_backward,
+            config.device,
+            warmup=config.warmup,
+            repeat=config.repeat,
+        )
         isolated_policy.grad = None
-        torch.autograd.backward((ratio, kl), (grad_ratio, grad_kl), retain_graph=True)
-        return isolated_policy.grad
+        del last_grad
+        peak = _incremental_peak_bytes(isolated_backward, config.device)
+        isolated_policy.grad = None
+        return samples, peak
 
-    _, isolated_samples = _time_samples_ms(
-        isolated_backward,
-        config.device,
-        warmup=config.warmup,
-        repeat=config.repeat,
-    )
-    isolated_policy.grad = None
-    isolated_peak = _incremental_peak_bytes(isolated_backward, config.device)
+    isolated_samples, isolated_peak = measure_isolated_backward()
 
     torch.cuda.empty_cache()
 
