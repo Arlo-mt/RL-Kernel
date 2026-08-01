@@ -236,6 +236,19 @@ def test_triton_direct_backward_matches_staging_bitwise(dtype):
 
 
 @requires_nvidia_triton
+def test_triton_fp32_backward_matches_staging_bitwise():
+    case = _kernel_case(torch.float32, vocab=64)
+    staged = _backward_kernel_output(case, write_inactive_zero=False)
+    policy, ref, action, mask, old, *_, grad_ratio, grad_kl, _ = case
+    production_policy = policy.clone().requires_grad_(True)
+
+    ratio, kl = TritonRatioKLOp()(production_policy, ref, action, mask, old)
+    torch.autograd.backward((ratio, kl), (grad_ratio, grad_kl))
+
+    assert torch.equal(production_policy.grad, staged)
+
+
+@requires_nvidia_triton
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     ("n_rows", "vocab", "density", "masked_oob"),

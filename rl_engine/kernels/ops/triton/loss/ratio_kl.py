@@ -174,13 +174,9 @@ class _RatioKLFunction(torch.autograd.Function):
         n_rows, V = pol.shape
         gr = grad_ratio.contiguous().view(-1).to(torch.float32)
         gk = grad_kl.contiguous().view(-1).to(torch.float32)
-        direct_output = (
-            torch.version.hip is None and pol.dtype in (torch.float16, torch.bfloat16)
-        )
+        direct_output = torch.version.hip is None and pol.dtype in (torch.float16, torch.bfloat16)
         grad_pol = (
-            torch.empty_like(pol)
-            if direct_output
-            else torch.zeros_like(pol, dtype=torch.float32)
+            torch.empty_like(pol) if direct_output else torch.zeros_like(pol, dtype=torch.float32)
         )
 
         _ratio_kl_bwd_kernel[(n_rows,)](

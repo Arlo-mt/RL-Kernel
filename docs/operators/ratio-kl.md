@@ -92,7 +92,9 @@ python benchmarks/benchmark_ratio_kl.py --backward-suite --smoke --dtype float16
 
 The backward suite records isolated backward, forward+backward, and incremental peak VRAM
 under `.cache/benchmarks/ratio_kl/`. Formal FP16/BF16 base/head validation uses an H100
-with 20 warmups and 100 iterations; that gate remains pending until run on H100.
+with 20 warmups and 100 iterations. On an H100 PCIe at `[B,T,V]=[32,256,32768]`, the
+direct-output backward saved exactly 1 GiB, ran 1.60–2.34× faster in isolation, and
+improved forward+backward by 2.4–30.6% across FP16/BF16 at 10% and 90% mask density.
 
 Indicative forward-only results (fp16, `B=16`, `T=512`):
 

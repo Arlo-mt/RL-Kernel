@@ -183,9 +183,7 @@ def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
 
     def isolated_backward():
         isolated_policy.grad = None
-        torch.autograd.backward(
-            (ratio, kl), (grad_ratio, grad_kl), retain_graph=True
-        )
+        torch.autograd.backward((ratio, kl), (grad_ratio, grad_kl), retain_graph=True)
         return isolated_policy.grad
 
     _, isolated_samples = _time_samples_ms(
@@ -208,9 +206,7 @@ def _backward_row(config: BenchmarkConfig) -> dict[str, Any]:
             batch.completion_mask,
             batch.old_logps,
         )
-        torch.autograd.backward(
-            (current_ratio, current_kl), (grad_ratio, grad_kl)
-        )
+        torch.autograd.backward((current_ratio, current_kl), (grad_ratio, grad_kl))
         return current_policy.grad
 
     _, forward_backward_samples = _time_samples_ms(
