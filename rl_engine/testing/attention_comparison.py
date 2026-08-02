@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 import torch
 
+from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.testing.reference_ops import selected_logprobs_reference
 
 MergeBackend = Literal["rl_kernel", "transformer_engine"]
@@ -45,6 +46,11 @@ class AttentionComparisonInputs:
     target_ids: torch.Tensor | None = None
     active_token_mask: torch.Tensor | None = None
     output_dtype: torch.dtype = torch.float32
+    rope_positions: torch.Tensor | None = None
+    rope_theta: float = 1_000_000.0
+    rope_rotary_dim: int | None = None
+    rope_cast_at: str = "after_rope"
+    rope_output_dtype: torch.dtype | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,8 @@ class AttentionPathResult:
     out: torch.Tensor
     lse: torch.Tensor
     provenance: dict[str, Any]
+    post_rope_q: torch.Tensor | None = None
+    post_rope_k: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,8 @@ class AttentionPathDrift:
     lse: DriftStats
     dlogp: DriftStats | None
     provenance: dict[str, Any]
+    post_rope_q: DriftStats | None = None
+    post_rope_k: DriftStats | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +103,8 @@ class AttentionPathDrift:
             "out": self.out.to_dict(),
             "lse": self.lse.to_dict(),
             "dlogp": None if self.dlogp is None else self.dlogp.to_dict(),
+            "post_rope_q": (None if self.post_rope_q is None else self.post_rope_q.to_dict()),
+            "post_rope_k": (None if self.post_rope_k is None else self.post_rope_k.to_dict()),
             "provenance": self.provenance,
         }
 
@@ -162,6 +174,24 @@ def compare_single_gpu_attention(
     )
 
 
+def compare_single_gpu_rope_attention(
+    inputs: AttentionComparisonInputs,
+) -> AttentionComparisonReport:
+    """Compare canonical unfused RoPE+Attention with fused-like materialization.
+
+    This attribution path keeps the computation on one device and checks the
+    boundary that matters before CP communication: post-RoPE Q/K identity and
+    the resulting attention ``out`` / attention-domain ``lse``.
+    """
+
+    _validate_comparison_inputs(inputs)
+    _validate_rope_inputs(inputs)
+    reference = run_unfused_rope_attention(inputs)
+    candidates = [run_fused_like_rope_attention(inputs)]
+    drifts = tuple(_compare_path(candidate, reference, inputs) for candidate in candidates)
+    return AttentionComparisonReport(reference_name=reference.name, drifts=drifts)
+
+
 def run_full_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
     """Training-style full-sequence attention with exported attention-domain LSE."""
 
@@ -187,6 +217,68 @@ def run_full_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult
             "materialization": "full_sequence",
             "lse_domain": "attention",
         },
+    )
+
+
+def run_unfused_rope_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
+    """Canonical ``RoPE -> Attention`` reference materialization."""
+
+    post_rope_q, post_rope_k = _apply_rope_to_qk(inputs)
+    out, lse = _attention_with_lse(
+        post_rope_q,
+        post_rope_k,
+        inputs.v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=post_rope_q.size(2),
+        total_kv_len=post_rope_k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="unfused_rope_attention",
+        out=out,
+        lse=lse,
+        provenance=_rope_attention_provenance(
+            inputs,
+            materialization="rope_then_attention",
+            fusion_boundary="unfused_rope_attention",
+        ),
+        post_rope_q=post_rope_q,
+        post_rope_k=post_rope_k,
+    )
+
+
+def run_fused_like_rope_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
+    """Semantic fused ``RoPE+Attention`` path using the same canonical RoPE rules."""
+
+    post_rope_q, post_rope_k = _apply_rope_to_qk(inputs)
+    out, lse = _attention_with_lse(
+        post_rope_q,
+        post_rope_k,
+        inputs.v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=post_rope_q.size(2),
+        total_kv_len=post_rope_k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="fused_like_rope_attention",
+        out=out,
+        lse=lse,
+        provenance=_rope_attention_provenance(
+            inputs,
+            materialization="fused_like_rope_attention",
+            fusion_boundary="fused_rope_attention",
+        ),
+        post_rope_q=post_rope_q,
+        post_rope_k=post_rope_k,
     )
 
 
@@ -317,7 +409,61 @@ def _compare_path(
         lse=_drift_stats(candidate.lse, reference.lse),
         dlogp=dlogp,
         provenance=candidate.provenance,
+        post_rope_q=(
+            None
+            if candidate.post_rope_q is None or reference.post_rope_q is None
+            else _drift_stats(candidate.post_rope_q, reference.post_rope_q)
+        ),
+        post_rope_k=(
+            None
+            if candidate.post_rope_k is None or reference.post_rope_k is None
+            else _drift_stats(candidate.post_rope_k, reference.post_rope_k)
+        ),
     )
+
+
+def _apply_rope_to_qk(inputs: AttentionComparisonInputs) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_rope_inputs(inputs)
+    assert inputs.rope_positions is not None
+    rope = NativeRoPEOp()
+    output_dtype = _rope_output_dtype(inputs)
+    q = rope.forward_fp32(inputs.q, inputs.rope_positions, theta=inputs.rope_theta).to(output_dtype)
+    k = rope.forward_fp32(inputs.k, inputs.rope_positions, theta=inputs.rope_theta).to(output_dtype)
+    return q, k
+
+
+def _rope_output_dtype(inputs: AttentionComparisonInputs) -> torch.dtype:
+    return inputs.q.dtype if inputs.rope_output_dtype is None else inputs.rope_output_dtype
+
+
+def _rope_rotary_dim(inputs: AttentionComparisonInputs) -> int:
+    return inputs.q.size(-1) if inputs.rope_rotary_dim is None else inputs.rope_rotary_dim
+
+
+def _rope_attention_provenance(
+    inputs: AttentionComparisonInputs,
+    *,
+    materialization: str,
+    fusion_boundary: str,
+) -> dict[str, Any]:
+    assert inputs.rope_positions is not None
+    return {
+        "attention_mode": "prefill",
+        "materialization": materialization,
+        "rope_state": "post_rope",
+        "q_rope_state": "post_rope",
+        "k_rope_state": "post_rope",
+        "position_kind": "position_ids",
+        "position_ids_shape": list(inputs.rope_positions.shape),
+        "position_ids_min": int(inputs.rope_positions.min().item()),
+        "position_ids_max": int(inputs.rope_positions.max().item()),
+        "rope_theta": float(inputs.rope_theta),
+        "rotary_dim": _rope_rotary_dim(inputs),
+        "rope_cast_at": inputs.rope_cast_at,
+        "rope_output_dtype": str(_rope_output_dtype(inputs)).replace("torch.", ""),
+        "fusion_boundary": fusion_boundary,
+        "lse_domain": "attention",
+    }
 
 
 def _attention_with_lse(
@@ -521,6 +667,45 @@ def _validate_comparison_inputs(inputs: AttentionComparisonInputs) -> None:
             raise ValueError("active_token_mask must have shape [B, Sq]")
         if inputs.active_token_mask.dtype != torch.bool:
             raise ValueError("active_token_mask must be bool")
+    if not isinstance(inputs.rope_theta, (float, int)) or isinstance(inputs.rope_theta, bool):
+        raise ValueError("rope_theta must be a positive number")
+    if float(inputs.rope_theta) <= 0:
+        raise ValueError("rope_theta must be a positive number")
+    if inputs.rope_output_dtype is not None and not isinstance(
+        inputs.rope_output_dtype, torch.dtype
+    ):
+        raise ValueError("rope_output_dtype must be a torch.dtype when provided")
+
+
+def _validate_rope_inputs(inputs: AttentionComparisonInputs) -> None:
+    if inputs.rope_positions is None:
+        raise ValueError("rope_positions are required for RoPE+Attention comparison")
+    if inputs.q.size(2) != inputs.k.size(2):
+        raise ValueError("RoPE+Attention comparison currently requires Sq == Skv")
+    if inputs.rope_rotary_dim is not None:
+        if isinstance(inputs.rope_rotary_dim, bool) or inputs.rope_rotary_dim <= 0:
+            raise ValueError("rope_rotary_dim must be a positive integer when provided")
+        if inputs.rope_rotary_dim != inputs.q.size(-1):
+            raise ValueError(
+                "rope_rotary_dim must equal head_dim until partial-rotary RoPE is supported"
+            )
+    if inputs.rope_cast_at != "after_rope":
+        raise ValueError("rope_cast_at must be 'after_rope' for the current fp32 RoPE reference")
+    if (
+        inputs.rope_positions.device != inputs.q.device
+        or inputs.rope_positions.device != inputs.k.device
+    ):
+        raise ValueError("rope_positions must be on the same device as q/k")
+    if inputs.rope_positions.dtype not in {torch.int32, torch.int64, torch.long}:
+        raise ValueError("rope_positions must contain integer token positions")
+    if inputs.rope_positions.ndim == 1:
+        if inputs.rope_positions.numel() != inputs.q.size(2):
+            raise ValueError("1D rope_positions must have length Sq")
+    elif inputs.rope_positions.ndim == 2:
+        if inputs.rope_positions.shape != (inputs.q.size(0), inputs.q.size(2)):
+            raise ValueError("2D rope_positions must have shape [B, Sq]")
+    else:
+        raise ValueError("rope_positions must have shape [Sq] or [B, Sq]")
 
 
 def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -570,9 +755,12 @@ __all__ = [
     "AttentionPathResult",
     "DriftStats",
     "TransformerEngineUnavailable",
+    "compare_single_gpu_rope_attention",
     "compare_single_gpu_attention",
     "run_chunked_query_attention",
+    "run_fused_like_rope_attention",
     "run_full_attention",
     "run_paged_kv_attention",
+    "run_unfused_rope_attention",
     "transformer_engine_context_parallel_available",
 ]

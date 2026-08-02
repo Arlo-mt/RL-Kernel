@@ -9,6 +9,7 @@ import json
 import sys
 import types
 
+import pytest
 import torch
 
 from rl_engine.kernels.gtest import run_operator_suite
@@ -16,6 +17,7 @@ from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator
 from rl_engine.testing.attention_comparison import (
     AttentionComparisonInputs,
     compare_single_gpu_attention,
+    compare_single_gpu_rope_attention,
 )
 
 _TE_CONTEXT_PARALLEL_MODULE = (
@@ -102,6 +104,54 @@ def test_single_gpu_attention_harness_preserves_key_padding_mask():
     for drift in report.drifts:
         assert drift.out.max_abs <= 1.0e-6
         assert drift.lse.max_abs <= 1.0e-6
+
+
+def test_single_gpu_rope_attention_harness_reports_rope_and_attention_drift():
+    base = _comparison_inputs()
+    report = compare_single_gpu_rope_attention(
+        AttentionComparisonInputs(
+            q=base.q,
+            k=base.k,
+            v=base.v,
+            causal=True,
+            lm_head_weight=base.lm_head_weight,
+            target_ids=base.target_ids,
+            active_token_mask=base.active_token_mask,
+            rope_positions=torch.arange(base.q.size(2), dtype=torch.long),
+            rope_theta=1_000_000.0,
+            rope_rotary_dim=base.q.size(-1),
+            rope_output_dtype=torch.float32,
+        )
+    )
+
+    assert report.reference_name == "unfused_rope_attention"
+    assert len(report.drifts) == 1
+    drift = report.drifts[0]
+    assert drift.candidate_name == "fused_like_rope_attention"
+    assert drift.post_rope_q is not None
+    assert drift.post_rope_k is not None
+    assert drift.post_rope_q.max_abs <= 1.0e-6
+    assert drift.post_rope_k.max_abs <= 1.0e-6
+    assert drift.out.max_abs <= 1.0e-6
+    assert drift.lse.max_abs <= 1.0e-6
+    assert drift.dlogp is not None
+    assert drift.dlogp.max_abs <= 1.0e-6
+    assert drift.provenance["position_kind"] == "position_ids"
+    assert drift.provenance["position_ids_shape"] == [base.q.size(2)]
+    assert drift.provenance["rotary_dim"] == base.q.size(-1)
+    assert drift.provenance["rope_cast_at"] == "after_rope"
+    assert drift.provenance["fusion_boundary"] == "fused_rope_attention"
+
+    payload = report.to_dict()
+    assert payload["drifts"][0]["post_rope_q"]["active_count"] == base.q.numel()
+    json.dumps(payload)
+
+
+def test_single_gpu_rope_attention_requires_position_metadata():
+    base = _comparison_inputs()
+
+    with pytest.raises(ValueError, match="rope_positions are required"):
+        compare_single_gpu_rope_attention(AttentionComparisonInputs(q=base.q, k=base.k, v=base.v))
 
 
 def test_transformer_engine_merge_oracle_can_be_reused_when_available(monkeypatch):

@@ -17,6 +17,17 @@ Implemented paths:
 - `transformer_engine_paged_kv`: optional oracle that reuses NVIDIA Transformer
   Engine's context-parallel PyTorch correction helpers when TE is installed.
 
+RoPE scope:
+
+- `unfused_rope_attention`: canonical `RoPE -> Attention` path;
+- `fused_like_rope_attention`: semantic `RoPE+Attention` path that applies the
+  same canonical RoPE rules before attention, then records the fused boundary in
+  provenance.
+
+The RoPE path is still single-GPU attribution. It proves that both sides agree
+on post-RoPE Q/K, `out`, attention-domain `lse`, and optional active-token
+`dlogp` before CP communication or production fused kernels are introduced.
+
 ## Report
 
 `rl_engine.testing.attention_comparison.compare_single_gpu_attention` emits a
@@ -29,6 +40,15 @@ structured report with:
 - per-path provenance including chunk/page sizes, KV page bounds, merge backend,
   merge order, and LSE domain;
 - optional-backend unavailability reasons.
+
+`compare_single_gpu_rope_attention` emits the same drift schema and additionally
+reports post-RoPE Q/K drift. Its provenance records:
+
+- Q/K state as `post_rope`;
+- `position_ids` shape and range;
+- `rope_theta`, `rotary_dim`, `rope_cast_at`, and `rope_output_dtype`;
+- `fusion_boundary` as either `unfused_rope_attention` or
+  `fused_rope_attention`.
 
 The selected-logprob convention follows #207:
 
@@ -72,6 +92,7 @@ The attention-specific WS2 comparison entry point is Python-first for now:
 ```python
 from rl_engine.testing.attention_comparison import (
     AttentionComparisonInputs,
+    compare_single_gpu_rope_attention,
     compare_single_gpu_attention,
 )
 
@@ -82,6 +103,18 @@ report = compare_single_gpu_attention(
     include_transformer_engine=True,
 )
 print(report.to_dict())
+
+rope_report = compare_single_gpu_rope_attention(
+    AttentionComparisonInputs(
+        q=q,
+        k=k,
+        v=v,
+        rope_positions=torch.arange(q.size(2), device=q.device),
+        target_ids=target_ids,
+        lm_head_weight=w,
+    )
+)
+print(rope_report.to_dict())
 ```
 
 ## Validation
@@ -92,4 +125,5 @@ python -m pytest tests/test_attention_comparison.py -q
 
 The tests cover full vs chunked/paged equivalence, active-token `dlogp` drift,
 optional TE correction-helper reuse through a fake TE module, JSON-compatible
-reports, and `attention` registration in the generic operator comparison specs.
+reports, RoPE+Attention post-RoPE Q/K attribution, and `attention` registration
+in the generic operator comparison specs.
