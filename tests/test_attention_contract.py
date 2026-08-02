@@ -19,6 +19,8 @@ from rl_engine.kernels.attention_contract import (
     AttentionRole,
     KVCacheSpec,
     ReductionSpec,
+    RoPEFusionBoundary,
+    RoPESpec,
     ShardingSpec,
 )
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
@@ -68,6 +70,7 @@ def _contract(
     causal_offsets: tuple[int, ...] = (0,),
     batch_size: int = 1,
     query_sequence_length: int | None = None,
+    rope: RoPESpec | None = None,
 ) -> AttentionContract:
     resolved_sharding = sharding or _sharding()
     return AttentionContract(
@@ -86,6 +89,7 @@ def _contract(
         sharding=resolved_sharding,
         reduction=ReductionSpec(),
         kv_cache=kv_cache,
+        rope=rope,
     )
 
 
@@ -123,6 +127,55 @@ def test_qwen3_tp2_cp2_contract_is_representable_and_serializable():
         "engine": "in_op_reference",
     }
     json.dumps(contract.to_dict())
+
+
+def test_rope_metadata_is_part_of_attention_contract_provenance():
+    rope = RoPESpec(
+        q_state="post_rope",
+        k_state="post_rope",
+        k_cache_state="post_rope",
+        theta=1.0e6,
+        rotary_dim=128,
+        query_position_offsets=(0,),
+        key_position_offsets=(0,),
+        cast_at="after_rope",
+        output_dtype="bf16",
+        fusion_boundary="unfused_rope_attention",
+    )
+
+    contract = _contract(rope=rope)
+    payload = contract.to_dict()
+
+    assert payload["rope"] == {
+        "q_state": "post_rope",
+        "k_state": "post_rope",
+        "k_cache_state": "post_rope",
+        "theta": 1.0e6,
+        "rotary_dim": 128,
+        "rope_scaling": None,
+        "position_ids": None,
+        "query_position_offsets": [0],
+        "key_position_offsets": [0],
+        "cast_at": "after_rope",
+        "output_dtype": "bf16",
+        "fusion_boundary": "unfused_rope_attention",
+    }
+    json.dumps(payload)
+
+
+def test_rope_position_metadata_is_validated_against_contract_shape():
+    with pytest.raises(AttentionContractError, match="rotary_dim=256"):
+        _contract(rope=RoPESpec(rotary_dim=256))
+
+    with pytest.raises(AttentionContractError, match="query_position_offsets"):
+        _contract(batch_size=2, causal_offsets=(0, 0), rope=RoPESpec(query_position_offsets=(0,)))
+
+    with pytest.raises(AttentionContractError, match="position_ids"):
+        _contract(rope=RoPESpec(position_ids=(0, 1, 2)))
+
+    valid = _contract(rope=RoPESpec(position_ids=tuple(range(2048))))
+    assert valid.rope is not None
+    assert valid.rope.position_ids == tuple(range(2048))
 
 
 @pytest.mark.parametrize(
@@ -464,6 +517,28 @@ def test_packed_layout_requires_declared_backend_support():
     )
 
     assert capability.incompatibilities(contract) == ("packed varlen layout is unsupported",)
+
+
+def test_rope_contract_requires_declared_backend_support():
+    contract = _contract(rope=RoPESpec())
+    capability = _declared_cp_backend()
+
+    assert capability.incompatibilities(contract) == ("RoPE/position metadata is unsupported",)
+
+    supported = replace(capability, supports_rope_metadata=True)
+    assert supported.incompatibilities(contract) == ()
+
+
+def test_fused_rope_attention_boundary_requires_declared_backend_support():
+    contract = _contract(rope=RoPESpec(fusion_boundary=RoPEFusionBoundary.FUSED_ROPE_ATTENTION))
+    capability = replace(_declared_cp_backend(), supports_rope_metadata=True)
+
+    assert capability.incompatibilities(contract) == (
+        "fused RoPE+Attention boundary is unsupported",
+    )
+
+    supported = replace(capability, supports_fused_rope_attention=True)
+    assert supported.incompatibilities(contract) == ()
 
 
 def test_packed_sequence_count_must_match_logical_batch_size():

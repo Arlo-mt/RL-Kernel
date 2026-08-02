@@ -55,6 +55,22 @@ class ReductionEngine(str, Enum):
     IN_OP_REFERENCE = "in_op_reference"
 
 
+class RoPEState(str, Enum):
+    PRE_ROPE = "pre_rope"
+    POST_ROPE = "post_rope"
+
+
+class RoPECastPoint(str, Enum):
+    NONE = "none"
+    BEFORE_ROPE = "before_rope"
+    AFTER_ROPE = "after_rope"
+
+
+class RoPEFusionBoundary(str, Enum):
+    UNFUSED_ROPE_ATTENTION = "unfused_rope_attention"
+    FUSED_ROPE_ATTENTION = "fused_rope_attention"
+
+
 def _enum_value(enum_type: type[_EnumT], value: Any, field: str) -> _EnumT:
     try:
         return enum_type(value)
@@ -448,6 +464,65 @@ class KVCacheSpec:
 
 
 @dataclass(frozen=True)
+class RoPESpec:
+    """Qwen3 RoPE identity for attention inputs and KV-cache replay.
+
+    The CP attention reference consumes attention inputs.  This object records
+    whether those inputs are pre- or post-RoPE and pins the position/cache
+    metadata needed to compare fused ``RoPE+Attention`` and unfused
+    ``RoPE -> Attention`` materializations.
+    """
+
+    q_state: RoPEState = RoPEState.POST_ROPE
+    k_state: RoPEState = RoPEState.POST_ROPE
+    k_cache_state: RoPEState = RoPEState.POST_ROPE
+    theta: float = 1.0e6
+    rotary_dim: int = 128
+    rope_scaling: str | None = None
+    position_ids: tuple[int, ...] | None = None
+    query_position_offsets: tuple[int, ...] | None = None
+    key_position_offsets: tuple[int, ...] | None = None
+    cast_at: RoPECastPoint = RoPECastPoint.AFTER_ROPE
+    output_dtype: AttentionDType = AttentionDType.BF16
+    fusion_boundary: RoPEFusionBoundary = RoPEFusionBoundary.UNFUSED_ROPE_ATTENTION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "q_state", _enum_value(RoPEState, self.q_state, "q_state"))
+        object.__setattr__(self, "k_state", _enum_value(RoPEState, self.k_state, "k_state"))
+        object.__setattr__(
+            self, "k_cache_state", _enum_value(RoPEState, self.k_cache_state, "k_cache_state")
+        )
+        if isinstance(self.theta, bool) or not isinstance(self.theta, (float, int)):
+            raise AttentionContractError(f"theta must be a positive number; got {self.theta!r}")
+        theta = float(self.theta)
+        if theta <= 0.0:
+            raise AttentionContractError(f"theta must be a positive number; got {self.theta!r}")
+        object.__setattr__(self, "theta", theta)
+        _positive_int(self.rotary_dim, "rotary_dim")
+        if self.rope_scaling is not None and (
+            not isinstance(self.rope_scaling, str) or not self.rope_scaling.strip()
+        ):
+            raise AttentionContractError("rope_scaling must be a non-empty string when provided")
+        for field in ("position_ids", "query_position_offsets", "key_position_offsets"):
+            values = getattr(self, field)
+            if values is None:
+                continue
+            normalized = _integer_tuple(values, field)
+            if not normalized or any(value < 0 for value in normalized):
+                raise AttentionContractError(f"{field} must contain non-negative positions")
+            object.__setattr__(self, field, normalized)
+        object.__setattr__(self, "cast_at", _enum_value(RoPECastPoint, self.cast_at, "cast_at"))
+        object.__setattr__(
+            self, "output_dtype", _enum_value(AttentionDType, self.output_dtype, "output_dtype")
+        )
+        object.__setattr__(
+            self,
+            "fusion_boundary",
+            _enum_value(RoPEFusionBoundary, self.fusion_boundary, "fusion_boundary"),
+        )
+
+
+@dataclass(frozen=True)
 class AttentionContract:
     """Complete semantic request consumed by contract-aware dispatch."""
 
@@ -462,6 +537,7 @@ class AttentionContract:
     sharding: ShardingSpec
     reduction: ReductionSpec
     kv_cache: KVCacheSpec | None = None
+    rope: RoPESpec | None = None
     export_lse: bool = True
 
     def __post_init__(self) -> None:
@@ -520,6 +596,27 @@ class AttentionContract:
             raise AttentionContractError("kv_cache metadata is required for decode attention")
         if self.kv_cache is not None and not isinstance(self.kv_cache, KVCacheSpec):
             raise AttentionContractError("kv_cache must be a KVCacheSpec when provided")
+        if self.rope is not None:
+            if not isinstance(self.rope, RoPESpec):
+                raise AttentionContractError("rope must be a RoPESpec when provided")
+            if self.rope.rotary_dim > self.head_dim:
+                raise AttentionContractError(
+                    f"rotary_dim={self.rope.rotary_dim} must not exceed head_dim={self.head_dim}"
+                )
+            if self.rope.position_ids is not None and len(self.rope.position_ids) not in {
+                query_sequence_length,
+                self.sharding.local_sequence_length,
+            }:
+                raise AttentionContractError(
+                    "position_ids must describe the local query sequence or full local "
+                    "sequence length"
+                )
+            for field in ("query_position_offsets", "key_position_offsets"):
+                offsets = getattr(self.rope, field)
+                if offsets is not None and len(offsets) != batch_size:
+                    raise AttentionContractError(
+                        f"{field} must contain one entry per logical batch entry"
+                    )
         if self.mode is AttentionMode.DECODE and self.kv_cache is not None:
             if len(self.kv_cache.kv_seq_lens) != batch_size:
                 raise AttentionContractError(
@@ -574,6 +671,32 @@ class AttentionContract:
                 "prefix_cache_key": self.kv_cache.prefix_cache_key,
                 "shared_prefix_page_count": self.kv_cache.shared_prefix_page_count,
             }
+        rope = None
+        if self.rope is not None:
+            rope = {
+                "q_state": self.rope.q_state.value,
+                "k_state": self.rope.k_state.value,
+                "k_cache_state": self.rope.k_cache_state.value,
+                "theta": self.rope.theta,
+                "rotary_dim": self.rope.rotary_dim,
+                "rope_scaling": self.rope.rope_scaling,
+                "position_ids": (
+                    list(self.rope.position_ids) if self.rope.position_ids is not None else None
+                ),
+                "query_position_offsets": (
+                    list(self.rope.query_position_offsets)
+                    if self.rope.query_position_offsets is not None
+                    else None
+                ),
+                "key_position_offsets": (
+                    list(self.rope.key_position_offsets)
+                    if self.rope.key_position_offsets is not None
+                    else None
+                ),
+                "cast_at": self.rope.cast_at.value,
+                "output_dtype": self.rope.output_dtype.value,
+                "fusion_boundary": self.rope.fusion_boundary.value,
+            }
         return {
             "semantic_operator": "standard_softmax_attention",
             "role": self.role.value,
@@ -591,6 +714,7 @@ class AttentionContract:
             "sharding": sharding,
             "reduction": reduction,
             "kv_cache": kv_cache,
+            "rope": rope,
         }
 
 
@@ -608,6 +732,8 @@ class AttentionBackendCapability:
     deterministic_cp_merge: bool = False
     supports_packed_varlen: bool = False
     supports_kv_cache: bool = False
+    supports_rope_metadata: bool = False
+    supports_fused_rope_attention: bool = False
     implementation_kind: str = "production"
 
     def __post_init__(self) -> None:
@@ -635,6 +761,8 @@ class AttentionBackendCapability:
             "deterministic_cp_merge",
             "supports_packed_varlen",
             "supports_kv_cache",
+            "supports_rope_metadata",
+            "supports_fused_rope_attention",
         ):
             if not isinstance(getattr(self, field), bool):
                 raise AttentionContractError(f"{field} must be a bool")
@@ -675,6 +803,14 @@ class AttentionBackendCapability:
             reasons.append("packed varlen layout is unsupported")
         if contract.kv_cache is not None and not self.supports_kv_cache:
             reasons.append("KV-cache identity materialization is unsupported")
+        if contract.rope is not None and not self.supports_rope_metadata:
+            reasons.append("RoPE/position metadata is unsupported")
+        if (
+            contract.rope is not None
+            and contract.rope.fusion_boundary is RoPEFusionBoundary.FUSED_ROPE_ATTENTION
+            and not self.supports_fused_rope_attention
+        ):
+            reasons.append("fused RoPE+Attention boundary is unsupported")
         return tuple(reasons)
 
     def supports(self, contract: AttentionContract) -> bool:
@@ -692,6 +828,8 @@ class AttentionBackendCapability:
             "deterministic_cp_merge": self.deterministic_cp_merge,
             "supports_packed_varlen": self.supports_packed_varlen,
             "supports_kv_cache": self.supports_kv_cache,
+            "supports_rope_metadata": self.supports_rope_metadata,
+            "supports_fused_rope_attention": self.supports_fused_rope_attention,
             "implementation_kind": self.implementation_kind,
         }
 
@@ -719,5 +857,9 @@ __all__ = [
     "ReductionEngine",
     "ReductionOrder",
     "ReductionSpec",
+    "RoPECastPoint",
+    "RoPEFusionBoundary",
+    "RoPESpec",
+    "RoPEState",
     "ShardingSpec",
 ]

@@ -29,6 +29,7 @@ belong to later work in #235.
 - `ShardingSpec`: TP-local head ownership and CP block-to-token ownership;
 - `ReductionSpec`: fixed `(out, lse)` merge semantics;
 - `KVCacheSpec`: decode replay cache identity;
+- `RoPESpec`: Qwen3 RoPE state, position identity, and fused/unfused boundary metadata;
 - `AttentionBackendCapability`: the layouts and semantics a backend explicitly supports.
 
 Construction performs validation immediately. A structurally valid contract means that the
@@ -49,6 +50,7 @@ context.
 from rl_engine.kernels.attention_contract import (
     AttentionContract,
     ReductionSpec,
+    RoPESpec,
     ShardingSpec,
 )
 
@@ -81,6 +83,18 @@ contract = AttentionContract(
     causal_offsets=(0,),
     sharding=sharding,
     reduction=ReductionSpec(),
+    rope=RoPESpec(
+        q_state="post_rope",
+        k_state="post_rope",
+        k_cache_state="post_rope",
+        theta=1.0e6,
+        rotary_dim=128,
+        query_position_offsets=(0,),
+        key_position_offsets=(0,),
+        cast_at="after_rope",
+        output_dtype="bf16",
+        fusion_boundary="unfused_rope_attention",
+    ),
 )
 ```
 
@@ -96,6 +110,29 @@ local_block_offsets=(0, 1024, 2048)
 
 This metadata is sufficient for a later implementation to restore logical global order without
 using ring arrival order.
+
+## RoPE / Position Semantics
+
+RoPE is part of the attention contract because rollout can materialize
+`RoPE+Attention` as a fused or cache-aware path while training may materialize
+`RoPE -> Attention` as separate operators. PR1 does not execute the RoPE kernel,
+but it records the metadata required to prove both materializations use the same
+model semantics.
+
+`RoPESpec` records:
+
+- whether Q, K, and cached K are `pre_rope` or `post_rope`;
+- `theta`, optional `rope_scaling`, and `rotary_dim`;
+- dense `position_ids` or per-sequence `query_position_offsets` /
+  `key_position_offsets`;
+- the RoPE cast point and output dtype;
+- `fusion_boundary`, either `unfused_rope_attention` or `fused_rope_attention`.
+
+When RoPE metadata is present, construction validates that rotary dimensions fit
+the attention head dimension and that offset metadata matches the logical batch
+shape. Backends must declare RoPE support through `AttentionBackendCapability`;
+a backend that cannot consume RoPE/position metadata or cannot support a fused
+RoPE+Attention boundary is rejected before dispatch.
 
 ## Reduction Semantics
 
@@ -160,6 +197,8 @@ provenance = result.provenance
 
 Dispatch considers only backends with an `AttentionBackendCapability`. It checks role, attention
 mode, dtype, TP/CP degree, LSE export, deterministic CP merge, packed varlen, and KV-cache support.
+When RoPE metadata is present, dispatch also checks whether the backend explicitly supports
+RoPE/position metadata and fused RoPE+Attention boundaries.
 An undeclared or incompatible backend is skipped with an explicit rejection reason.
 
 The current WS1 PyTorch Attention implementations support local reference math but do not export
@@ -185,4 +224,4 @@ python -m pytest tests/test_attention_contract.py -q
 
 The tests include Qwen3 TP=2/CP=2 construction, GQA ownership errors, non-contiguous CP blocks,
 packed varlen metadata, decode cache identity, undeclared backend rejection, no incompatible
-fallback, and JSON-compatible provenance.
+fallback, RoPE metadata validation, and JSON-compatible provenance.
