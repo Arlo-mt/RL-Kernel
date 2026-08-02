@@ -19,6 +19,7 @@ from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     merge_attention_partial_states,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
+from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.kernels.registry import kernel_registry
 
 _N_HEADS = 32
@@ -101,6 +102,43 @@ def test_cp2_prefill_matches_cp1_reference():
     with _single_thread():
         out1, lse1 = op.forward_fp32_with_lse(q, k, v, causal=True, cp_world_size=1)
         out2, lse2 = op.forward_fp32_with_lse(q, k, v, causal=True, cp_world_size=2)
+
+    torch.testing.assert_close(out2, out1, atol=_ATOL, rtol=0.0)
+    torch.testing.assert_close(lse2, lse1, atol=_ATOL, rtol=0.0)
+
+
+def test_cp2_consumes_post_rope_qk_with_shared_global_position_metadata():
+    op = DeterministicCPAttentionReferenceOp()
+    rope = NativeRoPEOp()
+    pre_rope_q, pre_rope_k, v = _qkv(2, 7, 7, seed=14, heads=4, kv_heads=2, dim=8)
+    position_offsets = torch.tensor([17, 103], dtype=torch.long)
+    positions = position_offsets[:, None] + torch.arange(pre_rope_q.size(2), dtype=torch.long)
+    q = rope.forward_fp32(pre_rope_q, positions, theta=1_000_000.0)
+    k = rope.forward_fp32(pre_rope_k, positions, theta=1_000_000.0)
+
+    assert not torch.equal(q, pre_rope_q.float())
+    assert not torch.equal(k, pre_rope_k.float())
+
+    with _single_thread():
+        out1, lse1 = op.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=True,
+            query_position_offsets=position_offsets,
+            key_position_offsets=position_offsets,
+            cp_world_size=1,
+        )
+        out2, lse2 = op.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=True,
+            query_position_offsets=position_offsets,
+            key_position_offsets=position_offsets,
+            cp_world_size=2,
+            kv_chunk_size=2,
+        )
 
     torch.testing.assert_close(out2, out1, atol=_ATOL, rtol=0.0)
     torch.testing.assert_close(lse2, lse1, atol=_ATOL, rtol=0.0)

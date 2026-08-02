@@ -94,6 +94,12 @@ fused backend; it defines the CP/LSE merge behavior that downstream fused paths
 must match. Optional per-batch `query_position_offsets` / `key_position_offsets`
 cover varlen causal-mask metadata while keeping the dense tensor layout.
 
+For Qwen3 WS2, `cp_attention` consumes post-QK-Norm, post-RoPE Q/K. It does not
+call `NativeRoPEOp` internally and does not hide RoPE inside the CP merge. The
+position offsets passed to CP attention must describe the same absolute token
+positions used when RoPE was applied, so PR3 validates the post-RoPE Q/K boundary
+while PR7 can later validate production fused `RoPE+Attention` kernels.
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):
@@ -158,8 +164,9 @@ gradient flow, registry dispatch, and a
 GPU-only LARGE Qwen3-8B real-shape smoke test.
 
 `tests/test_cp_attention.py` covers the WS2 CP reference: CP=1 vs standard
-attention, CP=2 prefill vs CP=1, chunked-prefill replay, global-position causal
-masking across CP boundaries, order-independent LSE merge by global block index,
+attention, CP=2 prefill vs CP=1, post-RoPE Q/K input semantics with shared
+global position metadata, chunked-prefill replay, global-position causal masking
+across CP boundaries, order-independent LSE merge by global block index,
 padding/all-masked stability, BF16 final-write behavior, input purity, argument
 validation, and registry dispatch.
 `make_operator_inputs("cp_attention", ...)` also emits a CP=2 chunked-prefill
@@ -246,6 +253,8 @@ for measured peak memory at representative shapes.
 - Full materialization of scores/P limits practical sequence length.
 - `cp_attention` is a PyTorch reference for CP prefill/chunked-prefill semantics,
   not a distributed runtime or fused kernel.
+- `cp_attention` consumes post-RoPE Q/K for Qwen3 WS2; RoPE execution and fused
+  `RoPE+Attention` backend alignment are outside PR3.
 - `Hq` must be divisible by `Hkv` (raises `ValueError` otherwise).
 - CUDA KV-cache op wrapper is not in scope (caller does cat + calls this op).
 - No FP8, no multi-GPU / sequence-parallel.

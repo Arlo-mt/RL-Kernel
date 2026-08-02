@@ -84,6 +84,12 @@ def merge_attention_partial_states(
 class DeterministicCPAttentionReferenceOp:
     """Correctness-first CP attention reference for prefill and chunked prefill.
 
+    The reference consumes attention-ready Q/K. For Qwen3 WS2 this means Q/K
+    have already passed QK-Norm and RoPE unless an outer contract explicitly
+    marks them as pre-RoPE. RoPE is intentionally kept outside this CP merge
+    implementation so fused and unfused ``RoPE+Attention`` paths can compare the
+    same post-RoPE Q/K boundary before validating CP communication.
+
     The op emulates CP by splitting query and KV sequence dimensions into
     logical CP shards. Each query shard computes one partial attention state per
     KV block, then merges those states in fixed global-block order using fp32
@@ -267,6 +273,8 @@ class DeterministicCPAttentionReferenceOp:
         ``query_position_offsets`` and ``key_position_offsets`` are optional
         per-batch-row base positions. They let the reference express varlen or
         packed metadata while retaining the dense [B, H, S, D] tensor layout.
+        For post-RoPE Q/K, these offsets must describe the same absolute token
+        positions used when RoPE was applied.
         """
 
         _validate_qkv(q, k, v)
