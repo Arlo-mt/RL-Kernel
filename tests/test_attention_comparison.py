@@ -18,6 +18,7 @@ from rl_engine.testing.attention_comparison import (
     AttentionComparisonInputs,
     compare_single_gpu_attention,
     compare_single_gpu_rope_attention,
+    run_paged_kv_attention,
 )
 
 _TE_CONTEXT_PARALLEL_MODULE = (
@@ -191,8 +192,71 @@ def test_transformer_engine_merge_oracle_can_be_reused_when_available(monkeypatc
     assert "transformer_engine_paged_kv" in by_name
     assert by_name["transformer_engine_paged_kv"].out.max_abs <= 1.0e-6
     assert by_name["transformer_engine_paged_kv"].lse.max_abs <= 1.0e-6
+    provenance = by_name["transformer_engine_paged_kv"].provenance
+    assert provenance["te_available"] is True
+    assert provenance["te_module"] == _TE_CONTEXT_PARALLEL_MODULE
+    assert provenance["te_capability_probe"] == "passed"
+    assert provenance["te_signature_checked"] is True
+    assert provenance["te_numeric_selftest"] == "passed"
+    assert provenance["actual_backend"] == "te_context_parallel_merge_helpers"
+    assert provenance["actual_backend_source"] == "rl_kernel_te_context_parallel_adapter"
+    assert provenance["accum_dtype"] == "fp32"
+    assert provenance["downcast_at"] == "final_write"
     assert calls["lse"] > 0
     assert calls["out"] > 0
+    assert report.unavailable == ()
+
+
+def test_transformer_engine_merge_oracle_keeps_all_masked_rows_stable(monkeypatch):
+    def lse_correction(softmax_lse, softmax_lse_per_step):
+        max_scale = torch.max(softmax_lse, softmax_lse_per_step)
+        min_scale = torch.min(softmax_lse, softmax_lse_per_step)
+        softmax_lse.copy_(max_scale + torch.log1p(torch.exp(min_scale - max_scale)))
+
+    def out_correction_init(out_init_step, softmax_lse, softmax_lse_init_step, seq_dim):
+        scale = torch.exp(softmax_lse_init_step - softmax_lse).movedim(2, seq_dim)
+        return out_init_step * scale.unsqueeze(-1)
+
+    def out_correction(out, out_per_step, softmax_lse, softmax_lse_per_step, seq_dim):
+        scale = torch.exp(softmax_lse_per_step - softmax_lse).movedim(2, seq_dim)
+        out.add_(out_per_step * scale.unsqueeze(-1))
+
+    monkeypatch.setitem(
+        sys.modules,
+        _TE_CONTEXT_PARALLEL_MODULE,
+        types.SimpleNamespace(
+            flash_attn_fwd_softmax_lse_correction=lse_correction,
+            flash_attn_fwd_out_correction_init=out_correction_init,
+            flash_attn_fwd_out_correction=out_correction,
+        ),
+    )
+
+    q, k, v = _qkv(seed=11)
+    inputs = AttentionComparisonInputs(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        key_padding_mask=torch.zeros(q.size(0), k.size(2), dtype=torch.bool),
+    )
+
+    te_result = run_paged_kv_attention(
+        inputs,
+        kv_page_size=2,
+        merge_backend="transformer_engine",
+    )
+    assert torch.equal(te_result.out, torch.zeros_like(te_result.out))
+    assert torch.isneginf(te_result.lse).all()
+
+    report = compare_single_gpu_attention(
+        inputs,
+        query_chunk_size=3,
+        kv_page_size=2,
+        include_transformer_engine=True,
+    )
+    by_name = {drift.candidate_name: drift for drift in report.drifts}
+    assert by_name["transformer_engine_paged_kv"].out.max_abs == 0.0
+    assert by_name["transformer_engine_paged_kv"].lse.max_abs == 0.0
     assert report.unavailable == ()
 
 
@@ -218,6 +282,59 @@ def test_transformer_engine_path_reports_unavailable_without_failing(monkeypatch
         "rl_kernel_paged_kv",
     }
     assert report.unavailable == ("transformer_engine_paged_kv: test TE unavailable",)
+
+
+def test_transformer_engine_path_reports_missing_helpers(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        _TE_CONTEXT_PARALLEL_MODULE,
+        types.SimpleNamespace(
+            flash_attn_fwd_softmax_lse_correction=lambda softmax_lse, per_step: None,
+        ),
+    )
+
+    report = compare_single_gpu_attention(
+        _comparison_inputs(),
+        query_chunk_size=3,
+        kv_page_size=2,
+        include_transformer_engine=True,
+    )
+
+    assert len(report.unavailable) == 1
+    assert "missing required helpers" in report.unavailable[0]
+
+
+def test_transformer_engine_path_reports_incompatible_helper_signature(monkeypatch):
+    def lse_correction(wrong_name, softmax_lse_per_step):
+        wrong_name.copy_(torch.logaddexp(wrong_name, softmax_lse_per_step))
+
+    def out_correction_init(out_init_step, softmax_lse, softmax_lse_init_step, seq_dim):
+        scale = torch.exp(softmax_lse_init_step - softmax_lse).movedim(2, seq_dim)
+        return out_init_step * scale.unsqueeze(-1)
+
+    def out_correction(out, out_per_step, softmax_lse, softmax_lse_per_step, seq_dim):
+        scale = torch.exp(softmax_lse_per_step - softmax_lse).movedim(2, seq_dim)
+        out.add_(out_per_step * scale.unsqueeze(-1))
+
+    monkeypatch.setitem(
+        sys.modules,
+        _TE_CONTEXT_PARALLEL_MODULE,
+        types.SimpleNamespace(
+            flash_attn_fwd_softmax_lse_correction=lse_correction,
+            flash_attn_fwd_out_correction_init=out_correction_init,
+            flash_attn_fwd_out_correction=out_correction,
+        ),
+    )
+
+    report = compare_single_gpu_attention(
+        _comparison_inputs(),
+        query_chunk_size=3,
+        kv_page_size=2,
+        include_transformer_engine=True,
+    )
+
+    assert len(report.unavailable) == 1
+    assert "incompatible signature" in report.unavailable[0]
 
 
 def test_operator_comparison_specs_register_attention():

@@ -12,6 +12,8 @@ single device while preserving global causal positions and attention-domain LSE.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata as importlib_metadata
+import inspect
 import math
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -26,6 +28,22 @@ MergeBackend = Literal["rl_kernel", "transformer_engine"]
 _TE_CONTEXT_PARALLEL_MODULE = (
     "transformer_engine.pytorch.attention.dot_product_attention.context_parallel"
 )
+_TE_CONTEXT_PARALLEL_HELPERS = {
+    "flash_attn_fwd_softmax_lse_correction": ("softmax_lse", "softmax_lse_per_step"),
+    "flash_attn_fwd_out_correction_init": (
+        "out_init_step",
+        "softmax_lse",
+        "softmax_lse_init_step",
+        "seq_dim",
+    ),
+    "flash_attn_fwd_out_correction": (
+        "out",
+        "out_per_step",
+        "softmax_lse",
+        "softmax_lse_per_step",
+        "seq_dim",
+    ),
+}
 
 
 class TransformerEngineUnavailable(RuntimeError):
@@ -366,19 +384,33 @@ def run_paged_kv_attention(
         )
 
     out, lse = _merge_partial_states(states, backend=merge_backend)
+    provenance = {
+        "attention_mode": "prefill",
+        "materialization": "paged_kv",
+        "kv_page_size": page_size,
+        "kv_page_bounds": [list(bound) for bound in page_bounds],
+        "merge_backend": merge_backend,
+        "requested_backend": merge_backend,
+        "actual_backend": (
+            "te_context_parallel_merge_helpers"
+            if merge_backend == "transformer_engine"
+            else "rl_kernel"
+        ),
+        "fallback": False,
+        "fallback_reason": None,
+        "merge_order": "global_block_index",
+        "lse_domain": "attention",
+        "lse_exported": True,
+        "accum_dtype": "fp32",
+        "downcast_at": "final_write",
+    }
+    if merge_backend == "transformer_engine":
+        provenance.update(_te_context_parallel_provenance())
     return AttentionPathResult(
         name=f"{merge_backend}_paged_kv",
         out=out.to(inputs.output_dtype),
         lse=lse,
-        provenance={
-            "attention_mode": "prefill",
-            "materialization": "paged_kv",
-            "kv_page_size": page_size,
-            "kv_page_bounds": [list(bound) for bound in page_bounds],
-            "merge_backend": merge_backend,
-            "merge_order": "global_block_index",
-            "lse_domain": "attention",
-        },
+        provenance=provenance,
     )
 
 
@@ -562,29 +594,131 @@ def _merge_partial_states_transformer_engine(
     merged_lse = states[0].lse.float()
     for state in states[1:]:
         previous_lse = merged_lse
-        merged_lse = previous_lse.clone()
-        te_cp.flash_attn_fwd_softmax_lse_correction(merged_lse, state.lse.float())
+        state_out = state.out.float()
+        state_lse = state.lse.float()
+        both_masked = torch.isneginf(previous_lse) & torch.isneginf(state_lse)
+        te_previous_lse = torch.where(both_masked, torch.zeros_like(previous_lse), previous_lse)
+        te_state_lse = torch.where(both_masked, torch.zeros_like(state_lse), state_lse)
+        merged_lse = te_previous_lse.clone()
+        te_cp.flash_attn_fwd_softmax_lse_correction(merged_lse, te_state_lse)
         merged_out = te_cp.flash_attn_fwd_out_correction_init(
             merged_out,
             merged_lse,
-            previous_lse,
+            te_previous_lse,
             seq_dim=2,
         )
         te_cp.flash_attn_fwd_out_correction(
             merged_out,
-            state.out.float(),
+            state_out,
             merged_lse,
-            state.lse.float(),
+            te_state_lse,
             seq_dim=2,
         )
+        if both_masked.any():
+            merged_lse = torch.where(both_masked, previous_lse, merged_lse)
+            merged_out = torch.where(
+                both_masked.unsqueeze(-1),
+                torch.zeros_like(merged_out),
+                merged_out,
+            )
     return merged_out, merged_lse
 
 
 def _load_te_context_parallel() -> Any:
     try:
-        return importlib.import_module(_TE_CONTEXT_PARALLEL_MODULE)
+        module = importlib.import_module(_TE_CONTEXT_PARALLEL_MODULE)
     except (ImportError, OSError, RuntimeError) as exc:
         raise TransformerEngineUnavailable(str(exc)) from exc
+    _probe_te_context_parallel(module)
+    return module
+
+
+def _probe_te_context_parallel(module: Any) -> None:
+    missing = [
+        name for name in _TE_CONTEXT_PARALLEL_HELPERS if not callable(getattr(module, name, None))
+    ]
+    if missing:
+        raise TransformerEngineUnavailable(
+            f"{_TE_CONTEXT_PARALLEL_MODULE} missing required helpers: {', '.join(missing)}"
+        )
+
+    for name, expected in _TE_CONTEXT_PARALLEL_HELPERS.items():
+        helper = getattr(module, name)
+        try:
+            parameters = tuple(inspect.signature(helper).parameters)
+        except (TypeError, ValueError) as exc:
+            raise TransformerEngineUnavailable(
+                f"{_TE_CONTEXT_PARALLEL_MODULE}.{name} signature is not inspectable"
+            ) from exc
+        if parameters[: len(expected)] != expected:
+            raise TransformerEngineUnavailable(
+                f"{_TE_CONTEXT_PARALLEL_MODULE}.{name} has incompatible signature "
+                f"{parameters}; expected prefix {expected}"
+            )
+
+    try:
+        lse_a = torch.tensor([[[0.0, -1.0]]], dtype=torch.float32)
+        lse_b = torch.tensor([[[1.0, -3.0]]], dtype=torch.float32)
+        out_a = torch.tensor([[[[1.0, -2.0], [0.5, 2.0]]]], dtype=torch.float32)
+        out_b = torch.tensor([[[[-1.0, 4.0], [3.0, -0.5]]]], dtype=torch.float32)
+        expected_lse = torch.logaddexp(lse_a, lse_b)
+        expected_out = (
+            torch.exp(lse_a - expected_lse).unsqueeze(-1) * out_a
+            + torch.exp(lse_b - expected_lse).unsqueeze(-1) * out_b
+        )
+
+        probed_lse = lse_a.clone()
+        module.flash_attn_fwd_softmax_lse_correction(probed_lse, lse_b)
+        probed_out = module.flash_attn_fwd_out_correction_init(
+            out_a.clone(),
+            probed_lse,
+            lse_a,
+            seq_dim=2,
+        )
+        module.flash_attn_fwd_out_correction(
+            probed_out,
+            out_b,
+            probed_lse,
+            lse_b,
+            seq_dim=2,
+        )
+    except Exception as exc:
+        raise TransformerEngineUnavailable(
+            f"{_TE_CONTEXT_PARALLEL_MODULE} helper numeric self-test failed: {exc}"
+        ) from exc
+
+    if not torch.allclose(probed_lse, expected_lse, atol=1.0e-6, rtol=0.0):
+        raise TransformerEngineUnavailable(
+            f"{_TE_CONTEXT_PARALLEL_MODULE} LSE helper numeric self-test failed"
+        )
+    if not torch.allclose(probed_out, expected_out, atol=1.0e-6, rtol=0.0):
+        raise TransformerEngineUnavailable(
+            f"{_TE_CONTEXT_PARALLEL_MODULE} out helper numeric self-test failed"
+        )
+
+
+def _te_context_parallel_provenance() -> dict[str, Any]:
+    return {
+        "te_available": True,
+        "te_version": _te_version(),
+        "te_module": _TE_CONTEXT_PARALLEL_MODULE,
+        "te_symbols": list(_TE_CONTEXT_PARALLEL_HELPERS),
+        "te_capability_probe": "passed",
+        "te_signature_checked": True,
+        "te_numeric_selftest": "passed",
+        "actual_backend_source": "rl_kernel_te_context_parallel_adapter",
+        "deterministic_controls": "not_applicable_merge_only",
+        "dropout_policy": "not_applicable_merge_only",
+    }
+
+
+def _te_version() -> str | None:
+    for package_name in ("transformer-engine", "transformer_engine"):
+        try:
+            return importlib_metadata.version(package_name)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+    return None
 
 
 def _selected_logps_from_attention(
@@ -620,7 +754,14 @@ def _drift_stats(
             f"candidate shape {tuple(candidate.shape)} must match "
             f"reference shape {tuple(reference.shape)}"
         )
-    diff = (candidate.float() - reference.float()).abs()
+    candidate_fp32 = candidate.float()
+    reference_fp32 = reference.float()
+    raw_diff = (candidate_fp32 - reference_fp32).abs()
+    diff = torch.where(
+        candidate_fp32 == reference_fp32,
+        torch.zeros_like(raw_diff),
+        raw_diff,
+    )
     values = _active_values(diff, mask)
     active_count = int(values.numel())
     if active_count == 0:
