@@ -8,16 +8,23 @@ import importlib
 import json
 import sys
 import types
+from dataclasses import replace
+from typing import Literal
 
 import pytest
 import torch
 
 from rl_engine.kernels.gtest import run_operator_suite
 from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator_case
+from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.testing.attention_comparison import (
     AttentionComparisonInputs,
+    DecodeAttentionInputs,
+    DecodeKVCacheMetadata,
+    compare_decode_kv_replay,
     compare_single_gpu_attention,
     compare_single_gpu_rope_attention,
+    run_decode_kv_replay,
     run_paged_kv_attention,
 )
 
@@ -54,6 +61,54 @@ def _comparison_inputs() -> AttentionComparisonInputs:
         lm_head_weight=lm_head_weight,
         target_ids=target_ids,
         active_token_mask=active_mask,
+    )
+
+
+def _decode_inputs(
+    *,
+    page_order: tuple[int, ...] = (0, 1, 2),
+    prefix_cache_enabled: bool = False,
+    q_rope_state: Literal["pre_rope", "post_rope"] = "post_rope",
+    k_cache_rope_state: Literal["pre_rope", "post_rope"] = "post_rope",
+) -> DecodeAttentionInputs:
+    q, logical_k, logical_v = _qkv(seed=17)
+    q = q[:, :, 4:6, :]
+    page_size = 2
+    physical_k = torch.empty_like(logical_k)
+    physical_v = torch.empty_like(logical_v)
+    positions = torch.full((2, 6), -1, dtype=torch.long)
+    for logical_page, physical_page in enumerate(page_order):
+        logical_slice = slice(logical_page * page_size, (logical_page + 1) * page_size)
+        physical_slice = slice(physical_page * page_size, (physical_page + 1) * page_size)
+        physical_k[:, :, physical_slice, :] = logical_k[:, :, logical_slice, :]
+        physical_v[:, :, physical_slice, :] = logical_v[:, :, logical_slice, :]
+        positions[:, physical_slice] = torch.arange(
+            logical_page * page_size,
+            (logical_page + 1) * page_size,
+        )
+    return DecodeAttentionInputs(
+        q=q,
+        k_cache=physical_k,
+        v_cache=physical_v,
+        metadata=DecodeKVCacheMetadata(
+            cache_position=torch.tensor([[4, 5], [4, 5]], dtype=torch.long),
+            kv_seq_lens=torch.tensor([6, 6], dtype=torch.long),
+            block_table=torch.tensor([page_order, page_order], dtype=torch.long),
+            global_token_positions=positions,
+            query_position_ids=torch.tensor([[4, 5], [4, 5]], dtype=torch.long),
+            key_position_ids=positions.clone(),
+            page_size=page_size,
+            prefix_cache_enabled=prefix_cache_enabled,
+            prefix_cache_key="shared-prefix" if prefix_cache_enabled else None,
+            q_rope_state=q_rope_state,
+            k_cache_rope_state=k_cache_rope_state,
+            cp_block_owners=torch.tensor([[0, 1, 0], [0, 1, 0]], dtype=torch.long),
+        ),
+        lm_head_weight=torch.randn(
+            11, q.size(1) * q.size(3), generator=torch.Generator().manual_seed(18)
+        ),
+        target_ids=torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        active_token_mask=torch.tensor([[True, True], [False, True]], dtype=torch.bool),
     )
 
 
@@ -153,6 +208,181 @@ def test_single_gpu_rope_attention_requires_position_metadata():
 
     with pytest.raises(ValueError, match="rope_positions are required"):
         compare_single_gpu_rope_attention(AttentionComparisonInputs(q=base.q, k=base.k, v=base.v))
+
+
+def test_decode_replay_matches_full_prefill_for_single_and_few_query():
+    inputs = _decode_inputs()
+    report = compare_decode_kv_replay(inputs)
+
+    assert report.reference_name == "full_prefill_decode_reference"
+    drift = report.drifts[0]
+    assert drift.candidate_name == "rl_kernel_decode_kv_replay"
+    assert drift.out.max_abs <= 1.0e-6
+    assert drift.lse.max_abs <= 1.0e-6
+    assert drift.dlogp is not None
+    assert drift.dlogp.max_abs <= 3.0e-6
+    assert drift.dlogp.active_count == 3
+    assert drift.provenance["attention_mode"] == "decode"
+    assert drift.provenance["cache_position"] == [[4, 5], [4, 5]]
+    assert drift.provenance["cp_block_owners"] == [[0, 1, 0], [0, 1, 0]]
+    assert drift.provenance["merge_order"] == "global_block_index"
+
+    single_query = DecodeAttentionInputs(
+        q=inputs.q[:, :, -1:, :],
+        k_cache=inputs.k_cache,
+        v_cache=inputs.v_cache,
+        metadata=DecodeKVCacheMetadata(
+            cache_position=inputs.metadata.cache_position[:, -1:],
+            kv_seq_lens=inputs.metadata.kv_seq_lens,
+            block_table=inputs.metadata.block_table,
+            global_token_positions=inputs.metadata.global_token_positions,
+            query_position_ids=inputs.metadata.query_position_ids[:, -1:],
+            key_position_ids=inputs.metadata.key_position_ids,
+            page_size=inputs.metadata.page_size,
+            cp_block_owners=inputs.metadata.cp_block_owners,
+        ),
+    )
+    single_report = compare_decode_kv_replay(single_query)
+    assert single_report.drifts[0].out.max_abs <= 1.0e-6
+    assert single_report.drifts[0].lse.max_abs <= 1.0e-6
+
+
+def test_decode_replay_is_invariant_to_physical_page_and_prefix_layout():
+    contiguous = run_decode_kv_replay(_decode_inputs())
+    permuted = run_decode_kv_replay(_decode_inputs(page_order=(2, 0, 1), prefix_cache_enabled=True))
+
+    torch.testing.assert_close(permuted.out, contiguous.out, atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(permuted.lse, contiguous.lse, atol=1.0e-6, rtol=0.0)
+    assert permuted.provenance["prefix_cache_enabled"] is True
+    assert permuted.provenance["prefix_cache_key"] == "shared-prefix"
+
+
+def test_decode_replay_is_invariant_to_equivalent_cp_block_ownership():
+    cp2_inputs = _decode_inputs()
+    cp1_inputs = replace(
+        cp2_inputs,
+        metadata=replace(
+            cp2_inputs.metadata,
+            cp_block_owners=torch.zeros_like(cp2_inputs.metadata.cp_block_owners),
+        ),
+    )
+
+    cp1 = run_decode_kv_replay(cp1_inputs)
+    cp2 = run_decode_kv_replay(cp2_inputs)
+    torch.testing.assert_close(cp2.out, cp1.out, atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(cp2.lse, cp1.lse, atol=1.0e-6, rtol=0.0)
+    assert cp1.provenance["cp_block_owners"] == [[0, 0, 0], [0, 0, 0]]
+    assert cp2.provenance["cp_block_owners"] == [[0, 1, 0], [0, 1, 0]]
+
+
+def test_decode_replay_pre_rope_cache_matches_equivalent_post_rope_cache():
+    pre_rope = _decode_inputs(q_rope_state="pre_rope", k_cache_rope_state="pre_rope")
+    rope = NativeRoPEOp()
+    post_q = rope.forward_fp32(
+        pre_rope.q,
+        pre_rope.metadata.query_position_ids,
+        theta=pre_rope.rope_theta,
+    )
+    post_k = rope.forward_fp32(
+        pre_rope.k_cache,
+        pre_rope.metadata.key_position_ids,
+        theta=pre_rope.rope_theta,
+    )
+    post_rope = replace(
+        pre_rope,
+        q=post_q,
+        k_cache=post_k,
+        metadata=replace(
+            pre_rope.metadata,
+            q_rope_state="post_rope",
+            k_cache_rope_state="post_rope",
+        ),
+    )
+
+    pre_result = run_decode_kv_replay(pre_rope)
+    post_result = run_decode_kv_replay(post_rope)
+    torch.testing.assert_close(post_result.out, pre_result.out, atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(post_result.lse, pre_result.lse, atol=1.0e-6, rtol=0.0)
+
+
+def test_decode_replay_fails_loudly_on_position_identity_mismatch():
+    inputs = _decode_inputs()
+    bad_query_positions = inputs.metadata.query_position_ids.clone()
+    bad_query_positions[0, -1] = 4
+    bad_metadata = DecodeKVCacheMetadata(
+        cache_position=inputs.metadata.cache_position,
+        kv_seq_lens=inputs.metadata.kv_seq_lens,
+        block_table=inputs.metadata.block_table,
+        global_token_positions=inputs.metadata.global_token_positions,
+        query_position_ids=bad_query_positions,
+        key_position_ids=inputs.metadata.key_position_ids,
+        page_size=inputs.metadata.page_size,
+        cp_block_owners=inputs.metadata.cp_block_owners,
+    )
+
+    with pytest.raises(ValueError, match="cache_position and query_position_ids"):
+        run_decode_kv_replay(
+            DecodeAttentionInputs(
+                q=inputs.q,
+                k_cache=inputs.k_cache,
+                v_cache=inputs.v_cache,
+                metadata=bad_metadata,
+            )
+        )
+
+
+def test_decode_replay_fails_loudly_on_invalid_page_identity():
+    inputs = _decode_inputs()
+    bad_positions = inputs.metadata.global_token_positions.clone()
+    bad_positions[:, 0] = 1
+    bad_metadata = DecodeKVCacheMetadata(
+        cache_position=inputs.metadata.cache_position,
+        kv_seq_lens=inputs.metadata.kv_seq_lens,
+        block_table=inputs.metadata.block_table,
+        global_token_positions=bad_positions,
+        query_position_ids=inputs.metadata.query_position_ids,
+        key_position_ids=bad_positions.clone(),
+        page_size=inputs.metadata.page_size,
+        cp_block_owners=inputs.metadata.cp_block_owners,
+    )
+
+    with pytest.raises(ValueError, match="reconstruct logical positions"):
+        compare_decode_kv_replay(
+            DecodeAttentionInputs(
+                q=inputs.q,
+                k_cache=inputs.k_cache,
+                v_cache=inputs.v_cache,
+                metadata=bad_metadata,
+            )
+        )
+
+
+def test_decode_replay_covers_qwen3_gqa_head_layout():
+    generator = torch.Generator().manual_seed(23)
+    q = torch.randn(1, 32, 1, 128, generator=generator, dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 4, 128, generator=generator, dtype=torch.bfloat16)
+    v = torch.randn(1, 8, 4, 128, generator=generator, dtype=torch.bfloat16)
+    positions = torch.arange(4, dtype=torch.long).unsqueeze(0)
+    inputs = DecodeAttentionInputs(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        metadata=DecodeKVCacheMetadata(
+            cache_position=torch.tensor([[3]], dtype=torch.long),
+            kv_seq_lens=torch.tensor([4], dtype=torch.long),
+            block_table=torch.tensor([[0, 1]], dtype=torch.long),
+            global_token_positions=positions,
+            query_position_ids=torch.tensor([[3]], dtype=torch.long),
+            key_position_ids=positions.clone(),
+            page_size=2,
+            cp_block_owners=torch.tensor([[0, 1]], dtype=torch.long),
+        ),
+        output_dtype=torch.bfloat16,
+    )
+
+    report = compare_decode_kv_replay(inputs)
+    assert report.drifts[0].out.max_abs <= 1.0e-6
+    assert report.drifts[0].lse.max_abs <= 1.0e-6
 
 
 def test_transformer_engine_merge_oracle_can_be_reused_when_available(monkeypatch):
