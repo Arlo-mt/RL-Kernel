@@ -61,6 +61,7 @@ __all__ = [
     "IDENTITY_FIELDS",
     "NULLABLE_IDENTITY_FIELDS",
     "RECORDED_FIELDS",
+    "SEMANTIC_CONTRACT_FIELDS",
     "SEMANTIC_REDUCTION_FIELDS",
     "WS2_ATTENTION_REDUCTION_MANDATE",
     "bind_attention_contracts",
@@ -126,6 +127,9 @@ IDENTITY_FIELDS: tuple[str, ...] = (
     "rope_scaling",
     "rotary_dim",
     "qk_layernorm",
+    # batch composition: batch-invariance is a claim about results not changing with
+    # batch makeup, so two sides scoring different batches are not comparable at all
+    "batch_size",
     # decode replay identity (#235 PR6)
     "global_token_positions_fingerprint",
     "kv_seq_lens_fingerprint",
@@ -140,6 +144,14 @@ SEMANTIC_REDUCTION_FIELDS: tuple[str, ...] = (
     "order",
     "downcast_at",
 )
+
+
+#: Contract fields outside ``ReductionSpec`` that still decide the numerical result.
+#: ``dtype`` is here rather than in :data:`RECORDED_FIELDS` because comparing a BF16
+#: rollout against an FP16 training pass produces a real drift number attributable to
+#: nothing. #235 PR5 does sweep BF16 against an FP32 reference; that sweep opts in via
+#: ``allow_dtype_difference`` instead of loosening the default.
+SEMANTIC_CONTRACT_FIELDS: tuple[str, ...] = ("dtype",)
 
 
 #: The WS2 mandate itself. ``#236`` currently declares single-member enums for
@@ -172,6 +184,11 @@ RECORDED_FIELDS: tuple[str, ...] = (
     "sharding.cp_world_size",
     "sharding.tp_world_size",
     "sharding.local_sequence_length",
+    # Supplied by the caller, not by the contract: #236 has no split-KV field yet, so
+    # the value comes from vLLM's flash_attn_max_num_splits_for_cuda_graph via the
+    # adapter. Recorded so split-KV differences are at least visible in provenance
+    # until #236 grows the field and it can move into the contract proper.
+    "split_kv_policy",
 )
 
 
@@ -264,7 +281,10 @@ def _reduction_view(contract: AttentionContract) -> dict[str, Any]:
     }
 
 
-def _recorded_view(contract: AttentionContract) -> dict[str, Any]:
+def _recorded_view(
+    contract: AttentionContract,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
     rope = contract.rope
     kv_cache = contract.kv_cache
     view: dict[str, Any] = {
@@ -297,6 +317,8 @@ def _recorded_view(contract: AttentionContract) -> dict[str, Any]:
                 ],
             }
         )
+    if extra:
+        view.update(extra)
     return view
 
 
@@ -324,6 +346,9 @@ def bind_attention_contracts(
     training_backend_id: str,
     determinism_issues: Sequence[BindingIssue] = (),
     require_full_identity: bool = True,
+    allow_dtype_difference: bool = False,
+    rollout_recorded_extra: Optional[Mapping[str, Any]] = None,
+    training_recorded_extra: Optional[Mapping[str, Any]] = None,
 ) -> AttentionBindingResult:
     """Bind a rollout attention contract to a training attention contract.
 
@@ -335,6 +360,13 @@ def bind_attention_contracts(
     ``require_full_identity`` exists for the single-GPU harness in #235 PR2, which
     legitimately has no KV-cache or decode identity to declare. Distributed callers
     must leave it at ``True``.
+
+    ``allow_dtype_difference`` exists for the #235 PR5 sweep that deliberately scores
+    a BF16 path against an FP32 reference. It must stay ``False`` everywhere else.
+
+    ``rollout_recorded_extra`` / ``training_recorded_extra`` carry materialization
+    facts that #236 does not yet model -- today that is ``split_kv_policy``. They are
+    merged into the recorded tier, never into identity or semantics.
     """
 
     if rollout_contract.role is not AttentionRole.INFER:
@@ -419,6 +451,22 @@ def bind_attention_contracts(
                     )
                 )
 
+    if not allow_dtype_difference and rollout_contract.dtype is not training_contract.dtype:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.REDUCTION_SEMANTIC_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="dtype",
+                rollout=rollout_contract.dtype.value,
+                training=training_contract.dtype.value,
+                message=(
+                    "the two sides compute in different dtypes; the resulting drift is "
+                    "not attributable. Pass allow_dtype_difference=True only for a "
+                    "deliberate precision sweep"
+                ),
+            )
+        )
+
     for side, contract in (("rollout", rollout_contract), ("training", training_contract)):
         if not contract.export_lse:
             issues.append(
@@ -441,9 +489,9 @@ def bind_attention_contracts(
     issues.extend(determinism_issues)
 
     # ---- tier 3: recorded differences --------------------------------------
-    rollout_recorded = _recorded_view(rollout_contract)
+    rollout_recorded = _recorded_view(rollout_contract, rollout_recorded_extra)
     rollout_recorded["backend_id"] = rollout_backend_id
-    training_recorded = _recorded_view(training_contract)
+    training_recorded = _recorded_view(training_contract, training_recorded_extra)
     training_recorded["backend_id"] = training_backend_id
 
     recorded_differences: dict[str, dict[str, Any]] = {}
@@ -464,6 +512,7 @@ def bind_attention_contracts(
 
     provenance = {
         "lse_domain": ATTENTION_LSE_DOMAIN,
+        "dtype": training_contract.dtype.value,
         "rollout": {
             "contract": rollout_contract.to_dict(),
             "backend_id": rollout_backend_id,

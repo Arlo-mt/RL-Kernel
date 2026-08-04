@@ -71,6 +71,7 @@ def _identity(**overrides):
         "position_ids_fingerprint": "pos-abc",
         "padding_side": "right",
         "pre_update_state": "pre_update",
+        "batch_size": 2,
         "global_token_positions_fingerprint": "gtp-abc",
         "kv_seq_lens_fingerprint": "kvlen-abc",
     }
@@ -222,6 +223,64 @@ def test_lse_domain_is_recorded_as_attention_domain():
     result = _bind()
 
     assert result.provenance["lse_domain"] == ATTENTION_LSE_DOMAIN == "attention"
+
+
+def test_mixed_dtypes_fail_closed():
+    """BF16 rollout against FP16 training produces an unattributable number."""
+
+    rollout = VllmRolloutMaterializer().build_contract(
+        {**ROLLOUT_KNOBS, "rollout.dtype": "float16"}
+    )
+    result = _bind(rollout_contract=rollout)
+
+    assert result.comparable  # identity is fine
+    assert not result.passed
+    assert any(issue.field == "dtype" for issue in result.issues)
+
+
+def test_precision_sweep_may_opt_into_mixed_dtypes():
+    """#235 PR5 sweeps BF16 against an FP32 reference; it says so explicitly."""
+
+    training = MegatronAttentionMaterializer().build_contract(
+        {**TRAINING_KNOBS, "training.compute_dtype": "float32"}
+    )
+    result = _bind(training_contract=training, allow_dtype_difference=True)
+
+    assert result.passed
+    assert result.provenance["dtype"] == "fp32"
+
+
+def test_batch_size_mismatch_is_not_comparable():
+    """Batch invariance is a claim about batch makeup, so it belongs to identity."""
+
+    result = _bind(rollout_identity=_identity(batch_size=4))
+
+    assert not result.comparable
+    assert any(issue.field == "batch_size" for issue in result.issues)
+
+
+def test_split_kv_policy_difference_is_recorded():
+    """#236 has no split-KV field, so the adapter supplies it to the recorded tier."""
+
+    result = _bind(
+        rollout_recorded_extra={"split_kv_policy": 8},
+        training_recorded_extra={"split_kv_policy": None},
+    )
+
+    assert result.passed
+    assert result.recorded_differences["split_kv_policy"] == {
+        "rollout": 8,
+        "training": None,
+    }
+
+
+def test_matching_split_kv_policy_is_not_reported_as_a_difference():
+    result = _bind(
+        rollout_recorded_extra={"split_kv_policy": 32},
+        training_recorded_extra={"split_kv_policy": 32},
+    )
+
+    assert "split_kv_policy" not in result.recorded_differences
 
 
 # --------------------------------------------------------------------------
