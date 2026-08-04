@@ -17,12 +17,18 @@ layout:
 - `key_position_ids` binds cached K to its RoPE positions;
 - `q_rope_state` and `k_cache_rope_state` declare whether tensors are before or
   after RoPE;
-- `prefix_cache_key` identifies a reused prefix when prefix caching is enabled;
+- `prefix_cache_key`, `prefix_length`, and `prefix_cache_fingerprint` identify a
+  reused logical prefix and bind it to the cached K/V content;
 - `cp_block_owners` records logical CP ownership without changing merge order.
 
 Metadata is validated before attention runs. Missing pages, duplicated active
 pages, out-of-range positions, mismatched RoPE positions, or inconsistent
-prefix-cache identity fail with an explicit error.
+prefix-cache identity fail with an explicit error. Prefix identity is verified
+by recomputing a physical-layout-invariant SHA-256 fingerprint over logical
+prefix positions and cached K/V content. The current reference requires
+`rope_cast_at="after_rope"` and `rope_rotary_dim == head_dim`; partial rotary is
+not supported yet. Q and cached K retain separate RoPE output dtype contracts so
+mixed rollout query/KV storage dtypes are represented faithfully.
 
 ## Deterministic replay
 
@@ -50,7 +56,9 @@ Transformer Engine remains optional. When requested, the replay passes the same
 sorted partial states to the capability-probed TE context-parallel correction
 helpers already used by the PR2 harness. TE validates merge arithmetic only; it
 does not interpret cache metadata, choose logical order, or replace RL-Kernel's
-reference semantics.
+reference semantics. The comparison always reports the RL-Kernel result; when
+TE is requested but unavailable or incompatible, it records the reason in the
+report instead of failing the core decode harness.
 
 ## Current boundary
 

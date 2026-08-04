@@ -11,6 +11,7 @@ single device while preserving global causal positions and attention-domain LSE.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.metadata as importlib_metadata
 import inspect
@@ -91,6 +92,8 @@ class DecodeKVCacheMetadata:
     page_size: int
     prefix_cache_key: str | None = None
     prefix_cache_enabled: bool = False
+    prefix_length: int = 0
+    prefix_cache_fingerprint: str | None = None
     q_rope_state: RoPEState = "post_rope"
     k_cache_rope_state: RoPEState = "post_rope"
     cp_block_owners: torch.Tensor | None = None
@@ -109,7 +112,8 @@ class DecodeAttentionInputs:
     rope_theta: float = 1_000_000.0
     rope_rotary_dim: int | None = None
     rope_cast_at: str = "after_rope"
-    rope_output_dtype: torch.dtype | None = None
+    q_rope_output_dtype: torch.dtype | None = None
+    k_cache_rope_output_dtype: torch.dtype | None = None
     lm_head_weight: torch.Tensor | None = None
     target_ids: torch.Tensor | None = None
     active_token_mask: torch.Tensor | None = None
@@ -257,26 +261,25 @@ def compare_single_gpu_rope_attention(
 def compare_decode_kv_replay(
     inputs: DecodeAttentionInputs,
     *,
-    merge_backend: MergeBackend = "rl_kernel",
+    include_transformer_engine: bool = False,
 ) -> AttentionComparisonReport:
     """Compare paged decode replay with a logical full-KV teacher-forcing view."""
 
     _validate_decode_inputs(inputs)
-    reference = run_decode_full_prefill_reference(inputs)
-    candidate = run_decode_kv_replay(inputs, merge_backend=merge_backend)
-    dlogp = None
-    if inputs.lm_head_weight is not None and inputs.target_ids is not None:
-        candidate_logp = _selected_logps_from_decode_attention(candidate.out, inputs)
-        reference_logp = _selected_logps_from_decode_attention(reference.out, inputs)
-        dlogp = _drift_stats(candidate_logp, reference_logp, mask=inputs.active_token_mask)
-    drift = AttentionPathDrift(
-        candidate_name=candidate.name,
-        out=_drift_stats(candidate.out, reference.out),
-        lse=_drift_stats(candidate.lse, reference.lse),
-        dlogp=dlogp,
-        provenance=candidate.provenance,
+    reference = _run_decode_full_prefill_reference(inputs)
+    candidates = [_run_decode_kv_replay(inputs, merge_backend="rl_kernel")]
+    unavailable: list[str] = []
+    if include_transformer_engine:
+        try:
+            candidates.append(_run_decode_kv_replay(inputs, merge_backend="transformer_engine"))
+        except TransformerEngineUnavailable as exc:
+            unavailable.append(f"transformer_engine_decode_kv_replay: {exc}")
+    drifts = tuple(_compare_decode_path(candidate, reference, inputs) for candidate in candidates)
+    return AttentionComparisonReport(
+        reference_name=reference.name,
+        drifts=drifts,
+        unavailable=tuple(unavailable),
     )
-    return AttentionComparisonReport(reference_name=reference.name, drifts=(drift,))
 
 
 def run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> AttentionPathResult:
@@ -287,6 +290,10 @@ def run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> Attentio
     """
 
     _validate_decode_inputs(inputs)
+    return _run_decode_full_prefill_reference(inputs)
+
+
+def _run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> AttentionPathResult:
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
     for batch_index in range(inputs.q.size(0)):
@@ -334,9 +341,17 @@ def run_decode_kv_replay(
     """Replay decode over physical KV pages and merge by logical block index."""
 
     _validate_decode_inputs(inputs)
+    return _run_decode_kv_replay(inputs, merge_backend=merge_backend)
+
+
+def _run_decode_kv_replay(
+    inputs: DecodeAttentionInputs,
+    *,
+    merge_backend: MergeBackend,
+) -> AttentionPathResult:
     outs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
-    merge_orders: list[list[int]] = []
+    merge_orders: list[list[list[int]]] = []
     cp_block_owners: list[list[int]] = []
     for batch_index in range(inputs.q.size(0)):
         q, k, v, logical_positions = _decode_logical_qkv(inputs, batch_index)
@@ -344,6 +359,7 @@ def run_decode_kv_replay(
         cp_block_owners.append(owners)
         batch_out: list[torch.Tensor] = []
         batch_lse: list[torch.Tensor] = []
+        batch_orders: list[list[int]] = []
         for query_index in range(q.size(2)):
             query_position = int(inputs.metadata.cache_position[batch_index, query_index].item())
             states: list[_PartialAttentionState] = []
@@ -383,7 +399,8 @@ def run_decode_kv_replay(
             out, lse = _merge_partial_states(states, backend=merge_backend)
             batch_out.append(out.to(inputs.output_dtype))
             batch_lse.append(lse)
-            merge_orders.append(order)
+            batch_orders.append(order)
+        merge_orders.append(batch_orders)
         outs.append(torch.cat(batch_out, dim=2))
         lses.append(torch.cat(batch_lse, dim=2))
 
@@ -400,12 +417,15 @@ def run_decode_kv_replay(
         "key_position_ids": inputs.metadata.key_position_ids.tolist(),
         "prefix_cache_enabled": inputs.metadata.prefix_cache_enabled,
         "prefix_cache_key": inputs.metadata.prefix_cache_key,
+        "prefix_length": inputs.metadata.prefix_length,
+        "prefix_cache_fingerprint": inputs.metadata.prefix_cache_fingerprint,
         "q_rope_state": inputs.metadata.q_rope_state,
         "k_cache_rope_state": inputs.metadata.k_cache_rope_state,
         "rope_theta": float(inputs.rope_theta),
         "rotary_dim": _decode_rope_rotary_dim(inputs),
         "rope_cast_at": inputs.rope_cast_at,
-        "rope_output_dtype": str(_decode_rope_output_dtype(inputs)).replace("torch.", ""),
+        "q_rope_output_dtype": str(_decode_q_rope_output_dtype(inputs)).replace("torch.", ""),
+        "k_cache_rope_output_dtype": str(_decode_k_rope_output_dtype(inputs)).replace("torch.", ""),
         "cp_block_owners": cp_block_owners,
         "merge_order": "global_block_index",
         "logical_merge_orders": merge_orders,
@@ -639,6 +659,39 @@ def transformer_engine_context_parallel_available() -> bool:
     return True
 
 
+def decode_prefix_cache_fingerprint(
+    inputs: DecodeAttentionInputs,
+    *,
+    prefix_length: int,
+) -> str:
+    """Fingerprint logical prefix positions and cached K/V content.
+
+    The fingerprint is invariant to physical page placement because cache slots
+    are first restored to logical token order. It intentionally includes the
+    cached-K RoPE state and tensor dtypes so it identifies the actual replay
+    boundary rather than only the token positions.
+    """
+
+    prefix_length = _positive_int(prefix_length, "prefix_length")
+    if bool((inputs.metadata.kv_seq_lens < prefix_length).any()):
+        raise ValueError("prefix_length must not exceed any kv_seq_lens entry")
+    digest = hashlib.sha256()
+    digest.update(f"k_rope_state={inputs.metadata.k_cache_rope_state}\n".encode())
+    digest.update(f"k_dtype={inputs.k_cache.dtype};v_dtype={inputs.v_cache.dtype}\n".encode())
+    for batch_index in range(inputs.q.size(0)):
+        slots = _decode_logical_slot_index(inputs, batch_index)[:prefix_length]
+        for tensor in (
+            inputs.metadata.global_token_positions[batch_index, slots],
+            inputs.metadata.key_position_ids[batch_index, slots],
+            inputs.k_cache[batch_index, :, slots, :],
+            inputs.v_cache[batch_index, :, slots, :],
+        ):
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(str(tensor.dtype).encode())
+            digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _compare_path(
     candidate: AttentionPathResult,
     reference: AttentionPathResult,
@@ -669,6 +722,25 @@ def _compare_path(
     )
 
 
+def _compare_decode_path(
+    candidate: AttentionPathResult,
+    reference: AttentionPathResult,
+    inputs: DecodeAttentionInputs,
+) -> AttentionPathDrift:
+    dlogp = None
+    if inputs.lm_head_weight is not None and inputs.target_ids is not None:
+        candidate_logp = _selected_logps_from_decode_attention(candidate.out, inputs)
+        reference_logp = _selected_logps_from_decode_attention(reference.out, inputs)
+        dlogp = _drift_stats(candidate_logp, reference_logp, mask=inputs.active_token_mask)
+    return AttentionPathDrift(
+        candidate_name=candidate.name,
+        out=_drift_stats(candidate.out, reference.out),
+        lse=_drift_stats(candidate.lse, reference.lse),
+        dlogp=dlogp,
+        provenance=candidate.provenance,
+    )
+
+
 def _apply_rope_to_qk(inputs: AttentionComparisonInputs) -> tuple[torch.Tensor, torch.Tensor]:
     _validate_rope_inputs(inputs)
     assert inputs.rope_positions is not None
@@ -686,43 +758,44 @@ def _decode_logical_qkv(
     """Restore one batch's cache to logical order and materialize RoPE state."""
 
     metadata = inputs.metadata
-    sequence_length = int(metadata.kv_seq_lens[batch_index].item())
-    physical_slots: list[int] = []
-    logical_positions: list[int] = []
-    logical_block_count = math.ceil(sequence_length / metadata.page_size)
-    for logical_block in range(logical_block_count):
-        physical_page = int(metadata.block_table[batch_index, logical_block].item())
-        tokens_in_block = min(
-            metadata.page_size,
-            sequence_length - logical_block * metadata.page_size,
-        )
-        for page_offset in range(tokens_in_block):
-            slot = physical_page * metadata.page_size + page_offset
-            physical_slots.append(slot)
-            logical_positions.append(int(metadata.global_token_positions[batch_index, slot].item()))
-
-    slot_index = torch.tensor(physical_slots, device=inputs.k_cache.device, dtype=torch.long)
-    logical_position_tensor = torch.tensor(
-        logical_positions,
-        device=inputs.k_cache.device,
-        dtype=torch.long,
-    )
+    slot_index = _decode_logical_slot_index(inputs, batch_index)
+    logical_position_tensor = metadata.global_token_positions[batch_index, slot_index].long()
     k = inputs.k_cache[batch_index : batch_index + 1, :, slot_index, :]
     v = inputs.v_cache[batch_index : batch_index + 1, :, slot_index, :]
     q = inputs.q[batch_index : batch_index + 1]
 
     rope = NativeRoPEOp()
-    output_dtype = _decode_rope_output_dtype(inputs)
     if metadata.q_rope_state == "pre_rope":
         q = rope.forward_fp32(
             q,
             metadata.query_position_ids[batch_index : batch_index + 1],
             theta=inputs.rope_theta,
-        ).to(output_dtype)
+        ).to(_decode_q_rope_output_dtype(inputs))
     if metadata.k_cache_rope_state == "pre_rope":
         key_positions = metadata.key_position_ids[batch_index, slot_index].unsqueeze(0)
-        k = rope.forward_fp32(k, key_positions, theta=inputs.rope_theta).to(output_dtype)
+        k = rope.forward_fp32(k, key_positions, theta=inputs.rope_theta).to(
+            _decode_k_rope_output_dtype(inputs)
+        )
     return q, k, v, logical_position_tensor
+
+
+def _decode_logical_slot_index(
+    inputs: DecodeAttentionInputs,
+    batch_index: int,
+) -> torch.Tensor:
+    metadata = inputs.metadata
+    sequence_length = int(metadata.kv_seq_lens[batch_index].item())
+    logical_block_count = math.ceil(sequence_length / metadata.page_size)
+    logical_index = torch.arange(
+        sequence_length,
+        device=inputs.k_cache.device,
+        dtype=torch.long,
+    )
+    pages = metadata.block_table[batch_index, :logical_block_count].long()
+    return (
+        pages[logical_index // metadata.page_size] * metadata.page_size
+        + logical_index % metadata.page_size
+    )
 
 
 def _logical_block_owners(inputs: DecodeAttentionInputs, batch_index: int) -> list[int]:
@@ -736,8 +809,16 @@ def _logical_block_owners(inputs: DecodeAttentionInputs, batch_index: int) -> li
     ]
 
 
-def _decode_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
-    return inputs.q.dtype if inputs.rope_output_dtype is None else inputs.rope_output_dtype
+def _decode_q_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
+    return inputs.q.dtype if inputs.q_rope_output_dtype is None else inputs.q_rope_output_dtype
+
+
+def _decode_k_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
+    return (
+        inputs.k_cache.dtype
+        if inputs.k_cache_rope_output_dtype is None
+        else inputs.k_cache_rope_output_dtype
+    )
 
 
 def _decode_rope_rotary_dim(inputs: DecodeAttentionInputs) -> int:
@@ -1153,6 +1234,8 @@ def _validate_rope_inputs(inputs: AttentionComparisonInputs) -> None:
 
 def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
     _validate_qkv(inputs.q, inputs.k_cache, inputs.v_cache)
+    if inputs.q.device != inputs.k_cache.device or inputs.q.device != inputs.v_cache.device:
+        raise ValueError("q, k_cache, and v_cache must be on the same device")
     metadata = inputs.metadata
     batch, _, sq, head_dim = inputs.q.shape
     cache_capacity = inputs.k_cache.size(2)
@@ -1199,10 +1282,21 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
         raise ValueError("q_rope_state must be 'pre_rope' or 'post_rope'")
     if metadata.k_cache_rope_state not in {"pre_rope", "post_rope"}:
         raise ValueError("k_cache_rope_state must be 'pre_rope' or 'post_rope'")
-    if metadata.prefix_cache_enabled and not metadata.prefix_cache_key:
-        raise ValueError("prefix_cache_key is required when prefix cache is enabled")
-    if not metadata.prefix_cache_enabled and metadata.prefix_cache_key is not None:
-        raise ValueError("prefix_cache_key must be None when prefix cache is disabled")
+    if metadata.prefix_cache_enabled:
+        if not metadata.prefix_cache_key:
+            raise ValueError("prefix_cache_key is required when prefix cache is enabled")
+        _positive_int(metadata.prefix_length, "prefix_length")
+        if not metadata.prefix_cache_fingerprint:
+            raise ValueError("prefix_cache_fingerprint is required when prefix cache is enabled")
+    elif (
+        metadata.prefix_cache_key is not None
+        or metadata.prefix_length != 0
+        or metadata.prefix_cache_fingerprint is not None
+    ):
+        raise ValueError(
+            "prefix cache key/fingerprint must be None and prefix_length must be 0 "
+            "when prefix cache is disabled"
+        )
     if inputs.rope_cast_at != "after_rope":
         raise ValueError("rope_cast_at must be 'after_rope' for the current fp32 RoPE reference")
     if inputs.rope_rotary_dim is not None:
@@ -1211,10 +1305,26 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
         _positive_int(inputs.rope_rotary_dim, "rope_rotary_dim")
     if float(inputs.rope_theta) <= 0:
         raise ValueError("rope_theta must be a positive number")
-    if inputs.rope_output_dtype is not None and not isinstance(
-        inputs.rope_output_dtype, torch.dtype
+    if inputs.q_rope_output_dtype is not None and not isinstance(
+        inputs.q_rope_output_dtype, torch.dtype
     ):
-        raise ValueError("rope_output_dtype must be a torch.dtype when provided")
+        raise ValueError("q_rope_output_dtype must be a torch.dtype when provided")
+    if inputs.k_cache_rope_output_dtype is not None and not isinstance(
+        inputs.k_cache_rope_output_dtype, torch.dtype
+    ):
+        raise ValueError("k_cache_rope_output_dtype must be a torch.dtype when provided")
+    if (
+        metadata.q_rope_state == "post_rope"
+        and inputs.q_rope_output_dtype is not None
+        and inputs.q.dtype != inputs.q_rope_output_dtype
+    ):
+        raise ValueError("post-RoPE q dtype must match q_rope_output_dtype")
+    if (
+        metadata.k_cache_rope_state == "post_rope"
+        and inputs.k_cache_rope_output_dtype is not None
+        and inputs.k_cache.dtype != inputs.k_cache_rope_output_dtype
+    ):
+        raise ValueError("post-RoPE k_cache dtype must match k_cache_rope_output_dtype")
     if (inputs.lm_head_weight is None) != (inputs.target_ids is None):
         raise ValueError("lm_head_weight and target_ids must be provided together")
     if inputs.target_ids is not None and inputs.target_ids.shape != (batch, sq):
@@ -1237,11 +1347,7 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
             raise ValueError("block_table contains an out-of-range physical page")
         if torch.unique(pages).numel() != block_count:
             raise ValueError("active block_table entries must not contain duplicate pages")
-        slots: list[int] = []
-        for logical_block, page in enumerate(pages.tolist()):
-            token_count = min(page_size, sequence_length - logical_block * page_size)
-            slots.extend(int(page) * page_size + offset for offset in range(token_count))
-        slot_index = torch.tensor(slots, device=inputs.q.device, dtype=torch.long)
+        slot_index = _decode_logical_slot_index(inputs, batch_index)
         active_slot_mask = torch.zeros(cache_capacity, device=inputs.q.device, dtype=torch.bool)
         active_slot_mask[slot_index] = True
         if bool((metadata.global_token_positions[batch_index, ~active_slot_mask] != -1).any()):
@@ -1267,6 +1373,16 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
             raise ValueError("cache_position must refer to a token present in the KV cache")
         if sq > 1 and bool((cache_positions[1:] <= cache_positions[:-1]).any()):
             raise ValueError("few-query cache_position values must be strictly increasing")
+
+    if metadata.prefix_cache_enabled:
+        actual_fingerprint = decode_prefix_cache_fingerprint(
+            inputs,
+            prefix_length=metadata.prefix_length,
+        )
+        if actual_fingerprint != metadata.prefix_cache_fingerprint:
+            raise ValueError(
+                "prefix_cache_fingerprint does not match the logical prefix positions/content"
+            )
 
 
 def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -1321,6 +1437,7 @@ __all__ = [
     "compare_single_gpu_rope_attention",
     "compare_single_gpu_attention",
     "compare_decode_kv_replay",
+    "decode_prefix_cache_fingerprint",
     "run_chunked_query_attention",
     "run_fused_like_rope_attention",
     "run_full_attention",
