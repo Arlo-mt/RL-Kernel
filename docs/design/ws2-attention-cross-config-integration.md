@@ -1,0 +1,135 @@
+# WS2 Attention Cross-Configuration Integration
+
+Implements PR4 of [#235](https://github.com/RL-Align/RL-Kernel/issues/235): wiring the
+CP attention path into the cross-configuration planner/runtime for the Qwen3-8B
+TP=2 CP=2 BF16 target.
+
+Builds on [#236](https://github.com/RL-Align/RL-Kernel/pull/236) (attention contract
+and dispatch metadata), [#238](https://github.com/RL-Align/RL-Kernel/pull/238)
+(deterministic CP reference) and [#230](https://github.com/RL-Align/RL-Kernel/pull/230)
+(cross-configuration framework).
+
+## What "bind to the same contract" means here
+
+The PR4 acceptance criteria say rollout and training descriptors must "bind to the
+same semantic attention contract". Under the frozen deployment the two sides can
+never produce identical `AttentionContract` instances:
+
+| | training (Megatron) | rollout (vLLM) |
+| --- | --- | --- |
+| mode | full-sequence prefill | chunked prefill, later decode |
+| CP | `context_parallel_size`, whole forward | `prefill_context_parallel_size`, prefill only |
+| KV | no paging | paged KV with a block table |
+| backend vocabulary | `AttnBackend{flash,fused,unfused,local,auto}` | `AttentionBackendEnum` |
+
+Read literally, the criterion is unsatisfiable. It is therefore implemented as three
+tiers, in `rl_engine/alignment/cross_config/attention_binding.py`:
+
+| tier | fields | rule | failure |
+| --- | --- | --- | --- |
+| `IDENTICAL` | checkpoint, model version, weight version, tokenizer, token ids, active mask, position ids, padding side, pre-update state, Q/KV heads, head dim, RoPE theta/scaling/rotary dim, QK-Norm, cached global token positions, KV sequence lengths | equal bit for bit | `comparable=False`; no drift number from the pair means anything |
+| `SEMANTIC` | `reduction.merge`, `reduction.acc_dtype`, `reduction.order`, `reduction.downcast_at`, `export_lse`, cross-side determinism mode | both sides equal **and** equal to the WS2 mandate | fail closed |
+| `RECORDED` | `mode`, `backend_id`, `reduction.engine`, RoPE materialization state and fusion boundary, KV-cache paging, CP/TP world sizes, local sequence length | free to differ | none; recorded into provenance and measured |
+
+Two placements are load-bearing:
+
+* **`reduction.engine` is `RECORDED`, not `SEMANTIC`.** Training may run the in-op
+  deterministic reference while rollout runs a Transformer Engine merge oracle.
+  Forcing them equal would defeat the oracle comparison that #235 PR2/PR3/PR5/PR6
+  depend on.
+* **`reduction.order` and `reduction.acc_dtype` are `SEMANTIC`.** This is the entire
+  WS2 claim: merge order and accumulation precision are decided by the contract, not
+  by whichever backend happens to be selected.
+
+`comparable` and `passed` are separate flags. A pair with mismatched identity is not
+comparable. A pair that is comparable but violates the reduction mandate is still
+rejected -- the drift would be real but attributable to the wrong thing.
+
+## Determinism is not one thing
+
+`rl_engine/alignment/cross_config/determinism.py` probes both sides and compares
+them, because the two frameworks mean different things by "deterministic":
+
+| | Megatron `deterministic_mode` | vLLM `VLLM_BATCH_INVARIANT` |
+| --- | --- | --- |
+| `NCCL_ALGO` | asserts membership in a five-value set | hard-sets `allreduce:tree` |
+| `NCCL_PROTO`, channels, threads | not managed | hard-set (`Simple`, `1`, `1`) |
+| TF32 | **not managed at all** | disabled (`fp32_precision="ieee"`) |
+| BF16 reduced-precision reduction | not managed | disabled |
+| cuBLAS workspace / BLAS library | not managed | `:4096:8`, cuBLASLt |
+| GEMM | cuBLAS / TE | Triton `matmul_persistent` |
+| FlashAttention | forbidden | permitted |
+
+`NCCL_ALGO`, `NCCL_PROTO` and `CUBLAS_WORKSPACE_CONFIG` change arithmetic, so a
+mismatch there is blocking. The remaining differences -- including the TF32 and
+BF16-reduction asymmetry, which under a pure BF16 GEMM path does not fire -- are
+recorded so the asymmetry appears in every artifact rather than being invisible.
+
+## Runtime adapters
+
+Before this PR the only `RuntimeMaterializer` in the repository was
+`CpuSmokeMaterializer` over a synthetic CPU model, and every named scenario
+(`S1`/`S2`/`S3`) was planning-only. This PR adds the first two framework-shaped
+adapters:
+
+* `adapters/megatron.py` -- `MegatronProvenanceAdapter` (construction and
+  distributed-context fingerprints, determinism probe, frozen-scope assertions) and
+  `MegatronAttentionMaterializer`.
+* `adapters/vllm.py` -- `VllmProvenanceAdapter` (adds `kv_page_size` from
+  `CacheConfig.block_size` and `split_kv_policy` from
+  `AttentionConfig.flash_attn_max_num_splits_for_cuda_graph`) and
+  `VllmRolloutMaterializer`.
+
+Neither module imports `megatron` or `vllm`; configs are duck-typed, so the binding
+rules are exercised on CPU in CI rather than only on a 2-node cluster.
+
+## Fail closed, never substitute
+
+`unsupported_reduction_reason` rejects requests that #236 cannot express, instead of
+collapsing them onto the supported value:
+
+| request | status | why |
+| --- | --- | --- |
+| `attention.reduction_order=arrival` | `UNSUPPORTED` | the control group must stay distinguishable from the treatment |
+| `attention.reduction_downcast_at=per_block` | `UNSUPPORTED` | `DowncastPoint` declares only `final_write` |
+| `attention.reduction_engine=te_oracle` | `UNSUPPORTED` | the TE merge oracle lands in #235 PR2/PR3; PR4's TE plan is provenance only |
+| `attention.reduction_acc_dtype=bf16` | `UNSUPPORTED` | the CP `(out, lse)` merge accumulates in FP32 |
+| `rollout.context_parallel_size>1` with `mode=decode` | `FALLBACK` | vLLM CP covers prefill only; recorded with the reason |
+
+## Knobs
+
+`adapters/knobs.py` extends `V1_KNOBS` additively. Added: training-side
+`tensor_parallel_size` / `context_parallel_size` / `deterministic_mode` /
+`cp_comm_type`, `rollout.batch_invariant` / `rollout.kv_block_size`, and the
+reduction axis (`acc_dtype`, `order`, `downcast_at`, `engine`) plus
+`attention.fusion_boundary` and `attention.split_kv_policy`.
+
+`training.attention_backend` keeps its path but its value domain is replaced with
+Megatron's `AttnBackend`; the HuggingFace names have no Megatron counterpart, so this
+is a replacement rather than a mapping.
+
+Not done here, because both change `V1_KNOBS` itself and would break existing
+cross-config tests: removing `training.sharding` (Megatron has no such concept, and
+DP=1 makes it moot) and renaming `rollout.context_parallel_size` to reflect that it
+binds to `prefill_context_parallel_size`.
+
+## Scenario
+
+`examples/cross_config_qwen3_8b_megatron_tp2_cp2_vllm.json` supersedes
+`cross_config_s1_distributed_smoke.json` and
+`cross_config_s3_qwen3_8b_tp4_cp4_bf16.json`, whose training sides used `sdpa` /
+`flash_attention_2` and `sharding: fsdp` -- none of which exist under Megatron -- and
+whose TP=4/CP=4 topology does not match the target.
+`cross_config_s2_vllm_tp_vs_fsdp.json` has no Megatron-only counterpart and should be
+retired rather than rewritten.
+
+## Out of scope
+
+Deliberately not in this PR:
+
+* launching `torchrun`, initializing process groups, or executing attention;
+* decode-mode materialization, which needs the validated `KVCacheSpec` from #235 PR6
+  and is refused with that reference rather than stubbed;
+* Transformer Engine calls of any kind (PR4's TE plan is policy and provenance only);
+* distributed drift benchmarks and report artifacts (#235 PR5);
+* fused production backend alignment (#235 PR7) and backward (#235 PR8).
