@@ -36,6 +36,7 @@ def _args(**overrides):
         "rms_norm",
         "matmul",
         "attention",
+        "cp_attention",
         "logp",
         "linear_logp",
         "batch_invariant_logp",
