@@ -18,6 +18,13 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _validate_dtype(x: Tensor, name: str) -> None:
+    if x.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(f"{name} must have dtype fp16, bf16, or fp32, got {x.dtype}.")
+
 
 @triton.jit
 def _silu_fwd_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
@@ -172,11 +179,13 @@ class TritonSiLUOp:
     def forward(self, x: Tensor) -> Tensor:
         if x.device.type not in ("cuda", "hip", "xpu"):
             raise RuntimeError(f"TritonSiLUOp requires a GPU tensor, got device '{x.device}'.")
+        _validate_dtype(x, "x")
         return _SiLUTritonFunction.apply(x)
 
     def forward_fp32(self, x: Tensor) -> Tensor:
         if x.device.type not in ("cuda", "hip", "xpu"):
             raise RuntimeError(f"TritonSiLUOp requires a GPU tensor, got device '{x.device}'.")
+        _validate_dtype(x, "x")
         return _SiLUTritonFunction.apply(x.float())
 
 
@@ -197,11 +206,20 @@ class TritonSwiGLUOp:
             raise RuntimeError(
                 f"TritonSwiGLUOp requires GPU tensors, got gate='{gate.device}', up='{up.device}'."
             )
+        if gate.device != up.device:
+            raise RuntimeError(
+                f"gate and up must be on the same GPU device, got "
+                f"'{gate.device}' and '{up.device}'."
+            )
         if gate.shape != up.shape:
             raise ValueError(
                 f"gate and up must share shape, got tuple(gate.shape)="
                 f"{tuple(gate.shape)} vs tuple(up.shape)={tuple(up.shape)}"
             )
+        _validate_dtype(gate, "gate")
+        _validate_dtype(up, "up")
+        if gate.dtype != up.dtype:
+            raise TypeError(f"gate and up must share dtype, got {gate.dtype} and {up.dtype}.")
         return _SwiGLUTritonFunction.apply(gate, up)
 
     def forward_fp32(self, gate: Tensor, up: Tensor) -> Tensor:
@@ -213,9 +231,18 @@ class TritonSwiGLUOp:
             raise RuntimeError(
                 f"TritonSwiGLUOp requires GPU tensors, got gate='{gate.device}', up='{up.device}'."
             )
+        if gate.device != up.device:
+            raise RuntimeError(
+                f"gate and up must be on the same GPU device, got "
+                f"'{gate.device}' and '{up.device}'."
+            )
         if gate.shape != up.shape:
             raise ValueError(
                 f"gate and up must share shape, got tuple(gate.shape)="
                 f"{tuple(gate.shape)} vs tuple(up.shape)={tuple(up.shape)}"
             )
+        _validate_dtype(gate, "gate")
+        _validate_dtype(up, "up")
+        if gate.dtype != up.dtype:
+            raise TypeError(f"gate and up must share dtype, got {gate.dtype} and {up.dtype}.")
         return _SwiGLUTritonFunction.apply(gate.float(), up.float())

@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 namespace {
 
@@ -106,6 +107,22 @@ static void check_cuda_contig(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.is_floating_point(), name, " must be floating point");
 }
 
+static void check_same_device(
+    const torch::Tensor& lhs,
+    const torch::Tensor& rhs,
+    const char* lhs_name,
+    const char* rhs_name) {
+  TORCH_CHECK(
+      lhs.device() == rhs.device(),
+      lhs_name,
+      " and ",
+      rhs_name,
+      " must be on the same CUDA device, got ",
+      lhs.device(),
+      " and ",
+      rhs.device());
+}
+
 }  // namespace
 
 torch::Tensor silu_forward_cuda(torch::Tensor x) {
@@ -126,12 +143,14 @@ torch::Tensor silu_forward_cuda(torch::Tensor x) {
         silu_forward_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
             x.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(), n);
       });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
 
 torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x) {
   check_cuda_contig(dy, "dy");
   check_cuda_contig(x, "x");
+  check_same_device(dy, x, "dy", "x");
   TORCH_CHECK(dy.sizes() == x.sizes(), "dy and x must share shape");
   TORCH_CHECK(dy.scalar_type() == x.scalar_type(), "dy and x must share dtype");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
@@ -150,12 +169,14 @@ torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x) {
         silu_backward_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
             dy.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), dx.data_ptr<scalar_t>(), n);
       });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dx;
 }
 
 torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up) {
   check_cuda_contig(gate, "gate");
   check_cuda_contig(up, "up");
+  check_same_device(gate, up, "gate", "up");
   TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must share shape");
   TORCH_CHECK(gate.scalar_type() == up.scalar_type(), "gate and up must share dtype");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gate));
@@ -178,6 +199,7 @@ torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up) {
         swiglu_forward_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
             gate.data_ptr<scalar_t>(), up.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(), n);
       });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
 
@@ -188,6 +210,8 @@ std::vector<torch::Tensor> swiglu_backward_cuda(
   check_cuda_contig(dy, "dy");
   check_cuda_contig(gate, "gate");
   check_cuda_contig(up, "up");
+  check_same_device(dy, gate, "dy", "gate");
+  check_same_device(gate, up, "gate", "up");
   TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must share shape");
   TORCH_CHECK(dy.sizes() == gate.sizes(), "dy and gate must share shape");
   TORCH_CHECK(dy.scalar_type() == gate.scalar_type(), "dy and gate must share dtype");
@@ -218,5 +242,6 @@ std::vector<torch::Tensor> swiglu_backward_cuda(
             d_up.data_ptr<scalar_t>(),
             n);
       });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {d_gate, d_up};
 }

@@ -19,6 +19,13 @@ from torch import Tensor
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _validate_dtype(x: Tensor, name: str) -> None:
+    if x.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(f"{name} must have dtype fp16, bf16, or fp32, got {x.dtype}.")
+
 
 def _require_cuda_activation() -> None:
     if not _EXT_AVAILABLE or _C is None:
@@ -83,12 +90,14 @@ class SiLUCudaOp:
     def forward(self, x: Tensor) -> Tensor:
         if x.device.type != "cuda":
             raise RuntimeError(f"SiLUCudaOp requires a CUDA tensor, got device '{x.device}'.")
+        _validate_dtype(x, "x")
         return _SiLUCudaFunction.apply(x)
 
     def forward_fp32(self, x: Tensor) -> Tensor:
         """Ground-truth path: force fp32 input so the kernel stores fp32 output."""
         if x.device.type != "cuda":
             raise RuntimeError(f"SiLUCudaOp requires a CUDA tensor, got device '{x.device}'.")
+        _validate_dtype(x, "x")
         return _SiLUCudaFunction.apply(x.float())
 
 
@@ -109,11 +118,20 @@ class SwiGLUCudaOp:
             raise RuntimeError(
                 f"SwiGLUCudaOp requires CUDA tensors, got gate='{gate.device}', up='{up.device}'."
             )
+        if gate.device != up.device:
+            raise RuntimeError(
+                f"gate and up must be on the same CUDA device, got "
+                f"'{gate.device}' and '{up.device}'."
+            )
         if gate.shape != up.shape:
             raise ValueError(
                 f"gate and up must share shape, got tuple(gate.shape)="
                 f"{tuple(gate.shape)} vs tuple(up.shape)={tuple(up.shape)}"
             )
+        _validate_dtype(gate, "gate")
+        _validate_dtype(up, "up")
+        if gate.dtype != up.dtype:
+            raise TypeError(f"gate and up must share dtype, got {gate.dtype} and {up.dtype}.")
         return _SwiGLUCudaFunction.apply(gate, up)
 
     def forward_fp32(self, gate: Tensor, up: Tensor) -> Tensor:
@@ -121,9 +139,18 @@ class SwiGLUCudaOp:
             raise RuntimeError(
                 f"SwiGLUCudaOp requires CUDA tensors, got gate='{gate.device}', up='{up.device}'."
             )
+        if gate.device != up.device:
+            raise RuntimeError(
+                f"gate and up must be on the same CUDA device, got "
+                f"'{gate.device}' and '{up.device}'."
+            )
         if gate.shape != up.shape:
             raise ValueError(
                 f"gate and up must share shape, got tuple(gate.shape)="
                 f"{tuple(gate.shape)} vs tuple(up.shape)={tuple(up.shape)}"
             )
+        _validate_dtype(gate, "gate")
+        _validate_dtype(up, "up")
+        if gate.dtype != up.dtype:
+            raise TypeError(f"gate and up must share dtype, got {gate.dtype} and {up.dtype}.")
         return _SwiGLUCudaFunction.apply(gate.float(), up.float())

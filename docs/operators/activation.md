@@ -51,7 +51,7 @@ All backends expose the WS1 dual-path contract:
 | --- | --- | --- | --- |
 | `x` (SiLU) | `[..., N]` | float (fp16/bf16/fp32) | Any shape; last dim arbitrary (Qwen3-8B `I=12288`). |
 | `gate` (SwiGLU) | `[..., I]` | float | `gate_proj` output. |
-| `up` (SwiGLU) | `[..., I]` | float | `up_proj` output; **must share `gate`'s shape**. |
+| `up` (SwiGLU) | `[..., I]` | float | `up_proj` output; **must share `gate`'s shape, dtype, and device**. |
 | output | same as input | `forward`: input dtype · `forward_fp32`: float32 | Same shape as input. |
 
 Element-wise and shape-agnostic: the Qwen3-8B intermediate dim `I=12288` is just one valid
@@ -132,8 +132,7 @@ native forward+backward, registry dispatch, and the issue-#108 `OP_SPECS` harnes
 
 ## Known Limitations
 
-- SwiGLU requires `gate` and `up` to share shape (raises `ValueError` otherwise); no
-  broadcasting.
+- SwiGLU requires `gate` and `up` to share shape, dtype, and device; no broadcasting.
 - No fused `bias + SiLU` or `chunk(y,2) + silu_and_mul` variant yet (vLLM-style
   `SiluAndMul` on a packed gate/up tensor). Callers that hold a packed tensor should
   split first, then call `swiglu`.

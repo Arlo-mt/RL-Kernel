@@ -66,6 +66,10 @@ requires_cuda_activation = pytest.mark.skipif(
     not (torch.cuda.is_available() and _HAS_CUDA_ACTIVATION),
     reason="CUDA SiLU/SwiGLU extension is not available",
 )
+requires_nvidia_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="NVIDIA CUDA is required",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +108,17 @@ def test_native_swiglu_rejects_mismatched_shape():
 
     with pytest.raises(ValueError, match="share shape"):
         NativeSwiGLUOp().forward(gate, up)
+
+
+def test_native_activation_rejects_invalid_dtypes():
+    with pytest.raises(TypeError, match="fp16, bf16, or fp32"):
+        NativeSiLUOp().forward(torch.ones(8, dtype=torch.int32))
+
+    with pytest.raises(TypeError, match="share dtype"):
+        NativeSwiGLUOp().forward(
+            torch.ones(8, dtype=torch.float16),
+            torch.ones(8, dtype=torch.bfloat16),
+        )
 
 
 # Axis A -- batch invariance, bitwise (the WS1 "aligned" property).
@@ -232,10 +247,18 @@ def test_registry_dispatches_native_activation_ops_on_cpu():
 
 
 def _silu_impls():
-    impls = ["triton"]
-    if _HAS_CUDA_ACTIVATION:
-        impls.append("cuda")
-    return impls
+    return [
+        "triton",
+        pytest.param("cuda", marks=requires_cuda_activation, id="cuda"),
+    ]
+
+
+@requires_nvidia_cuda
+def test_cuda_activation_symbols_are_built_on_cuda_host():
+    assert _HAS_CUDA_ACTIVATION, (
+        "CUDA is available but SiLU/SwiGLU symbols are missing from rl_engine._C; "
+        "rebuild the extension from the current source tree"
+    )
 
 
 def _make_silu_op(impl: str):
@@ -398,6 +421,168 @@ def test_cuda_triton_swiglu_rejects_mismatched_shape(impl):
     gate = torch.randn(2, 3, device="cuda")
     up = torch.randn(2, 4, device="cuda")
     with pytest.raises(ValueError, match="share shape"):
+        op.forward(gate, up)
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_silu_backward_batch_invariance_bitwise(impl):
+    op = _make_silu_op(impl)
+    x = _rand((6, 4, 64), seed=10, dtype=torch.bfloat16, device="cuda")
+    dy = _rand(x.shape, seed=11, dtype=torch.bfloat16, device="cuda")
+
+    x_full = x.detach().clone().requires_grad_(True)
+    op.forward(x_full).backward(dy)
+    full_grad = x_full.grad[2:4].clone()
+
+    x_slice = x[2:4].detach().clone().requires_grad_(True)
+    op.forward(x_slice).backward(dy[2:4])
+    assert torch.equal(x_slice.grad, full_grad)
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_swiglu_backward_batch_invariance_bitwise(impl):
+    op = _make_swiglu_op(impl)
+    gate = _rand((6, 4, 64), seed=12, dtype=torch.bfloat16, device="cuda")
+    up = _rand((6, 4, 64), seed=13, dtype=torch.bfloat16, device="cuda")
+    dy = _rand(gate.shape, seed=14, dtype=torch.bfloat16, device="cuda")
+
+    gate_full = gate.detach().clone().requires_grad_(True)
+    up_full = up.detach().clone().requires_grad_(True)
+    op.forward(gate_full, up_full).backward(dy)
+    full_d_gate = gate_full.grad[2:4].clone()
+    full_d_up = up_full.grad[2:4].clone()
+
+    gate_slice = gate[2:4].detach().clone().requires_grad_(True)
+    up_slice = up[2:4].detach().clone().requires_grad_(True)
+    op.forward(gate_slice, up_slice).backward(dy[2:4])
+    assert torch.equal(gate_slice.grad, full_d_gate)
+    assert torch.equal(up_slice.grad, full_d_up)
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_silu_padding_invariance_forward_and_backward(impl):
+    op = _make_silu_op(impl)
+    x = _rand((4, 64), seed=15, dtype=torch.bfloat16, device="cuda")
+    dy = _rand(x.shape, seed=16, dtype=torch.bfloat16, device="cuda")
+    x_padded = torch.cat(
+        [x, _rand((3, 64), seed=17, dtype=torch.bfloat16, device="cuda")], dim=0
+    ).requires_grad_(True)
+    dy_padded = torch.cat([dy, _rand((3, 64), seed=18, dtype=torch.bfloat16, device="cuda")], dim=0)
+
+    y_padded = op.forward(x_padded)
+    y_padded.backward(dy_padded)
+
+    x_real = x.detach().clone().requires_grad_(True)
+    y_real = op.forward(x_real)
+    y_real.backward(dy)
+    assert torch.equal(y_padded[:4], y_real)
+    assert torch.equal(x_padded.grad[:4], x_real.grad)
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_swiglu_padding_invariance_forward_and_backward(impl):
+    op = _make_swiglu_op(impl)
+    gate = _rand((4, 64), seed=19, dtype=torch.bfloat16, device="cuda")
+    up = _rand((4, 64), seed=20, dtype=torch.bfloat16, device="cuda")
+    dy = _rand(gate.shape, seed=21, dtype=torch.bfloat16, device="cuda")
+    gate_padded = torch.cat(
+        [gate, _rand((3, 64), seed=22, dtype=torch.bfloat16, device="cuda")], dim=0
+    ).requires_grad_(True)
+    up_padded = torch.cat(
+        [up, _rand((3, 64), seed=23, dtype=torch.bfloat16, device="cuda")], dim=0
+    ).requires_grad_(True)
+    dy_padded = torch.cat([dy, _rand((3, 64), seed=24, dtype=torch.bfloat16, device="cuda")], dim=0)
+
+    y_padded = op.forward(gate_padded, up_padded)
+    y_padded.backward(dy_padded)
+
+    gate_real = gate.detach().clone().requires_grad_(True)
+    up_real = up.detach().clone().requires_grad_(True)
+    y_real = op.forward(gate_real, up_real)
+    y_real.backward(dy)
+    assert torch.equal(y_padded[:4], y_real)
+    assert torch.equal(gate_padded.grad[:4], gate_real.grad)
+    assert torch.equal(up_padded.grad[:4], up_real.grad)
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_swiglu_deterministic_repeat(impl):
+    op = _make_swiglu_op(impl)
+    gate = _rand((16, 256), seed=25, dtype=torch.bfloat16, device="cuda")
+    up = _rand((16, 256), seed=26, dtype=torch.bfloat16, device="cuda")
+    dy = _rand(gate.shape, seed=27, dtype=torch.bfloat16, device="cuda")
+
+    def _run():
+        gate_r = gate.detach().clone().requires_grad_(True)
+        up_r = up.detach().clone().requires_grad_(True)
+        y = op.forward(gate_r, up_r)
+        y.backward(dy)
+        return y.detach(), gate_r.grad.detach(), up_r.grad.detach()
+
+    expected = _run()
+    for _ in range(5):
+        actual = _run()
+        torch.cuda.synchronize()
+        assert all(torch.equal(lhs, rhs) for lhs, rhs in zip(expected, actual))
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_activation_handles_noncontiguous_and_empty_inputs(impl):
+    silu = _make_silu_op(impl)
+    swiglu = _make_swiglu_op(impl)
+
+    x = torch.randn(5, 3, device="cuda", dtype=torch.bfloat16).T.requires_grad_(True)
+    assert not x.is_contiguous()
+    silu.forward(x).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    gate = torch.randn(5, 3, device="cuda", dtype=torch.bfloat16).T.requires_grad_(True)
+    up = torch.randn(5, 3, device="cuda", dtype=torch.bfloat16).T.requires_grad_(True)
+    assert not gate.is_contiguous() and not up.is_contiguous()
+    swiglu.forward(gate, up).sum().backward()
+    assert gate.grad is not None and up.grad is not None
+
+    empty = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    silu_empty = silu.forward(empty)
+    silu_empty.sum().backward()
+    assert silu_empty.shape == empty.shape and empty.grad.shape == empty.shape
+
+    empty_gate = empty.detach().clone().requires_grad_(True)
+    empty_up = empty.detach().clone().requires_grad_(True)
+    swiglu_empty = swiglu.forward(empty_gate, empty_up)
+    swiglu_empty.sum().backward()
+    assert swiglu_empty.shape == empty_gate.shape
+    assert empty_gate.grad.shape == empty_gate.shape and empty_up.grad.shape == empty_up.shape
+
+
+@requires_cuda
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_activation_rejects_invalid_dtypes(impl):
+    silu = _make_silu_op(impl)
+    swiglu = _make_swiglu_op(impl)
+    with pytest.raises(TypeError, match="fp16, bf16, or fp32"):
+        silu.forward(torch.ones(8, device="cuda", dtype=torch.int32))
+    with pytest.raises(TypeError, match="share dtype"):
+        swiglu.forward(
+            torch.ones(8, device="cuda", dtype=torch.float16),
+            torch.ones(8, device="cuda", dtype=torch.bfloat16),
+        )
+
+
+@requires_cuda
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
+@pytest.mark.parametrize("impl", _silu_impls())
+def test_cuda_triton_swiglu_rejects_cross_device_inputs(impl):
+    op = _make_swiglu_op(impl)
+    gate = torch.ones(8, device="cuda:0")
+    up = torch.ones(8, device="cuda:1")
+    with pytest.raises(RuntimeError, match="same .*device"):
         op.forward(gate, up)
 
 
