@@ -104,7 +104,13 @@ static void launch_1d(int64_t n, int& threads, int64_t& blocks) {
 static void check_cuda_contig(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
-  TORCH_CHECK(t.is_floating_point(), name, " must be floating point");
+  // Supported activation dtypes only: fp16 / bf16 / fp32 (reject float64).
+  TORCH_CHECK(
+      t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16 ||
+          t.scalar_type() == at::kFloat,
+      name,
+      " must be fp16, bf16, or fp32, got ",
+      t.scalar_type());
 }
 
 static void check_same_device(

@@ -135,8 +135,9 @@ def _launch_swiglu_bwd(dy: Tensor, gate: Tensor, up: Tensor) -> tuple[Tensor, Te
 class _SiLUTritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-        y = _launch_silu_fwd(x)
-        ctx.save_for_backward(x.contiguous())
+        x_c = x.contiguous()
+        y = _launch_silu_fwd(x_c)
+        ctx.save_for_backward(x_c)
         return y
 
     @staticmethod
@@ -151,8 +152,10 @@ class _SiLUTritonFunction(torch.autograd.Function):
 class _SwiGLUTritonFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate: Tensor, up: Tensor) -> Tensor:
-        y = _launch_swiglu_fwd(gate, up)
-        ctx.save_for_backward(gate.contiguous(), up.contiguous())
+        gate_c = gate.contiguous()
+        up_c = up.contiguous()
+        y = _launch_swiglu_fwd(gate_c, up_c)
+        ctx.save_for_backward(gate_c, up_c)
         return y
 
     @staticmethod

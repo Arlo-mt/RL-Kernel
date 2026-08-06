@@ -40,8 +40,9 @@ def _require_cuda_activation() -> None:
 class _SiLUCudaFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
-        y = _C.silu_forward(x.contiguous())
-        ctx.save_for_backward(x.contiguous())
+        x_c = x.contiguous()
+        y = _C.silu_forward(x_c)
+        ctx.save_for_backward(x_c)
         return y
 
     @staticmethod

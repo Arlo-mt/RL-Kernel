@@ -11,8 +11,18 @@ import torch
 import torch.distributed as dist
 
 from rl_engine.kernels.gtest.tolerance import load_contract
-from rl_engine.kernels.ops.cuda.activation import SwiGLUSM90Op
 from rl_engine.kernels.ops.cuda.matmul import deterministic_gemm
+
+# Prefer the general CUDA SwiGLU from WS1 (#280). Fall back to the SM90-named
+# symbol if an older/newer activation package only exports that name, so pytest
+# collection never hard-fails when this script is present under tests/.
+try:
+    from rl_engine.kernels.ops.cuda.activation import SwiGLUCudaOp as _SwiGLUOp
+except ImportError:  # pragma: no cover - optional depending on branch merge order
+    try:
+        from rl_engine.kernels.ops.cuda.activation import SwiGLUSM90Op as _SwiGLUOp
+    except ImportError:  # pragma: no cover
+        _SwiGLUOp = None
 
 
 def setup_ws2_fwd_topology():
@@ -69,8 +79,13 @@ def run_pr4_forward_validation():
     gate_local = deterministic_gemm(x_local, w_gate_local)
     up_local = deterministic_gemm(x_local, w_up_local)
 
-    # 2. Activation boundary (via PR #258 SM90 operator)
-    swiglu_op = SwiGLUSM90Op()
+    # 2. Activation boundary (WS1 CUDA SwiGLU / optional SM90 alias)
+    if _SwiGLUOp is None:
+        raise RuntimeError(
+            "No CUDA SwiGLU op available (expected SwiGLUCudaOp or SwiGLUSM90Op). "
+            "Rebuild the extension / ensure the activation package is installed."
+        )
+    swiglu_op = _SwiGLUOp()
     hidden_local = swiglu_op(gate_local, up_local)
 
     # 3. Down RowParallel + TP AllReduce SUM

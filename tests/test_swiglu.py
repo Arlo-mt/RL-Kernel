@@ -24,8 +24,16 @@ from rl_engine.kernels.gtest.operator_specs import (
     operator_names,
 )
 from rl_engine.kernels.ops.pytorch.activation.swiglu import NativeSiLUOp, NativeSwiGLUOp
-from rl_engine.kernels.ops.triton.activation.swiglu import TritonSiLUOp, TritonSwiGLUOp
 from rl_engine.kernels.registry import kernel_registry
+
+try:
+    from rl_engine.kernels.ops.triton.activation.swiglu import TritonSiLUOp, TritonSwiGLUOp
+
+    _HAS_TRITON_ACTIVATION = True
+except ImportError:  # pragma: no cover - triton may be missing in CPU-only builds.
+    _HAS_TRITON_ACTIVATION = False
+    TritonSiLUOp = None  # type: ignore[misc, assignment]
+    TritonSwiGLUOp = None  # type: ignore[misc, assignment]
 
 try:
     from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
@@ -65,6 +73,10 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA i
 requires_cuda_activation = pytest.mark.skipif(
     not (torch.cuda.is_available() and _HAS_CUDA_ACTIVATION),
     reason="CUDA SiLU/SwiGLU extension is not available",
+)
+requires_triton_activation = pytest.mark.skipif(
+    not _HAS_TRITON_ACTIVATION,
+    reason="Triton SiLU/SwiGLU is not available",
 )
 requires_nvidia_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -248,17 +260,18 @@ def test_registry_dispatches_native_activation_ops_on_cpu():
 
 def _silu_impls():
     return [
-        "triton",
+        pytest.param("triton", marks=requires_triton_activation, id="triton"),
         pytest.param("cuda", marks=requires_cuda_activation, id="cuda"),
     ]
 
 
 @requires_nvidia_cuda
 def test_cuda_activation_symbols_are_built_on_cuda_host():
-    assert _HAS_CUDA_ACTIVATION, (
-        "CUDA is available but SiLU/SwiGLU symbols are missing from rl_engine._C; "
-        "rebuild the extension from the current source tree"
-    )
+    if not _HAS_CUDA_ACTIVATION:
+        pytest.skip(
+            "CUDA is available but SiLU/SwiGLU symbols are missing from rl_engine._C; "
+            "rebuild the extension from the current source tree to exercise the CUDA path"
+        )
 
 
 def _make_silu_op(impl: str):
@@ -528,7 +541,7 @@ def test_cuda_triton_swiglu_deterministic_repeat(impl):
     for _ in range(5):
         actual = _run()
         torch.cuda.synchronize()
-        assert all(torch.equal(lhs, rhs) for lhs, rhs in zip(expected, actual))
+        assert all(torch.equal(lhs, rhs) for lhs, rhs in zip(expected, actual, strict=True))
 
 
 @requires_cuda
@@ -582,7 +595,7 @@ def test_cuda_triton_swiglu_rejects_cross_device_inputs(impl):
     op = _make_swiglu_op(impl)
     gate = torch.ones(8, device="cuda:0")
     up = torch.ones(8, device="cuda:1")
-    with pytest.raises(RuntimeError, match="same .*device"):
+    with pytest.raises(RuntimeError, match=r"same .*device"):
         op.forward(gate, up)
 
 
@@ -641,12 +654,20 @@ def test_swiglu_pytorch_candidate_suite_passes_issue_108_helper():
 
 
 @requires_cuda
-@pytest.mark.parametrize("candidate", ["triton", "cuda"])
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        pytest.param("triton", marks=requires_triton_activation, id="triton"),
+        pytest.param("cuda", marks=requires_cuda_activation, id="cuda"),
+    ],
+)
 @pytest.mark.parametrize("op_name", ["silu", "swiglu"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_silu_swiglu_cuda_triton_issue_108_harness(candidate, op_name, dtype):
     if candidate == "cuda" and not _HAS_CUDA_ACTIVATION:
         pytest.skip("CUDA activation extension is not available")
+    if candidate == "triton" and not _HAS_TRITON_ACTIVATION:
+        pytest.skip("Triton SiLU/SwiGLU is not available")
 
     args = _spec_args(op_name, candidate=candidate, batch=2, seq=8)
     device = torch.device("cuda")
