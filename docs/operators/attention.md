@@ -100,6 +100,30 @@ position offsets passed to CP attention must describe the same absolute token
 positions used when RoPE was applied, so PR3 validates the post-RoPE Q/K boundary
 while PR7 can later validate production fused `RoPE+Attention` kernels.
 
+PR8 extends the CP reference with training-side backward validation:
+
+```python
+from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+    compare_cp_attention_backward,
+)
+
+report = compare_cp_attention_backward(
+    q,
+    k,
+    v,
+    dout,
+    candidate_cp_world_size=2,
+    candidate_kv_chunk_size=512,
+)
+```
+
+The report compares CP=1 against the CP/chunked candidate for `dq`, `dk`, `dv`,
+`out`, and attention-domain `lse`. It also includes per-logical-CP-rank gradient
+drift slices, fixed `global_block_index` merge provenance, final-write downcast
+metadata, and the saved forward state required by training backward validation.
+Decode backward remains out of scope. Transformer Engine backward is not claimed
+in this reference path because compatible saved forward state is not exposed here.
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):
@@ -167,8 +191,9 @@ GPU-only LARGE Qwen3-8B real-shape smoke test.
 attention, CP=2 prefill vs CP=1, post-RoPE Q/K input semantics with shared
 global position metadata, chunked-prefill replay, global-position causal masking
 across CP boundaries, order-independent LSE merge by global block index,
-padding/all-masked stability, BF16 final-write behavior, input purity, argument
-validation, and registry dispatch.
+padding/all-masked stability, BF16 final-write behavior, backward drift reports
+for `dq/dk/dv`, Qwen3-8B local TP=2/CP=2 BF16 backward smoke coverage, input
+purity, argument validation, and registry dispatch.
 `make_operator_inputs("cp_attention", ...)` also emits a CP=2 chunked-prefill
 synthetic case for local harnesses.
 `tests/test_cp_attention_transformer_engine.py` optionally imports NVIDIA
@@ -227,6 +252,10 @@ Hooks:
 - `forward(q, k, v, ...)` — main path (registry, #108 harness). Differentiable.
 - `forward_with_lse(q, k, v, ...)` — returns `(out, lse)` for LSE verification, debugging,
   and future KV-cache / training integration.
+- `backward_reference(q, k, v, dout, ...)` — runs the deterministic training backward
+  validation path and returns `dq`, `dk`, `dv`, `out`, `lse`, and provenance.
+- `compare_cp_attention_backward(q, k, v, dout, ...)` — compares CP=1 backward against
+  CP/chunked-prefill backward and emits whole-tensor plus per-logical-rank drift stats.
 
 ## Tolerance
 
@@ -255,6 +284,10 @@ for measured peak memory at representative shapes.
   not a distributed runtime or fused kernel.
 - `cp_attention` consumes post-RoPE Q/K for Qwen3 WS2; RoPE execution and fused
   `RoPE+Attention` backend alignment are outside PR3.
+- PR8 backward validation is for training prefill/chunked-prefill only. Decode
+  replay remains forward-only unless a future issue scopes differentiable decode.
+- Transformer Engine backward is not used or claimed by PR8 unless a later backend
+  exposes compatible saved forward state for `dq/dk/dv` comparison.
 - `Hq` must be divisible by `Hkv` (raises `ValueError` otherwise).
 - CUDA KV-cache op wrapper is not in scope (caller does cat + calls this op).
 - No FP8, no multi-GPU / sequence-parallel.
