@@ -124,6 +124,30 @@ metadata, and the saved forward state required by training backward validation.
 Decode backward remains out of scope. Transformer Engine backward is not claimed
 in this reference path because compatible saved forward state is not exposed here.
 
+PR5 adds a rank-aware drift artifact benchmark around the same reference path:
+
+```bash
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
+python benchmarks/benchmark_ws2_cp_attention_drift.py \
+  --smoke \
+  --tp-world-sizes 2 \
+  --cp-world-sizes 2 \
+  --kv-chunk-sizes none,1 \
+  --include-backward \
+  --output artifacts/ws2-cp-attention-drift.json
+```
+
+The report covers Qwen3-8B-style TP-local head shards, CP=1/2, full prefill,
+chunked-prefill, BF16-vs-FP32 drift, per-logical-CP-rank metrics, optional
+PR8 backward drift, RoPE provenance, and optional Transformer Engine
+context-parallel merge-oracle drift. TE reuse is limited to
+`transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py`
+helpers:
+`flash_attn_fwd_softmax_lse_correction`,
+`flash_attn_fwd_out_correction_init`, and
+`flash_attn_fwd_out_correction`.
+See `docs/design/ws2-attention-pr5-distributed-drift-benchmark.md`.
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):
