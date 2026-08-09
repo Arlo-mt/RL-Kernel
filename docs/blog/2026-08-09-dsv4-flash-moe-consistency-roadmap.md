@@ -150,4 +150,4 @@ If you are familiar with CUDA / Triton / Hopper, vLLM fused MoE, Megatron MoE, d
 
 ## Acknowledgments
 
-Thanks to Embedded LLM, Vensen Mu, Chutian Wang, Jiajie Li, Siru He, Xiaosong Ma, Kaijie Lin, Jian Zhang, Bosong Yang, Yunxiang Cai, Huihong Lu, Zhewei Liu, Zhengtao Chen, and Ziying Tao for their work on Dense model operator-level train-inference consistency and for supporting the DSV4 MoE investigation.
+Thanks to Embedded LLM, Chutian Wang, Jiajie Li, Siru He, Xiaosong Ma, Kaijie Lin, Jian Zhang, Bosong Yang, Yunxiang Cai, Huihong Lu, Zhewei Liu, Zhengtao Chen, and Ziying Tao, Zhipeng Wang, Vensen Mu for their work on Dense model operator-level train-inference consistency and for supporting the DSV4 MoE investigation.
