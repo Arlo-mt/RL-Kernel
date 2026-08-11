@@ -9,7 +9,13 @@ from typing import Any
 
 import torch
 
-from rl_engine.kernels.gtest.tolerance import load_contract
+from rl_engine.kernels.gtest.tolerance import (
+    BackendProvenance,
+    ContractResolveError,
+    load_contract,
+    resolve_tolerance,
+    validate_backend_provenance,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,7 @@ class CandidateSpec:
     fn: Callable[..., Any] | Any
     backend: str = "unknown"
     arch_key: str | None = None
+    provenance: BackendProvenance | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,9 @@ class OutputCheck:
     mean_abs_error: float
     max_rel_error: float
     passed: bool
+    judgment: str
+    comparison_lhs_role: str
+    comparison_rhs_role: str
     message: str = ""
 
 
@@ -73,6 +83,7 @@ class CandidateReport:
     pass_rate: float
     passed: bool
     cases: list[CaseCheck]
+    backend_provenance: BackendProvenance | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +151,19 @@ def _run_candidate(
     grad_mode: str,
     grad_seed: int,
 ) -> CandidateReport:
+    if candidate.provenance is not None:
+        validate_backend_provenance(contract, candidate.provenance)
+        if candidate.backend != candidate.provenance.actual_backend:
+            raise ContractResolveError(
+                f"candidate backend {candidate.backend!r} disagrees with reported actual backend "
+                f"{candidate.provenance.actual_backend!r}"
+            )
+        for case in cases:
+            if _dtype_name(case.dtype) != candidate.provenance.execution_dtype:
+                raise ContractResolveError(
+                    f"case {case.name!r} dtype {case.dtype} does not match "
+                    f"provenance execution_dtype {candidate.provenance.execution_dtype!r}"
+                )
     if check_grad:
         case_checks = [
             _run_case_backward(
@@ -164,6 +188,7 @@ def _run_candidate(
         pass_rate=pass_rate,
         passed=passed_outputs == total_outputs,
         cases=case_checks,
+        backend_provenance=candidate.provenance,
     )
 
 
@@ -216,14 +241,29 @@ def _run_case_backward(
         candidate_outputs,
         gold_outputs,
     ).outputs
-    # Reuse the same tolerance class for gradients as for values. This is a
-    # first conservative default; operator-specific gradient tolerances can be
-    # split out later if a real backend shows different numerical behavior.
+    # Gradient thresholds come from the independent gradient_accuracy judgment
+    # (#267); they must not silently inherit forward_accuracy rows.
     atol, rtol = _resolve_tolerance(
         contract,
         op_class=case.op_class,
         dtype=case.dtype,
         arch_key=candidate.arch_key,
+        backend_profile=(candidate.provenance.backend_profile if candidate.provenance else None),
+        judgment="gradient_accuracy",
+    )
+    gradient_spec = (
+        resolve_tolerance(
+            contract,
+            judgment="gradient_accuracy",
+            op_class=case.op_class,
+            dtype=case.dtype,
+            arch_key=candidate.arch_key,
+            backend_profile=(
+                candidate.provenance.backend_profile if candidate.provenance else None
+            ),
+        )
+        if "judgments" in contract
+        else None
     )
     grad_checks = [
         _compare_output(
@@ -232,6 +272,13 @@ def _run_case_backward(
             output_index=len(output_checks) + index,
             atol=atol,
             rtol=rtol,
+            judgment="gradient_accuracy",
+            comparison_lhs_role=(
+                gradient_spec.comparison_lhs_role if gradient_spec is not None else "bf16_candidate"
+            ),
+            comparison_rhs_role=(
+                gradient_spec.comparison_rhs_role if gradient_spec is not None else "fp32_reference"
+            ),
             message=f"gradient:{name}",
         )
         for index, (name, candidate_grad, gold_grad) in enumerate(
@@ -265,7 +312,37 @@ def _compare_case_outputs(
         op_class=case.op_class,
         dtype=case.dtype,
         arch_key=candidate.arch_key,
+        backend_profile=(candidate.provenance.backend_profile if candidate.provenance else None),
+        judgment="forward_accuracy",
     )
+    forward_spec = (
+        resolve_tolerance(
+            contract,
+            judgment="forward_accuracy",
+            op_class=case.op_class,
+            dtype=case.dtype,
+            arch_key=candidate.arch_key,
+            backend_profile=(
+                candidate.provenance.backend_profile if candidate.provenance else None
+            ),
+        )
+        if "judgments" in contract
+        else None
+    )
+    if candidate.provenance is not None:
+        for candidate_output, gold_output in zip(candidate_outputs, gold_outputs, strict=True):
+            candidate_dtype = _dtype_name(candidate_output.dtype)
+            gold_dtype = _dtype_name(gold_output.dtype)
+            if candidate_dtype != candidate.provenance.output_dtype:
+                raise ContractResolveError(
+                    f"candidate output dtype {candidate_dtype!r} disagrees with provenance "
+                    f"output_dtype {candidate.provenance.output_dtype!r}"
+                )
+            if gold_dtype != candidate.provenance.reference_dtype:
+                raise ContractResolveError(
+                    f"gold output dtype {gold_dtype!r} disagrees with provenance "
+                    f"reference_dtype {candidate.provenance.reference_dtype!r}"
+                )
     output_checks = [
         _compare_output(
             candidate_output,
@@ -273,6 +350,13 @@ def _compare_case_outputs(
             output_index=index,
             atol=atol,
             rtol=rtol,
+            judgment="forward_accuracy",
+            comparison_lhs_role=(
+                forward_spec.comparison_lhs_role if forward_spec is not None else "bf16_candidate"
+            ),
+            comparison_rhs_role=(
+                forward_spec.comparison_rhs_role if forward_spec is not None else "fp32_reference"
+            ),
         )
         for index, (candidate_output, gold_output) in enumerate(
             zip(candidate_outputs, gold_outputs, strict=True)
@@ -407,7 +491,27 @@ def _resolve_tolerance(
     op_class: str,
     dtype: torch.dtype,
     arch_key: str | None = None,
+    backend_profile: str | None = None,
+    judgment: str = "forward_accuracy",
 ) -> tuple[float, float]:
+    """Resolve thresholds via the shared four-judgment contract (#267).
+
+    Falls back to the legacy ``accuracy`` mirror only when the four-judgment
+    block is absent (older fixture contracts in unit tests).
+    """
+
+    if "judgments" in contract:
+        spec = resolve_tolerance(
+            contract,
+            judgment=judgment,
+            op_class=op_class,
+            dtype=dtype,
+            arch_key=arch_key,
+            backend_profile=backend_profile,
+        )
+        return float(spec.atol), float(spec.rtol)
+
+    # Legacy fixtures used by some unit tests that inject a minimal contract.
     dtype_name = _dtype_name(dtype)
     if arch_key is not None:
         arch_values = (
@@ -441,6 +545,9 @@ def _compare_output(
     output_index: int,
     atol: float,
     rtol: float,
+    judgment: str = "forward_accuracy",
+    comparison_lhs_role: str = "bf16_candidate",
+    comparison_rhs_role: str = "fp32_reference",
     message: str = "",
 ) -> OutputCheck:
     if candidate.shape != gold.shape:
@@ -455,6 +562,9 @@ def _compare_output(
             mean_abs_error=float("inf"),
             max_rel_error=float("inf"),
             passed=False,
+            judgment=judgment,
+            comparison_lhs_role=comparison_lhs_role,
+            comparison_rhs_role=comparison_rhs_role,
             message=f"shape mismatch: candidate={tuple(candidate.shape)} gold={tuple(gold.shape)}",
         )
 
@@ -482,6 +592,9 @@ def _compare_output(
         mean_abs_error=mean_abs_error,
         max_rel_error=max_rel_error,
         passed=bool(torch.allclose(candidate_fp32, gold_fp32, atol=atol, rtol=rtol)),
+        judgment=judgment,
+        comparison_lhs_role=comparison_lhs_role,
+        comparison_rhs_role=comparison_rhs_role,
         message=message,
     )
 

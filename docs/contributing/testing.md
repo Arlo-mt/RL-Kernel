@@ -2,6 +2,21 @@
 
 RL-Kernel uses focused tests for dispatch behavior and operator accuracy.
 
+## gtest (operator candidate vs gold)
+
+Primary entry for single-operator forward/backward checks against a PyTorch gold path:
+
+```bash
+python scripts/check_operator.py --op logp --candidate pytorch --device cpu --dtype fp32
+```
+
+Full usage (register `OP_SPECS`, build inputs, CLI flags, and the WS1 four-judgment
+tolerance contract after #267):
+
+- **[gtest usage guide](gtest-usage.md)** (operator CLI + `OP_SPECS` + contract; English)
+- [WS1 numerical contract](../design/ws1-numerical-contract.md)
+- [gtest private-threshold migration checklist](../design/ws1-gtest-migration-checklist.md)
+
 ## Dispatch Tests
 
 ```bash
@@ -12,6 +27,12 @@ python -m pytest rl_engine/tests/test_dispatch.py -v
 
 ```bash
 python tests/test_op_accuracy.py
+```
+
+Contract schema / resolver:
+
+```bash
+python -m pytest tests/test_tolerance_contract.py tests/test_op_checks.py -q
 ```
 
 ## Documentation Build

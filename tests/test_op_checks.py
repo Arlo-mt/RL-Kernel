@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
 import torch
 
 from rl_engine.kernels.gtest.op_checks import CandidateSpec, OperatorCase, run_operator_suite
@@ -13,6 +14,7 @@ from rl_engine.kernels.gtest.operator_specs import (
     make_operator_case,
     operator_names,
 )
+from rl_engine.kernels.gtest.tolerance import BackendProvenance, ContractResolveError
 from rl_engine.kernels.ops.pytorch.linear.embedding import NativeEmbeddingOp
 from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
@@ -119,7 +121,11 @@ def test_embedding_native_candidate_suite_passes_issue_108_helper():
     )
 
     assert report.passed
-    assert report.candidates[0].cases[0].outputs[1].message == "gradient:weight"
+    gradient = report.candidates[0].cases[0].outputs[1]
+    assert gradient.message == "gradient:weight"
+    assert gradient.judgment == "gradient_accuracy"
+    assert gradient.comparison_lhs_role == "bf16_candidate"
+    assert gradient.comparison_rhs_role == "fp32_reference"
 
 
 def test_lm_head_native_candidate_suite_passes_issue_108_helper():
@@ -180,6 +186,97 @@ def test_suite_report_to_dict_contains_error_metrics():
     assert "max_abs_error" in output
     assert "atol" in output
     assert "passed" in output
+
+
+def test_ws1_report_persists_roles_and_backend_provenance():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="cuda",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    report = run_operator_suite(
+        "logp",
+        candidates=[
+            CandidateSpec(
+                name="cuda-logp",
+                backend="cuda",
+                fn=NativeLogpOp(),
+                provenance=provenance,
+            )
+        ],
+        cases=[_logp_case("bf16", torch.bfloat16, seed=12)],
+    )
+    output = report.candidates[0].cases[0].outputs[0]
+    assert output.judgment == "forward_accuracy"
+    assert output.comparison_lhs_role == "bf16_candidate"
+    assert output.comparison_rhs_role == "fp32_reference"
+    data = report.to_dict()["candidates"][0]
+    assert data["backend_provenance"]["actual_backend"] == "cuda"
+    assert "baseline" not in data["cases"][0]["outputs"][0]
+
+
+def test_ws1_report_rejects_backend_provenance_mismatch():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="triton",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    with pytest.raises(ContractResolveError, match="actual_backend"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="bad",
+                    backend="triton",
+                    fn=NativeLogpOp(),
+                    provenance=provenance,
+                )
+            ],
+            cases=[_logp_case("bf16", torch.bfloat16, seed=13)],
+        )
+
+
+def test_ws1_report_checks_observed_output_dtype_against_provenance():
+    provenance = BackendProvenance(
+        backend_profile="cuda_bf16",
+        requested_backend="cuda",
+        actual_backend="cuda",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+
+    def wrong_output_dtype(logits, token_ids):
+        return NativeLogpOp().forward(logits, token_ids).float()
+
+    with pytest.raises(ContractResolveError, match="candidate output dtype"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="wrong-output",
+                    backend="cuda",
+                    fn=wrong_output_dtype,
+                    provenance=provenance,
+                )
+            ],
+            cases=[_logp_case("bf16", torch.bfloat16, seed=14)],
+        )
 
 
 def test_candidate_arch_key_uses_tolerance_override():
