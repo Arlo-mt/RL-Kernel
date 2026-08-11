@@ -155,7 +155,7 @@ def _run_candidate(
         validate_backend_provenance(contract, candidate.provenance)
         if candidate.backend != candidate.provenance.actual_backend:
             raise ContractResolveError(
-                f"candidate backend {candidate.backend!r} disagrees with reported actual backend "
+                f"candidate backend {candidate.backend!r} disagrees with reported actual_backend "
                 f"{candidate.provenance.actual_backend!r}"
             )
         for case in cases:

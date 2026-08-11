@@ -225,7 +225,7 @@ def test_ws1_report_rejects_backend_provenance_mismatch():
     provenance = BackendProvenance(
         backend_profile="cuda_bf16",
         requested_backend="cuda",
-        actual_backend="triton",
+        actual_backend="cuda",
         execution_dtype="bfloat16",
         accumulation_dtype="float32",
         output_dtype="bfloat16",

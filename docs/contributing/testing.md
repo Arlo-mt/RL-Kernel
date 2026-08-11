@@ -14,7 +14,6 @@ Full usage (register `OP_SPECS`, build inputs, CLI flags, and the WS1 four-judgm
 tolerance contract after #267):
 
 - **[gtest usage guide](gtest-usage.md)** (operator CLI + `OP_SPECS` + contract; English)
-- **[gtest 使用指南](gtest-usage.zh-CN.md)**（算子 CLI、`OP_SPECS` 与数值合同；中文）
 
 ## Dispatch Tests
 

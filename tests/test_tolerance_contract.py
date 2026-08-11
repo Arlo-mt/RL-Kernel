@@ -113,22 +113,28 @@ def test_invariance_rows_are_bitwise_zero():
 
 def test_cuda_and_triton_profiles_share_thresholds():
     contract = load_contract()
-    for profile in ("cuda_bf16", "triton_cuda_bf16"):
-        a = resolve_tolerance(
-            contract,
-            judgment="forward_accuracy",
-            op_class="logprob",
-            dtype="bfloat16",
-            backend_profile=profile,
-        )
-        b = resolve_tolerance(
-            contract,
-            judgment="forward_accuracy",
-            op_class="logprob",
-            dtype="bfloat16",
-            backend_profile="cuda_bf16" if profile != "cuda_bf16" else "triton_cuda_bf16",
-        )
-        assert a.atol == b.atol and a.rtol == b.rtol and a.mode == b.mode
+    for judgment in JUDGMENTS:
+        for op_class in OP_CLASSES:
+            for dtype_name in ("float32", "bfloat16"):
+                cuda = resolve_tolerance(
+                    contract,
+                    judgment=judgment,
+                    op_class=op_class,
+                    dtype=dtype_name,
+                    backend_profile="cuda_bf16",
+                )
+                triton = resolve_tolerance(
+                    contract,
+                    judgment=judgment,
+                    op_class=op_class,
+                    dtype=dtype_name,
+                    backend_profile="triton_cuda_bf16",
+                )
+                assert (cuda.atol, cuda.rtol, cuda.mode) == (
+                    triton.atol,
+                    triton.rtol,
+                    triton.mode,
+                )
 
 
 def test_unknown_backend_profile_hard_fails():
@@ -313,9 +319,15 @@ def test_resolve_tolerance_attaches_roles():
 
 def test_chain_aggregate_named_resolve():
     contract = load_contract()
+    expected = {
+        "max_abs_dlogp": {"bfloat16": 5.0e-2, "float32": 1.0e-5},
+        "approx_kl0": {"bfloat16": 5.0e-2, "float32": 1.0e-5},
+        "clipfrac0": {"bfloat16": 0.0, "float32": 0.0},
+    }
+    assert set(expected) == set(CHAIN_AGGREGATE_METRICS)
     for metric in CHAIN_AGGREGATE_METRICS:
-        thr = resolve_chain_aggregate_thresholds(contract, metric, "bfloat16")
-        assert thr >= 0.0
+        for dtype, value in expected[metric].items():
+            assert resolve_chain_aggregate_thresholds(contract, metric, dtype) == value
     with pytest.raises(ContractResolveError, match="unknown chain aggregate"):
         resolve_chain_aggregate_thresholds(contract, "mean_abs_dlogp", "bfloat16")
 
@@ -398,6 +410,21 @@ def test_nan_inf_hard_fail():
             comparison_rhs_role="inference_style_rollout_decode",
         )
 
+    # Finite dlogp can still overflow exp(dlogp), which is a separate hard-fail.
+    lhs = torch.tensor([200.0, 0.0], dtype=torch.float32)
+    rhs = torch.zeros(2)
+    with pytest.raises(ContractResolveError, match="ratio0"):
+        compute_logprob_aggregates(
+            lhs,
+            rhs,
+            torch.ones(2, dtype=torch.bool),
+            contract=load_contract(),
+            report_kind="train_infer_logprob_parity",
+            clip_interval=(0.8, 1.2),
+            comparison_lhs_role="training_style_teacher_forcing",
+            comparison_rhs_role="inference_style_rollout_decode",
+        )
+
     lhs = torch.tensor([float("inf"), 0.0])
     with pytest.raises(ContractResolveError, match="NaN/Inf"):
         compute_logprob_aggregates(
@@ -410,6 +437,50 @@ def test_nan_inf_hard_fail():
             comparison_lhs_role="training_style_teacher_forcing",
             comparison_rhs_role="inference_style_rollout_decode",
         )
+
+
+def test_inactive_nan_is_ignored():
+    agg = compute_logprob_aggregates(
+        torch.tensor([0.0, float("nan")]),
+        torch.zeros(2),
+        torch.tensor([True, False]),
+        contract=load_contract(),
+        report_kind="train_infer_logprob_parity",
+        clip_interval=(0.8, 1.2),
+        comparison_lhs_role="training_style_teacher_forcing",
+        comparison_rhs_role="inference_style_rollout_decode",
+    )
+    assert agg.active_token_count == 1
+    assert agg.max_abs_dlogp == 0.0
+
+
+def test_clipfrac0_counts_ratios_outside_the_interval():
+    agg = compute_logprob_aggregates(
+        torch.tensor([0.0, 1.0, -1.0]),
+        torch.zeros(3),
+        torch.ones(3, dtype=torch.bool),
+        contract=load_contract(),
+        report_kind="train_infer_logprob_parity",
+        clip_interval=(0.8, 1.2),
+        comparison_lhs_role="training_style_teacher_forcing",
+        comparison_rhs_role="inference_style_rollout_decode",
+    )
+    assert math.isclose(agg.clipfrac0, 2.0 / 3.0, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_clip_interval_endpoints_count_as_inside():
+    lo, hi = 0.5, 2.0
+    agg = compute_logprob_aggregates(
+        torch.tensor([math.log(lo), math.log(hi)]),
+        torch.zeros(2),
+        torch.ones(2, dtype=torch.bool),
+        contract=load_contract(),
+        report_kind="train_infer_logprob_parity",
+        clip_interval=(lo, hi),
+        comparison_lhs_role="training_style_teacher_forcing",
+        comparison_rhs_role="inference_style_rollout_decode",
+    )
+    assert agg.clipfrac0 == 0.0
 
 
 def test_judge_requires_all_three_aggregates():
@@ -434,10 +505,11 @@ def test_judge_requires_all_three_aggregates():
     assert {m.metric for m in verdict.metrics} == set(CHAIN_AGGREGATE_METRICS)
     assert all(m.passed for m in verdict.metrics)
 
-    # Large drift fails max_abs_dlogp / approx_kl0 / possibly clipfrac.
-    lhs = torch.tensor([0.0, 1.0])
-    rhs = torch.zeros(2)
-    mask = torch.ones(2, dtype=torch.bool)
+    # A small in-interval drift fails only max_abs_dlogp. This proves the
+    # overall verdict requires all three metrics, rather than any one metric.
+    lhs = torch.tensor([0.1])
+    rhs = torch.zeros(1)
+    mask = torch.ones(1, dtype=torch.bool)
     agg = compute_logprob_aggregates(
         lhs,
         rhs,
@@ -450,7 +522,12 @@ def test_judge_requires_all_three_aggregates():
     )
     verdict = judge_logprob_aggregates(agg, contract, execution_dtype="bfloat16")
     assert not verdict.passed
-    assert any(not m.passed for m in verdict.metrics)
+    by_metric = {metric.metric: metric.passed for metric in verdict.metrics}
+    assert by_metric == {
+        "max_abs_dlogp": False,
+        "approx_kl0": True,
+        "clipfrac0": True,
+    }
 
 
 def test_compat_accuracy_mirrors_forward_accuracy():

@@ -381,7 +381,7 @@ def resolve_tolerance(
                 "backend_private_tolerance_relaxation must remain false under WS1 C1"
             )
 
-    if dtype_name in OUT_OF_SCOPE_DTYPES or policy.fp8 == "out_of_scope" and dtype_name == "float8":
+    if dtype_name in OUT_OF_SCOPE_DTYPES:
         raise ContractResolveError(
             f"dtype {dtype_name!r} is out of scope for WS1 (FP8 requests hard-fail)"
         )
@@ -781,12 +781,10 @@ def _validate_judgments(judgments: Mapping[str, Any]) -> None:
                     "applicable",
                     "not_applicable",
                 }:
-                    # BF16/FP32 must be explicitly applicable (or explicit N/A).
-                    if status != "applicable":
-                        raise ContractSchemaError(
-                            f"mandatory dtype cell must be applicable: "
-                            f"{judgment}/{op_class}/{dtype_name} status={status!r}"
-                        )
+                    raise ContractSchemaError(
+                        f"mandatory dtype cell must be applicable: "
+                        f"{judgment}/{op_class}/{dtype_name} status={status!r}"
+                    )
                 if status in {"applicable", "optional"}:
                     for thr in ("atol", "rtol", "mode"):
                         if thr not in cell:
@@ -810,6 +808,8 @@ def _validate_chain_aggregates(root: Mapping[str, Any]) -> None:
         "require_all",
         "nan_inf_policy",
         "empty_active_token_set",
+        "active_token_policy",
+        "clip_interval_field",
         "dlogp_definition",
         "default_clip_interval",
         "sole_chain_level_logprob_metrics",
@@ -823,6 +823,12 @@ def _validate_chain_aggregates(root: Mapping[str, Any]) -> None:
         raise ContractSchemaError("nan_inf_policy must be hard_fail")
     if root["empty_active_token_set"] != "hard_fail":
         raise ContractSchemaError("empty_active_token_set must be hard_fail")
+    if root["active_token_policy"] != "active selected tokens only":
+        raise ContractSchemaError("active_token_policy must be 'active selected tokens only'")
+    if root["clip_interval_field"] != "clip_interval":
+        raise ContractSchemaError("clip_interval_field must be 'clip_interval'")
+    if root["dlogp_definition"] != "comparison_lhs_logp - comparison_rhs_logp":
+        raise ContractSchemaError("dlogp_definition does not match implementation")
     if not root["require_all"]:
         raise ContractSchemaError("require_all must be true for chain logprob aggregates")
     sole = list(root["sole_chain_level_logprob_metrics"])
@@ -843,6 +849,15 @@ def _validate_chain_aggregates(root: Mapping[str, Any]) -> None:
         for dtype_name in ("bfloat16", "float32"):
             if dtype_name not in by_dtype or "threshold" not in by_dtype[dtype_name]:
                 raise ContractSchemaError(f"metric {name!r} missing threshold for {dtype_name}")
+        expected_formula = {
+            "max_abs_dlogp": "max(abs(dlogp))",
+            "approx_kl0": "mean(exp(dlogp) - 1 - dlogp)",
+            "clipfrac0": "mean(1[exp(dlogp) outside clip_interval])",
+        }[name]
+        if metrics[name].get("formula") != expected_formula:
+            raise ContractSchemaError(f"metric {name!r} formula does not match implementation")
+        if metrics[name].get("pass_rule") != "value <= threshold":
+            raise ContractSchemaError(f"metric {name!r} pass_rule must be 'value <= threshold'")
 
 
 def _validate_compat_views(contract: Mapping[str, Any]) -> None:
@@ -883,6 +898,7 @@ def _lookup_cell(
     dtype_name: str,
     arch_key: str | None,
 ) -> Mapping[str, Any] | None:
+    base = judgment_root.get("by_op_class", {}).get(op_class, {}).get(dtype_name)
     if arch_key is not None:
         arch_cell = (
             judgment_root.get("arch_overrides", {})
@@ -891,8 +907,10 @@ def _lookup_cell(
             .get(dtype_name)
         )
         if arch_cell is not None:
-            return arch_cell
-    return judgment_root.get("by_op_class", {}).get(op_class, {}).get(dtype_name)
+            if base is None:
+                return arch_cell
+            return {**base, **arch_cell}
+    return base
 
 
 def _dtype_name(dtype: str | Any) -> str:
