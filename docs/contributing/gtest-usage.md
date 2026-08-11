@@ -3,7 +3,6 @@
 > **Audience:** contributors implementing train–inference / batch-invariant operators
 > **Entry point:** `scripts/check_operator.py` + `rl_engine/kernels/gtest/*`
 > **Numerical SSOT:** [#267](https://github.com/RL-Align/RL-Kernel/issues/267) four-judgment contract
-> **Related:** [WS1 numerical contract](../design/ws1-numerical-contract.md) · [migration checklist](../design/ws1-gtest-migration-checklist.md)
 
 This is the official how-to for the gtest harness: register an op, build inputs, run the CLI for forward/backward checks, and obtain tolerances from the shared contract (not private `atol`/`rtol`).
 
@@ -270,6 +269,7 @@ verdict = judge_logprob_aggregates(agg, contract, execution_dtype="bfloat16")
 | Reference / accumulation | FP32 |
 | FP8 | Out of scope (resolve hard-fails) |
 | TF32 | Disabled |
+| Profiles | `cuda_bf16` and `triton_cuda_bf16` share **the same** thresholds |
 
 WS1 evidence must attach checked provenance to its candidate report:
 
@@ -297,9 +297,13 @@ candidate = CandidateSpec(
 
 The suite rejects backend fallback, dtype drift, TF32 enablement, and observed output
 dtypes that disagree with this provenance before producing a passing report.
-| Profiles | `cuda_bf16` and `triton_cuda_bf16` share **the same** thresholds |
 
-**Do not** use private `atol=1e-5` (etc.) as WS1 gate evidence. Inventory of legacy private thresholds: [migration checklist](../design/ws1-gtest-migration-checklist.md).
+`check_operator.py` is a local debugging CLI and does not construct provenance on its
+own. A WS1 gate must create `CandidateSpec(..., provenance=provenance)` in its harness;
+use `--json` to retain the resolved judgment and comparison-role fields in CLI reports.
+
+**Do not** use private `atol=1e-5` (etc.) as WS1 gate evidence. Migrate a gate to
+the shared resolver before using it as WS1 evidence.
 
 ### 6.4 Report `tol=(atol=..., rtol=...)`
 
@@ -375,8 +379,6 @@ New pytest code should call `resolve_tolerance` instead of copying magic numbers
 
 | Doc | Content |
 |-----|---------|
-| [ws1-numerical-contract.md](../design/ws1-numerical-contract.md) | Four judgments, roles, aggregate formulas |
-| [ws1-gtest-migration-checklist.md](../design/ws1-gtest-migration-checklist.md) | Which tests still use private thresholds and when to migrate |
 | [testing.md](testing.md) | Short testing entry points |
 | Issues [#266](https://github.com/RL-Align/RL-Kernel/issues/266) / [#267](https://github.com/RL-Align/RL-Kernel/issues/267) | WS1 closeout and C1 contract |
 
