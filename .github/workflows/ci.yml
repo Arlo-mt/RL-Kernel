@@ -67,6 +67,7 @@ jobs:
         run: |
           python -m pytest rl_engine/tests/test_dispatch.py -v
           PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_attention_correctness.py -q -rs
+          python -m pytest tests/test_forward_invariance.py -q
 
       - name: Run Attention Ground-Truth Tests (CPU-safe)
         run: |
