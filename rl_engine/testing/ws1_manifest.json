@@ -1,0 +1,1032 @@
+{
+  "version": "ws1-c2-v3",
+  "workload_id": "ws1-qwen3-8b-dense-primary-v3",
+  "seed": 20260812,
+  "model_identity": {
+    "model_id": "Qwen/Qwen3-8B",
+    "hf_repo": "Qwen/Qwen3-8B",
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "architecture": "Qwen3ForCausalLM",
+    "model_type": "qwen3",
+    "density": "dense",
+    "exit_forbids_architecture_shrink": true,
+    "config_fingerprint": {
+      "num_hidden_layers": 36,
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "max_position_embeddings": 40960,
+      "rope_theta": 1000000.0,
+      "rope_scaling": null,
+      "rms_norm_eps": 1e-06,
+      "hidden_act": "silu",
+      "swiglu": true,
+      "tie_word_embeddings": false,
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "use_sliding_window": false,
+      "sliding_window": null,
+      "qk_norm": true,
+      "qk_norm_note": "Qwen3 applies per-head RMSNorm on Q and K before RoPE; not a separate HF config flag."
+    },
+    "weight_snapshot": {
+      "pin_method": "hf_revision_plus_index_sha256_plus_all_lfs_shard_sha256",
+      "index_file": "model.safetensors.index.json",
+      "index_sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+      "tensor_total_size_bytes": 16381470720,
+      "weight_files_total_size_bytes": 16381516776,
+      "total_size_bytes": 16381470720,
+      "content_hash_algorithm": "sha256-of-sorted-shard-records-v1",
+      "content_hash": "fc664a19c52c82b6f5ddb33d4fe2723181daeb93a344b16fee6369963e5a13a5",
+      "shards": [
+        {
+          "filename": "model-00001-of-00005.safetensors",
+          "sha256": "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f",
+          "size_bytes": 3996250744
+        },
+        {
+          "filename": "model-00002-of-00005.safetensors",
+          "sha256": "5991236cea6fe21f3d43cab0f0e84448734fbbe0789816202989f2ddc9d18282",
+          "size_bytes": 3993160032
+        },
+        {
+          "filename": "model-00003-of-00005.safetensors",
+          "sha256": "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
+          "size_bytes": 3959604768
+        },
+        {
+          "filename": "model-00004-of-00005.safetensors",
+          "sha256": "b5ee7de71fbf17db3d5704e0c8f2bc7d005ca9e1d7ca2aeb19827b0cfcaa917a",
+          "size_bytes": 3187841392
+        },
+        {
+          "filename": "model-00005-of-00005.safetensors",
+          "sha256": "20c2d6366ab85c90786ccdd829cd2b9e7d30ef3b2ebbb998280e7e4014b542ff",
+          "size_bytes": 1244659840
+        }
+      ],
+      "source": "HF LFS x-linked-etag at the pinned revision; each value is the shard content SHA-256"
+    }
+  },
+  "chain_semantics": {
+    "execution_dtype": "bfloat16",
+    "reference_dtype": "float32",
+    "accumulation_dtype": "float32",
+    "temperature": 1.0,
+    "loss_reduction": "sum_over_active_tokens_then_optional_mean_by_active_count",
+    "logprob_selection": "selected_token_logprob_on_active_mask",
+    "active_token_policy": "active selected tokens only",
+    "aggregates": [
+      "max_abs_dlogp",
+      "approx_kl0",
+      "clipfrac0"
+    ],
+    "clip_interval": [
+      0.8,
+      1.2
+    ],
+    "clip_interval_note": "Pinned for clipfrac0; must match C1 chain_logprob_aggregates.default_clip_interval unless an explicit contract revision changes both.",
+    "comparison_roles_source": "rl_engine/kernels/gtest/tolerance_contract.json",
+    "forbidden_comparison_roles": [
+      "baseline",
+      "singleton_aggregate"
+    ],
+    "singleton_aggregate_note": "singleton_aggregate is a C2 execution/aggregation mode only. It must never populate comparison_lhs_role or comparison_rhs_role.",
+    "tf32_policy_ref": "rl_engine/kernels/gtest/tolerance_contract.json#/policy/tf32",
+    "tf32_note": "WS1 TF32 enable/disable is owned by the C1 contract; C2 gates must not introduce a private TF32 policy.",
+    "report_naming": {
+      "comparison_lhs_role": "from_c1_by_report_kind",
+      "comparison_rhs_role": "from_c1_by_report_kind",
+      "forbidden_in_reports": [
+        "baseline",
+        "singleton_aggregate"
+      ],
+      "singleton_aggregate_is": "c2_execution_aggregation_mode_only",
+      "note": "C2 freezes naming rules; C3+ emit reports that must obey these roles."
+    },
+    "backend_actual_semantics": {
+      "c2_actual_backend_id": "registry_resolved_expected_candidate",
+      "c2_actual_kernel_config_id": "operator_specs_candidate_path",
+      "runtime_observed_actual_owner": [
+        "C3",
+        "C8",
+        "C10",
+        "C11"
+      ],
+      "note": "For C2, actual_* equals expected_* after operator_specs resolution. GPU runtime provenance that proves a live kernel hit is owned by later closeout children; missing required Triton nodes stay status=missing_required (red)."
+    }
+  },
+  "stochastic_policy": {
+    "dropout": 0.0,
+    "attention_dropout": 0.0,
+    "sampling_in_logprob_parity": false,
+    "canonical_gate_uses_dropout_zero": true,
+    "rng_source": "manifest_seed_plus_logical_sample_token_identity",
+    "undeclared_randomness": "hard_fail",
+    "retained_stochastic_ops": []
+  },
+  "primary_matrix": {
+    "description": "Fixed #150 Batch × Chunked-Prefill matrix prerequisite workload cells.",
+    "N": 4,
+    "batch_size_bn": 4,
+    "sample_ids": [
+      "s0",
+      "s1",
+      "s2",
+      "s3"
+    ],
+    "sample_order_fixed": true,
+    "batch_permutation": {
+      "enabled": true,
+      "permutation": [
+        2,
+        0,
+        3,
+        1
+      ],
+      "target_sample_position_in_bn": 0,
+      "note": "Permutation exercises layout invariance; logical compare restores sample_id order."
+    },
+    "chunk": {
+      "chunk_size_tokens": 7,
+      "require_ge_2_chunks": true,
+      "non_divisible_case": true,
+      "note": "Longest primary seq_len=19 with chunk_size=7 yields chunks [7,7,5]."
+    },
+    "cells": [
+      {
+        "cell_id": "B1-singleton_aggregate/full",
+        "batch_mode": "singleton_aggregate",
+        "batch_size_per_run": 1,
+        "num_runs": 4,
+        "prefill_mode": "full",
+        "aggregation": {
+          "order": "sample_ids",
+          "denominator": "active_token_count_across_all_samples"
+        }
+      },
+      {
+        "cell_id": "BN/full",
+        "batch_mode": "batched",
+        "batch_size_per_run": 4,
+        "num_runs": 1,
+        "prefill_mode": "full",
+        "aggregation": {
+          "order": "sample_ids",
+          "denominator": "active_token_count_across_all_samples"
+        }
+      },
+      {
+        "cell_id": "B1-singleton_aggregate/chunked",
+        "batch_mode": "singleton_aggregate",
+        "batch_size_per_run": 1,
+        "num_runs": 4,
+        "prefill_mode": "chunked",
+        "aggregation": {
+          "order": "sample_ids",
+          "denominator": "active_token_count_across_all_samples"
+        }
+      },
+      {
+        "cell_id": "BN/chunked",
+        "batch_mode": "batched",
+        "batch_size_per_run": 4,
+        "num_runs": 1,
+        "prefill_mode": "chunked",
+        "aggregation": {
+          "order": "sample_ids",
+          "denominator": "active_token_count_across_all_samples"
+        }
+      }
+    ]
+  },
+  "fixtures": {
+    "prompt_template": "ws1_fixed_token_fixture",
+    "dtype_for_token_tensors": "int64",
+    "position_ids": {
+      "basis": "logical_zero_based_per_sample",
+      "reset_after_pack_boundary": true
+    },
+    "attention_mask": {
+      "active_value": 1,
+      "padding_value": 0,
+      "causal": true
+    },
+    "primary_seq_len": 19,
+    "primary_prompt_len": 8,
+    "short_seq_len": 8,
+    "long_seq_len": 32,
+    "varlen_seq_lens": [
+      11,
+      16,
+      13,
+      19
+    ],
+    "padding": {
+      "modes": [
+        "right",
+        "left"
+      ],
+      "pad_token_id": 151643,
+      "primary_padded_len": 20
+    },
+    "packing": {
+      "status": "supported",
+      "implementation": "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp",
+      "packed_fixture": {
+        "sample_order": [
+          "s0",
+          "s1",
+          "s2",
+          "s3"
+        ],
+        "segment_lengths": [
+          11,
+          16,
+          13,
+          19
+        ],
+        "total_tokens": 59,
+        "restore_key": [
+          "sample_id",
+          "token_position"
+        ]
+      }
+    },
+    "loss_mask": {
+      "prompt_tokens_active": false,
+      "completion_tokens_active": true
+    },
+    "samples": [
+      {
+        "sample_id": "s0",
+        "seq_len": 11,
+        "prompt_len": 8,
+        "token_ids": [
+          100,
+          101,
+          102,
+          103,
+          104,
+          105,
+          106,
+          107,
+          200,
+          201,
+          202
+        ]
+      },
+      {
+        "sample_id": "s1",
+        "seq_len": 16,
+        "prompt_len": 8,
+        "token_ids": [
+          110,
+          111,
+          112,
+          113,
+          114,
+          115,
+          116,
+          117,
+          210,
+          211,
+          212,
+          213,
+          214,
+          215,
+          216,
+          217
+        ]
+      },
+      {
+        "sample_id": "s2",
+        "seq_len": 13,
+        "prompt_len": 8,
+        "token_ids": [
+          120,
+          121,
+          122,
+          123,
+          124,
+          125,
+          126,
+          127,
+          220,
+          221,
+          222,
+          223,
+          224
+        ]
+      },
+      {
+        "sample_id": "s3",
+        "seq_len": 19,
+        "prompt_len": 8,
+        "token_ids": [
+          130,
+          131,
+          132,
+          133,
+          134,
+          135,
+          136,
+          137,
+          230,
+          231,
+          232,
+          233,
+          234,
+          235,
+          236,
+          237,
+          238,
+          239,
+          240
+        ]
+      }
+    ],
+    "short_full_model_fixture": {
+      "fixture_id": "short_full_model_seq8",
+      "seq_len": 8,
+      "prompt_len": 4,
+      "token_ids": [
+        310,
+        311,
+        312,
+        313,
+        410,
+        411,
+        412,
+        413
+      ],
+      "note": "Shorter sequence on full architecture+weights only; never shrinks layers/hidden/heads/vocab.",
+      "candidate_case_ids": [
+        "gemm-m127-k4096-n4096-no-splitk-v1",
+        "logp-vocab151936-btok17-reduction-boundary-v1"
+      ]
+    },
+    "long_full_model_fixture": {
+      "fixture_id": "long_full_model_seq32",
+      "seq_len": 32,
+      "prompt_len": 16,
+      "token_ids": [
+        500,
+        501,
+        502,
+        503,
+        504,
+        505,
+        506,
+        507,
+        508,
+        509,
+        510,
+        511,
+        512,
+        513,
+        514,
+        515,
+        600,
+        601,
+        602,
+        603,
+        604,
+        605,
+        606,
+        607,
+        608,
+        609,
+        610,
+        611,
+        612,
+        613,
+        614,
+        615
+      ],
+      "note": "Long fixed sequence on the same full architecture and pinned weight snapshot.",
+      "candidate_case_ids": [
+        "attn-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
+        "attn-triton-prefill-gqa-b2-sq33-skv33-no-splitkv-v1"
+      ]
+    },
+    "representative_full_model_fixture": {
+      "fixture_id": "rep_full_model_seq16",
+      "seq_len": 16,
+      "prompt_len": 8,
+      "sample_ids": [
+        "s0",
+        "s1",
+        "s2",
+        "s3"
+      ],
+      "note": "Primary variable-length matrix fixture; full architecture+weights.",
+      "candidate_case_ids": [
+        "gemm-m256-k4096-n12288-no-splitk-v1",
+        "logp-bi-triton-vocab151936-btok15-v1"
+      ]
+    },
+    "prompt_lens": [
+      8,
+      8,
+      8,
+      8
+    ],
+    "completion_lens": [
+      3,
+      8,
+      5,
+      11
+    ],
+    "max_completion_len": 11
+  },
+  "logical_identity": {
+    "key": [
+      "sample_id",
+      "token_position"
+    ],
+    "token_position_basis": "logical_unpadded_index_in_sample",
+    "restore_before_compare_after": [
+      "pad",
+      "pack",
+      "chunk",
+      "batch_permute"
+    ],
+    "gradient_singleton_aggregate": {
+      "definition": "N independent B=1 runs of the same N logical samples, aggregated with fixed sample order and active-token denominator",
+      "compare_to": "single B=N run of the same logical sample/token multiset",
+      "forbid_different_sample_sets": true
+    }
+  },
+  "capabilities": {
+    "packing": {
+      "status": "supported",
+      "detail": "NativePackOp is present; C2 pins and round-trips the packed variable-length fixture even though packing is outside the primary 2x2 matrix."
+    },
+    "qk_norm": {
+      "status": "required_on_chain",
+      "detail": "Qwen3-8B Dense applies QK-Norm before RoPE on every layer."
+    },
+    "operator_spec_map": {
+      "embedding": "embedding",
+      "rms_norm": "rms_norm",
+      "det_gemm": "det_gemm",
+      "qk_norm": "rms_norm",
+      "rope": "rope",
+      "attention": "attention",
+      "swiglu": "swiglu",
+      "silu": "silu",
+      "lm_head": "lm_head",
+      "logprob": "logp",
+      "batch_invariant_logp": "batch_invariant_logp"
+    },
+    "required_chain_ops": [
+      {
+        "op": "embedding",
+        "status": "required"
+      },
+      {
+        "op": "rms_norm",
+        "status": "required"
+      },
+      {
+        "op": "det_gemm",
+        "status": "required"
+      },
+      {
+        "op": "qk_norm",
+        "status": "required"
+      },
+      {
+        "op": "rope",
+        "status": "required"
+      },
+      {
+        "op": "attention",
+        "status": "required"
+      },
+      {
+        "op": "swiglu",
+        "status": "required"
+      },
+      {
+        "op": "silu",
+        "status": "required"
+      },
+      {
+        "op": "lm_head",
+        "status": "required"
+      },
+      {
+        "op": "logprob",
+        "status": "required"
+      },
+      {
+        "op": "batch_invariant_logp",
+        "status": "required"
+      },
+      {
+        "op": "linear_logp",
+        "status": "optional_fused_path"
+      }
+    ]
+  },
+  "backend_profiles": {
+    "cuda_bf16": {
+      "backend_family": "cuda",
+      "execution_dtype": "bfloat16",
+      "required_nodes": [
+        {
+          "node": "embedding",
+          "expected_backend_id": "cuda-sm90",
+          "expected_kernel_config_id": "sm90_embedding",
+          "algorithm_property": "deterministic_table_lookup",
+          "status": "declared"
+        },
+        {
+          "node": "rms_norm",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_rmsnorm_bf16",
+          "algorithm_property": "fused_batch_invariant_rmsnorm",
+          "status": "declared"
+        },
+        {
+          "node": "det_gemm",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_det_gemm_no_splitk",
+          "algorithm_property": "no_split_k_deterministic_gemm",
+          "status": "declared"
+        },
+        {
+          "node": "qk_norm",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_rmsnorm_qk",
+          "algorithm_property": "per_head_rms_on_q_k",
+          "status": "declared"
+        },
+        {
+          "node": "rope",
+          "expected_backend_id": "cuda-sm90",
+          "expected_kernel_config_id": "sm90_rope",
+          "algorithm_property": "rotate_half_theta_1e6",
+          "status": "declared"
+        },
+        {
+          "node": "attention",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_deterministic_attn_no_splitkv",
+          "algorithm_property": "no_split_kv_batch_invariant_attention",
+          "status": "declared"
+        },
+        {
+          "node": "swiglu",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_swiglu",
+          "algorithm_property": "elementwise_swiglu",
+          "status": "declared"
+        },
+        {
+          "node": "silu",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_silu",
+          "algorithm_property": "elementwise_silu",
+          "status": "declared"
+        },
+        {
+          "node": "lm_head",
+          "expected_backend_id": "cuda-sm90",
+          "expected_kernel_config_id": "sm90_lm_head",
+          "algorithm_property": "deterministic_untied_lm_head",
+          "status": "declared"
+        },
+        {
+          "node": "logprob",
+          "expected_backend_id": "cuda",
+          "expected_kernel_config_id": "cuda_fused_logp_generic",
+          "algorithm_property": "deterministic_selected_logprob",
+          "status": "declared"
+        },
+        {
+          "node": "batch_invariant_logp",
+          "expected_backend_id": "cuda-sm90",
+          "expected_kernel_config_id": "sm90_batch_invariant_logp",
+          "algorithm_property": "batch_invariant_logprob_reduction",
+          "status": "declared"
+        }
+      ]
+    },
+    "triton_cuda_bf16": {
+      "backend_family": "triton",
+      "execution_dtype": "bfloat16",
+      "required_nodes": [
+        {
+          "node": "embedding",
+          "expected_backend_id": null,
+          "expected_kernel_config_id": null,
+          "algorithm_property": "deterministic_table_lookup",
+          "status": "missing_required",
+          "note": "No Triton embedding candidate in operator_specs; profile is red for this node until a candidate is declared — not N/A, not silent fallback."
+        },
+        {
+          "node": "rms_norm",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_rmsnorm_bf16",
+          "algorithm_property": "fused_batch_invariant_rmsnorm",
+          "status": "declared"
+        },
+        {
+          "node": "det_gemm",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_det_gemm_no_splitk",
+          "algorithm_property": "no_split_k_deterministic_gemm",
+          "status": "declared"
+        },
+        {
+          "node": "qk_norm",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_rmsnorm_qk",
+          "algorithm_property": "per_head_rms_on_q_k",
+          "status": "declared"
+        },
+        {
+          "node": "rope",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_rope",
+          "algorithm_property": "rotate_half_theta_1e6",
+          "status": "declared"
+        },
+        {
+          "node": "attention",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_batch_invariant_attn_no_splitkv",
+          "algorithm_property": "no_split_kv_batch_invariant_attention",
+          "status": "declared"
+        },
+        {
+          "node": "swiglu",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_swiglu",
+          "algorithm_property": "elementwise_swiglu",
+          "status": "declared"
+        },
+        {
+          "node": "silu",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_silu",
+          "algorithm_property": "elementwise_silu",
+          "status": "declared"
+        },
+        {
+          "node": "lm_head",
+          "expected_backend_id": null,
+          "expected_kernel_config_id": null,
+          "algorithm_property": "deterministic_untied_lm_head",
+          "status": "missing_required",
+          "note": "No Triton lm_head candidate in operator_specs; profile is red for this node until declared."
+        },
+        {
+          "node": "logprob",
+          "expected_backend_id": null,
+          "expected_kernel_config_id": null,
+          "algorithm_property": "deterministic_selected_logprob",
+          "status": "missing_required",
+          "note": "operator_specs logp has no triton candidate; use batch_invariant_logp/linear_logp where applicable. Node stays missing_required for plain logp."
+        },
+        {
+          "node": "batch_invariant_logp",
+          "expected_backend_id": "triton",
+          "expected_kernel_config_id": "triton_batch_invariant_logp",
+          "algorithm_property": "batch_invariant_logprob_reduction",
+          "status": "declared"
+        }
+      ]
+    }
+  },
+  "representative_cases": [
+    {
+      "case_id": "gemm-m127-k4096-n4096-no-splitk-v1",
+      "family": "gemm",
+      "revision": 1,
+      "shape": {
+        "M": 127,
+        "K": 4096,
+        "N": 4096,
+        "note": "Non-tile-aligned flattened-token M on full-model projection K/N."
+      },
+      "expected_backend_id": "cuda",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+      "actual_backend_id": "cuda",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_k_deterministic_gemm",
+      "profile_ids": [
+        "cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "cuda",
+        "resolved_path": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+        "algorithm_source": "rl_engine/kernels/ops/cuda/matmul/det_gemm.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "gemm-m256-k4096-n12288-no-splitk-v1",
+      "family": "gemm",
+      "revision": 1,
+      "shape": {
+        "M": 256,
+        "K": 4096,
+        "N": 12288,
+        "note": "Gate/up projection width (intermediate_size)."
+      },
+      "expected_backend_id": "cuda",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+      "actual_backend_id": "cuda",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_k_deterministic_gemm",
+      "profile_ids": [
+        "cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "cuda",
+        "resolved_path": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
+        "algorithm_source": "rl_engine/kernels/ops/cuda/matmul/det_gemm.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "gemm-triton-m63-k4096-n4096-no-splitk-v1",
+      "family": "gemm",
+      "revision": 1,
+      "shape": {
+        "M": 63,
+        "K": 4096,
+        "N": 4096,
+        "note": "Non-tile-aligned M on Triton det_gemm path."
+      },
+      "expected_backend_id": "triton",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+      "actual_backend_id": "triton",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_k_deterministic_gemm",
+      "profile_ids": [
+        "triton_cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "triton",
+        "resolved_path": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "gemm-triton-m256-k4096-n12288-no-splitk-v1",
+      "family": "gemm",
+      "revision": 1,
+      "shape": {
+        "M": 256,
+        "K": 4096,
+        "N": 12288,
+        "note": "Second Triton M and full gate/up projection width."
+      },
+      "expected_backend_id": "triton",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+      "actual_backend_id": "triton",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_k_deterministic_gemm",
+      "profile_ids": [
+        "triton_cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "triton",
+        "resolved_path": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
+        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "attn-prefill-gqa-b2-sq31-skv31-no-splitkv-v1",
+      "family": "attention",
+      "revision": 1,
+      "shape": {
+        "B": 2,
+        "Hq": 32,
+        "Hkv": 8,
+        "Sq": 31,
+        "Skv": 31,
+        "D": 128,
+        "mode": "prefill",
+        "note": "Non-tile-aligned sequence; GQA as official."
+      },
+      "expected_backend_id": "cuda",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+      "actual_backend_id": "cuda",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_kv_batch_invariant_attention",
+      "profile_ids": [
+        "cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "cuda",
+        "resolved_path": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+        "algorithm_source": "rl_engine/kernels/ops/cuda/attention/deterministic_attn.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "attn-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
+      "family": "attention",
+      "revision": 1,
+      "shape": {
+        "B": 1,
+        "Hq": 32,
+        "Hkv": 8,
+        "Sq": 1,
+        "Skv": 129,
+        "D": 128,
+        "mode": "decode",
+        "note": "Decode step with non-tile-aligned KV length."
+      },
+      "expected_backend_id": "cuda",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+      "actual_backend_id": "cuda",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_kv_batch_invariant_attention",
+      "profile_ids": [
+        "cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "cuda",
+        "resolved_path": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+        "algorithm_source": "rl_engine/kernels/ops/cuda/attention/deterministic_attn.py:3",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "attn-triton-prefill-gqa-b2-sq33-skv33-no-splitkv-v1",
+      "family": "attention",
+      "revision": 1,
+      "shape": {
+        "B": 2,
+        "Hq": 32,
+        "Hkv": 8,
+        "Sq": 33,
+        "Skv": 33,
+        "D": 128,
+        "mode": "prefill",
+        "note": "Triton batch-invariant attention; non-power-of-two seq."
+      },
+      "expected_backend_id": "triton",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+      "actual_backend_id": "triton",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_kv_batch_invariant_attention",
+      "profile_ids": [
+        "triton_cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "triton",
+        "resolved_path": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:1",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "attn-triton-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
+      "family": "attention",
+      "revision": 1,
+      "shape": {
+        "B": 1,
+        "Hq": 32,
+        "Hkv": 8,
+        "Sq": 1,
+        "Skv": 129,
+        "D": 128,
+        "mode": "decode",
+        "note": "Triton decode with non-tile-aligned KV length."
+      },
+      "expected_backend_id": "triton",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+      "actual_backend_id": "triton",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "no_split_kv_batch_invariant_attention",
+      "profile_ids": [
+        "triton_cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "triton",
+        "resolved_path": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
+        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:1",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "logp-vocab151936-btok17-reduction-boundary-v1",
+      "family": "logprob",
+      "revision": 1,
+      "shape": {
+        "B": 1,
+        "T": 17,
+        "vocab": 151936,
+        "note": "Full vocab; token count crosses common 16-aligned reduction boundary."
+      },
+      "expected_backend_id": "cuda",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
+      "actual_backend_id": "cuda",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "deterministic_selected_logprob",
+      "profile_ids": [
+        "cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "cuda",
+        "resolved_path": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
+        "algorithm_source": "rl_engine/kernels/ops/cuda/loss/logp.py:213",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    },
+    {
+      "case_id": "logp-bi-triton-vocab151936-btok15-v1",
+      "family": "logprob",
+      "revision": 1,
+      "shape": {
+        "B": 1,
+        "T": 15,
+        "vocab": 151936,
+        "note": "Triton batch-invariant logp on full vocab; non-aligned T."
+      },
+      "expected_backend_id": "triton",
+      "expected_kernel_config_id": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
+      "actual_backend_id": "triton",
+      "actual_kernel_config_id": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
+      "provenance_status": "registry_resolved_runtime_pending",
+      "algorithm_property": "batch_invariant_logprob_reduction",
+      "profile_ids": [
+        "triton_cuda_bf16"
+      ],
+      "architecture_identity": "full_qwen3_8b_dense",
+      "provenance_evidence": {
+        "kind": "operator_specs_registry_resolution",
+        "registry": "rl_engine/kernels/gtest/operator_specs.py",
+        "candidate_name": "triton",
+        "resolved_path": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
+        "algorithm_source": "rl_engine/kernels/ops/triton/loss/batch_invariant_logp.py:1",
+        "runtime_evidence_owner": "C8/C10/C11"
+      }
+    }
+  ],
+  "fixture_identity_sha256": "c2ec565a575aa3a02c3a27d89ffba3162d93455efd53a7fcb1de11f7e9db7f3d",
+  "provenance_boundary": {
+    "c2_scope": "logical_workload_identity_and_registry_path_binding",
+    "not_in_c2": [
+      "full_model_forward",
+      "numerical_150_asserts",
+      "runtime_kernel_dispatch_observation",
+      "multi_gpu"
+    ],
+    "runtime_evidence_owner": [
+      "C3",
+      "C8",
+      "C10",
+      "C11"
+    ]
+  }
+}
