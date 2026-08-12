@@ -19,6 +19,7 @@ from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     DeterministicCPAttentionReferenceOp,
     compare_cp_attention_backward,
     merge_attention_partial_states,
+    split_kv_execution_plan_provenance,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
@@ -409,6 +410,57 @@ def test_backward_report_cp2_chunked_prefill_matches_cp1_reference():
     assert drift.dv.max_abs <= _GRAD_ATOL
     assert drift.provenance["attention_mode"] == "chunked_prefill"
     assert drift.provenance["kv_chunk_size"] == 2
+    assert drift.provenance["requested_split_kv_policy"] == "fixed"
+    assert drift.provenance["actual_split_kv_plans"] == [
+        {
+            "owner_cp_rank": 0,
+            "requested_split_kv_policy": "fixed",
+            "requested_split_kv_size": 2,
+            "actual_split_kv_policy": "fixed",
+            "actual_split_kv_size": 2,
+            "actual_split_kv_count": 2,
+            "actual_split_boundaries": [[0, 2], [2, 3]],
+            "split_kv_merge_order": "global_block_index",
+            "split_kv_accum_dtype": "fp32",
+            "split_kv_downcast_at": "final_write",
+            "split_kv_backend": "deterministic_cp_backward_reference",
+            "split_kv_plan_source": "reference_execution",
+            "split_kv_fallback": False,
+            "split_kv_fallback_reason": None,
+        },
+        {
+            "owner_cp_rank": 1,
+            "requested_split_kv_policy": "fixed",
+            "requested_split_kv_size": 2,
+            "actual_split_kv_policy": "fixed",
+            "actual_split_kv_size": 2,
+            "actual_split_kv_count": 2,
+            "actual_split_boundaries": [[3, 5], [5, 6]],
+            "split_kv_merge_order": "global_block_index",
+            "split_kv_accum_dtype": "fp32",
+            "split_kv_downcast_at": "final_write",
+            "split_kv_backend": "deterministic_cp_backward_reference",
+            "split_kv_plan_source": "reference_execution",
+            "split_kv_fallback": False,
+            "split_kv_fallback_reason": None,
+        },
+    ]
+
+
+def test_split_kv_plan_never_crosses_cp_owner_boundaries():
+    plans = split_kv_execution_plan_provenance(
+        10,
+        cp_world_size=3,
+        kv_chunk_size=3,
+        backend="test-reference",
+    )
+
+    assert [plan["actual_split_boundaries"] for plan in plans] == [
+        [[0, 3], [3, 4]],
+        [[4, 7]],
+        [[7, 10]],
+    ]
+    assert [plan["owner_cp_rank"] for plan in plans] == [0, 1, 2]
 
 
 def test_backward_report_preserves_post_rope_position_metadata():
@@ -564,6 +616,18 @@ def test_overlapping_partial_ranges_raise():
             [
                 AttentionPartialState(out=out, lse=lse, block_start=0, block_end=3),
                 AttentionPartialState(out=out, lse=lse, block_start=2, block_end=4),
+            ]
+        )
+
+
+def test_gapped_partial_ranges_raise():
+    out = torch.zeros(1, 1, 1, 1)
+    lse = torch.zeros(1, 1, 1)
+    with pytest.raises(ValueError, match="gap-free"):
+        merge_attention_partial_states(
+            [
+                AttentionPartialState(out=out, lse=lse, block_start=0, block_end=2),
+                AttentionPartialState(out=out, lse=lse, block_start=3, block_end=4),
             ]
         )
 
