@@ -273,7 +273,6 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
         page_size=args.page_size,
         q_rope_state="pre_rope",
         k_cache_rope_state="pre_rope",
-        cp_world_size=args.cp_world_size,
     )
     return DecodeAttentionInputs(q=q, k_cache=k_cache, v_cache=v_cache, metadata=metadata)
 
@@ -333,18 +332,17 @@ def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> Decode
         page_size=metadata.page_size,
         prefix_cache_key=metadata.prefix_cache_key,
         prefix_cache_enabled=metadata.prefix_cache_enabled,
+        prefix_length=metadata.prefix_length,
+        prefix_cache_fingerprint=metadata.prefix_cache_fingerprint,
         q_rope_state=metadata.q_rope_state,
         k_cache_rope_state=metadata.k_cache_rope_state,
         cp_block_owners=cp_block_owners,
-        cp_world_size=metadata.cp_world_size,
     )
     return replace(
         inputs,
         q=inputs.q[batch_index : batch_index + 1],
         k_cache=inputs.k_cache[batch_index : batch_index + 1],
         v_cache=inputs.v_cache[batch_index : batch_index + 1],
-        k_new=(None if inputs.k_new is None else inputs.k_new[batch_index : batch_index + 1]),
-        v_new=(None if inputs.v_new is None else inputs.v_new[batch_index : batch_index + 1]),
         metadata=selected_metadata,
     )
 

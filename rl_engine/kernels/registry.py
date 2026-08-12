@@ -98,6 +98,12 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_ATTENTION = (
         "rl_engine.kernels.ops.pytorch.attention.standard_attn.NativeAttentionOp"
     )
+    # WS2 correctness-first CP attention reference. Keep this separate from
+    # ``attention`` so production dispatch never selects the reference by accident.
+    PYTORCH_CP_ATTENTION = (
+        "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+        "DeterministicCPAttentionReferenceOp"
+    )
     # WS1 pure-PyTorch ground-truth KV-cache (decode/incremental) attention
     # reference; concats cache+new then reuses the standard attention reduction.
     PYTORCH_NATIVE_KV_CACHE_ATTN = (
@@ -201,6 +207,7 @@ class KernelRegistry:
                     OpBackend.CUDA_DETERMINISTIC_ATTENTION,
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
                 ],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [
@@ -249,6 +256,7 @@ class KernelRegistry:
                     OpBackend.TRITON_GENERIC,
                 ],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
@@ -273,6 +281,7 @@ class KernelRegistry:
                 "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
