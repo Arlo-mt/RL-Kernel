@@ -11,7 +11,7 @@ an incompatible backend before any numerically different path is launched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, TypeVar
 
@@ -53,6 +53,12 @@ class DowncastPoint(str, Enum):
 
 class ReductionEngine(str, Enum):
     IN_OP_REFERENCE = "in_op_reference"
+
+
+class SplitKVMode(str, Enum):
+    DISABLED = "disabled"
+    FIXED = "fixed"
+    AUTO = "auto"
 
 
 class RoPEState(str, Enum):
@@ -282,6 +288,645 @@ class ReductionSpec:
             raise AttentionContractError(
                 f"CP attention accumulation must be fp32; got {self.acc_dtype.value}"
             )
+
+
+@dataclass(frozen=True)
+class SplitKVExecutionPlan:
+    """Actual backend-local Split-KV schedule emitted by a runtime.
+
+    CP ownership is intentionally separate from this plan.  ``boundaries``
+    describe the canonical logical KV ranges reduced by one backend invocation;
+    CP may transport those partial states between ranks but must not change the
+    FP32 merge contract recorded here.
+    """
+
+    requested_mode: SplitKVMode
+    requested_split_size: int | None
+    actual_mode: SplitKVMode | None
+    actual_split_size: int | None
+    boundaries: tuple[tuple[int, int], ...]
+    merge_order: ReductionOrder = ReductionOrder.GLOBAL_BLOCK_INDEX
+    acc_dtype: AttentionDType = AttentionDType.FP32
+    downcast_at: DowncastPoint = DowncastPoint.FINAL_WRITE
+    backend: str = "reference"
+    source: str = "contract_exact"
+    fallback: bool = False
+    fallback_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "requested_mode",
+            _enum_value(SplitKVMode, self.requested_mode, "requested_mode"),
+        )
+        if self.actual_mode is not None:
+            object.__setattr__(
+                self,
+                "actual_mode",
+                _enum_value(SplitKVMode, self.actual_mode, "actual_mode"),
+            )
+        for field_name in ("requested_split_size", "actual_split_size"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _positive_int(value, field_name)
+        if self.requested_mode is SplitKVMode.FIXED:
+            if self.requested_split_size is None:
+                raise AttentionContractError(
+                    "requested fixed Split-KV mode requires requested_split_size"
+                )
+        elif self.requested_split_size is not None:
+            raise AttentionContractError(
+                "requested_split_size is only valid for requested fixed Split-KV mode"
+            )
+        try:
+            boundaries = tuple(tuple(boundary) for boundary in self.boundaries)
+        except TypeError as exc:
+            raise AttentionContractError(
+                "Split-KV boundaries must be an iterable of (start, end) pairs"
+            ) from exc
+        previous_end = 0
+        for index, boundary in enumerate(boundaries):
+            if len(boundary) != 2:
+                raise AttentionContractError(
+                    f"Split-KV boundary {index} must contain exactly start and end"
+                )
+            start, end = boundary
+            if (
+                isinstance(start, bool)
+                or isinstance(end, bool)
+                or not isinstance(start, int)
+                or not isinstance(end, int)
+                or start < 0
+                or end <= start
+            ):
+                raise AttentionContractError(
+                    "Split-KV boundaries must satisfy 0 <= start < end"
+                )
+            if index > 0 and start != previous_end:
+                raise AttentionContractError(
+                    "Split-KV boundaries must be contiguous and in logical KV order"
+                )
+            previous_end = end
+        if self.actual_mode is None and boundaries:
+            raise AttentionContractError("unknown actual Split-KV plan cannot declare boundaries")
+        if self.actual_mode is not None and not boundaries:
+            raise AttentionContractError("actual Split-KV plan must declare logical boundaries")
+        if self.actual_mode is SplitKVMode.FIXED:
+            if self.actual_split_size is None:
+                raise AttentionContractError(
+                    "actual fixed Split-KV mode requires actual_split_size"
+                )
+            widths = tuple(end - start for start, end in boundaries)
+            if any(width != self.actual_split_size for width in widths[:-1]) or (
+                widths and widths[-1] > self.actual_split_size
+            ):
+                raise AttentionContractError(
+                    "fixed Split-KV boundaries must use actual_split_size except "
+                    "for a shorter final split"
+                )
+        elif self.actual_split_size is not None:
+            raise AttentionContractError(
+                "actual_split_size is only valid for actual fixed Split-KV mode"
+            )
+        if self.actual_mode is SplitKVMode.DISABLED and len(boundaries) != 1:
+            raise AttentionContractError(
+                "disabled Split-KV execution must contain exactly one boundary"
+            )
+        object.__setattr__(self, "boundaries", boundaries)
+        object.__setattr__(
+            self,
+            "merge_order",
+            _enum_value(ReductionOrder, self.merge_order, "merge_order"),
+        )
+        object.__setattr__(
+            self,
+            "acc_dtype",
+            _enum_value(AttentionDType, self.acc_dtype, "acc_dtype"),
+        )
+        object.__setattr__(
+            self,
+            "downcast_at",
+            _enum_value(DowncastPoint, self.downcast_at, "downcast_at"),
+        )
+        if self.acc_dtype is not AttentionDType.FP32:
+            raise AttentionContractError("Split-KV partial states must be merged in fp32")
+        if not isinstance(self.backend, str) or not self.backend.strip():
+            raise AttentionContractError("Split-KV backend must be a non-empty string")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise AttentionContractError("Split-KV plan source must be a non-empty string")
+        if not isinstance(self.fallback, bool):
+            raise AttentionContractError("Split-KV fallback must be a bool")
+        if self.fallback and not self.fallback_reason:
+            raise AttentionContractError("Split-KV fallback_reason is required for a fallback")
+        if not self.fallback and self.fallback_reason is not None:
+            raise AttentionContractError(
+                "Split-KV fallback_reason must be None when fallback=False"
+            )
+        if not self.fallback and self.actual_mode is not None:
+            if self.actual_mode is not self.requested_mode:
+                raise AttentionContractError(
+                    "actual Split-KV mode may differ from requested mode only for a fallback"
+                )
+            if self.actual_split_size != self.requested_split_size:
+                raise AttentionContractError(
+                    "actual Split-KV size may differ from requested size only for a fallback"
+                )
+
+    @property
+    def actual_split_count(self) -> int | None:
+        return None if self.actual_mode is None else len(self.boundaries)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requested_split_kv_policy": self.requested_mode.value,
+            "requested_split_kv_size": self.requested_split_size,
+            "actual_split_kv_policy": (
+                None if self.actual_mode is None else self.actual_mode.value
+            ),
+            "actual_split_kv_size": self.actual_split_size,
+            "actual_split_kv_count": self.actual_split_count,
+            "actual_split_boundaries": [list(boundary) for boundary in self.boundaries],
+            "split_kv_merge_order": self.merge_order.value,
+            "split_kv_accum_dtype": self.acc_dtype.value,
+            "split_kv_downcast_at": self.downcast_at.value,
+            "split_kv_backend": self.backend,
+            "split_kv_plan_source": self.source,
+            "split_kv_fallback": self.fallback,
+            "split_kv_fallback_reason": self.fallback_reason,
+        }
+
+
+@dataclass(frozen=True)
+class SplitKVSpec:
+    """Requested Split-KV policy shared by training and rollout paths."""
+
+    mode: SplitKVMode = SplitKVMode.DISABLED
+    fixed_split_size: int | None = None
+    strict_consistency: bool = True
+
+    @classmethod
+    def disabled(cls, *, strict_consistency: bool = True) -> "SplitKVSpec":
+        return cls(mode=SplitKVMode.DISABLED, strict_consistency=strict_consistency)
+
+    @classmethod
+    def fixed(cls, split_size: int, *, strict_consistency: bool = True) -> "SplitKVSpec":
+        return cls(
+            mode=SplitKVMode.FIXED,
+            fixed_split_size=split_size,
+            strict_consistency=strict_consistency,
+        )
+
+    @classmethod
+    def auto(cls, *, strict_consistency: bool = False) -> "SplitKVSpec":
+        return cls(mode=SplitKVMode.AUTO, strict_consistency=strict_consistency)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mode", _enum_value(SplitKVMode, self.mode, "split_kv.mode"))
+        if not isinstance(self.strict_consistency, bool):
+            raise AttentionContractError("split_kv.strict_consistency must be a bool")
+        if self.mode is SplitKVMode.FIXED:
+            if self.fixed_split_size is None:
+                raise AttentionContractError(
+                    "fixed Split-KV policy requires fixed_split_size"
+                )
+            _positive_int(self.fixed_split_size, "split_kv.fixed_split_size")
+        elif self.fixed_split_size is not None:
+            raise AttentionContractError(
+                "fixed_split_size is only valid for fixed Split-KV policy"
+            )
+        if self.strict_consistency and self.mode is SplitKVMode.AUTO:
+            raise AttentionContractError(
+                "auto Split-KV is runtime-shape dependent and is not allowed in strict consistency"
+            )
+
+    def resolve(self, total_kv_tokens: int, *, backend: str) -> SplitKVExecutionPlan:
+        """Resolve policies whose logical schedule is fully known by contract."""
+
+        total_kv_tokens = _positive_int(total_kv_tokens, "total_kv_tokens")
+        if self.mode is SplitKVMode.AUTO:
+            return SplitKVExecutionPlan(
+                requested_mode=self.mode,
+                requested_split_size=None,
+                actual_mode=None,
+                actual_split_size=None,
+                boundaries=(),
+                backend=backend,
+                source="runtime_required",
+            )
+        split_size = total_kv_tokens if self.mode is SplitKVMode.DISABLED else self.fixed_split_size
+        assert split_size is not None
+        boundaries = tuple(
+            (start, min(start + split_size, total_kv_tokens))
+            for start in range(0, total_kv_tokens, split_size)
+        )
+        return SplitKVExecutionPlan(
+            requested_mode=self.mode,
+            requested_split_size=self.fixed_split_size,
+            actual_mode=self.mode,
+            actual_split_size=self.fixed_split_size,
+            boundaries=boundaries,
+            backend=backend,
+            source="contract_exact",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode.value,
+            "fixed_split_size": self.fixed_split_size,
+            "strict_consistency": self.strict_consistency,
+        }
+
+
+def validate_split_kv_alignment(
+    training: SplitKVExecutionPlan,
+    rollout: SplitKVExecutionPlan,
+) -> None:
+    """Fail closed unless train and rollout executed the same logical plan."""
+
+    if training.actual_mode is None or rollout.actual_mode is None:
+        raise AttentionContractError(
+            "strict Split-KV alignment requires actual runtime plans from both sides"
+        )
+    fields = (
+        "requested_mode",
+        "requested_split_size",
+        "actual_mode",
+        "actual_split_size",
+        "boundaries",
+        "merge_order",
+        "acc_dtype",
+        "downcast_at",
+        "fallback",
+    )
+    mismatches = [
+        field_name
+        for field_name in fields
+        if getattr(training, field_name) != getattr(rollout, field_name)
+    ]
+    if mismatches:
+        raise AttentionContractError(
+            "training/rollout Split-KV execution plans differ: " + ", ".join(mismatches)
+        )
+
+
+@dataclass(frozen=True, order=True)
+class SplitKVRuntimeCoordinate:
+    """Identity of one batch/rank/owner Split-KV runtime plan."""
+
+    batch_index: int
+    tp_rank: int
+    cp_rank: int
+    owner_cp_rank: int
+
+    def validate(
+        self,
+        *,
+        batch_size: int,
+        tp_world_size: int,
+        cp_world_size: int,
+    ) -> None:
+        batch_index = _non_negative_int(self.batch_index, "batch_index")
+        tp_rank = _non_negative_int(self.tp_rank, "tp_rank")
+        cp_rank = _non_negative_int(self.cp_rank, "cp_rank")
+        owner_cp_rank = _non_negative_int(self.owner_cp_rank, "owner_cp_rank")
+        if batch_index >= batch_size:
+            raise AttentionContractError("Split-KV batch_index is outside batch_size")
+        if tp_rank >= tp_world_size:
+            raise AttentionContractError("Split-KV tp_rank is outside tp_world_size")
+        if cp_rank >= cp_world_size:
+            raise AttentionContractError("Split-KV cp_rank is outside cp_world_size")
+        if owner_cp_rank >= cp_world_size:
+            raise AttentionContractError("Split-KV owner_cp_rank is outside cp_world_size")
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "batch_index": self.batch_index,
+            "tp_rank": self.tp_rank,
+            "cp_rank": self.cp_rank,
+            "owner_cp_rank": self.owner_cp_rank,
+        }
+
+
+@dataclass(frozen=True)
+class SplitKVRuntimePlanEntry:
+    """Actual plan for one batch/TP/CP consumer and logical KV owner."""
+
+    coordinate: SplitKVRuntimeCoordinate
+    expected_kv_range: tuple[int, int]
+    execution: SplitKVExecutionPlan
+
+    def validate(
+        self,
+        *,
+        batch_size: int,
+        tp_world_size: int,
+        cp_world_size: int,
+        total_kv_tokens: int,
+    ) -> None:
+        self.coordinate.validate(
+            batch_size=batch_size,
+            tp_world_size=tp_world_size,
+            cp_world_size=cp_world_size,
+        )
+        try:
+            start, end = self.expected_kv_range
+        except (TypeError, ValueError) as exc:
+            raise AttentionContractError(
+                "expected_kv_range must contain exactly (start, end)"
+            ) from exc
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+            or end > total_kv_tokens
+        ):
+            raise AttentionContractError(
+                "expected_kv_range must satisfy 0 <= start < end <= total_kv_tokens"
+            )
+        if self.execution.actual_mode is None:
+            raise AttentionContractError(
+                "complete Split-KV plan sets require actual runtime plans"
+            )
+        if (
+            self.execution.boundaries[0][0] != start
+            or self.execution.boundaries[-1][1] != end
+        ):
+            raise AttentionContractError(
+                "Split-KV execution boundaries must exactly cover expected_kv_range"
+            )
+        if any(
+            boundary_start < start or boundary_end > end
+            for boundary_start, boundary_end in self.execution.boundaries
+        ):
+            raise AttentionContractError(
+                "Split-KV execution boundary escapes expected_kv_range"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.coordinate.to_dict(),
+            "expected_kv_range": list(self.expected_kv_range),
+            **self.execution.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class SplitKVRuntimePlanSet:
+    """Complete actual Split-KV plans across batch, TP, CP, and KV owners.
+
+    Every CP consumer must report the plan used for every CP-owned KV range.
+    This duplicates owner plans across consumers intentionally: it detects one
+    rank silently choosing a different Split-K schedule or merge policy.
+    """
+
+    batch_size: int
+    tp_world_size: int
+    cp_world_size: int
+    total_kv_tokens: tuple[int, ...]
+    entries: tuple[SplitKVRuntimePlanEntry, ...]
+
+    def __post_init__(self) -> None:
+        batch_size = _positive_int(self.batch_size, "batch_size")
+        tp_world_size = _positive_int(self.tp_world_size, "tp_world_size")
+        cp_world_size = _positive_int(self.cp_world_size, "cp_world_size")
+        totals = _integer_tuple(self.total_kv_tokens, "total_kv_tokens")
+        if len(totals) != batch_size or any(total <= 0 for total in totals):
+            raise AttentionContractError(
+                "total_kv_tokens must contain one positive length per batch item"
+            )
+        object.__setattr__(self, "total_kv_tokens", totals)
+        entries = tuple(self.entries)
+        object.__setattr__(self, "entries", entries)
+        expected_coordinates = {
+            SplitKVRuntimeCoordinate(batch_index, tp_rank, cp_rank, owner_cp_rank)
+            for batch_index in range(batch_size)
+            for tp_rank in range(tp_world_size)
+            for cp_rank in range(cp_world_size)
+            for owner_cp_rank in range(cp_world_size)
+        }
+        actual_coordinates = [entry.coordinate for entry in entries]
+        if len(set(actual_coordinates)) != len(actual_coordinates):
+            raise AttentionContractError(
+                "Split-KV runtime plan set contains duplicate coordinates"
+            )
+        missing = expected_coordinates.difference(actual_coordinates)
+        extra = set(actual_coordinates).difference(expected_coordinates)
+        if missing or extra:
+            raise AttentionContractError(
+                "Split-KV runtime plan set coordinate coverage is incomplete; "
+                f"missing={_format_split_kv_coordinates(missing)}, "
+                f"extra={_format_split_kv_coordinates(extra)}"
+            )
+        for entry in entries:
+            entry.validate(
+                batch_size=batch_size,
+                tp_world_size=tp_world_size,
+                cp_world_size=cp_world_size,
+                total_kv_tokens=totals[entry.coordinate.batch_index],
+            )
+        self._validate_owner_coverage()
+        self._validate_rank_invariance()
+
+    def _validate_owner_coverage(self) -> None:
+        for batch_index, total in enumerate(self.total_kv_tokens):
+            for tp_rank in range(self.tp_world_size):
+                ranges = []
+                for owner_cp_rank in range(self.cp_world_size):
+                    matches = [
+                        entry
+                        for entry in self.entries
+                        if entry.coordinate.batch_index == batch_index
+                        and entry.coordinate.tp_rank == tp_rank
+                        and entry.coordinate.cp_rank == 0
+                        and entry.coordinate.owner_cp_rank == owner_cp_rank
+                    ]
+                    ranges.append(matches[0].expected_kv_range)
+                previous_end = 0
+                for start, end in ranges:
+                    if start != previous_end:
+                        raise AttentionContractError(
+                            "Split-KV owner ranges must be gap-free in CP owner order"
+                        )
+                    previous_end = end
+                if previous_end != total:
+                    raise AttentionContractError(
+                        "Split-KV owner ranges do not cover total_kv_tokens"
+                    )
+
+    def _validate_rank_invariance(self) -> None:
+        for batch_index in range(self.batch_size):
+            for owner_cp_rank in range(self.cp_world_size):
+                entries = sorted(
+                    (
+                        entry
+                        for entry in self.entries
+                        if entry.coordinate.batch_index == batch_index
+                        and entry.coordinate.owner_cp_rank == owner_cp_rank
+                    ),
+                    key=lambda entry: (
+                        entry.coordinate.tp_rank,
+                        entry.coordinate.cp_rank,
+                    ),
+                )
+                reference = entries[0]
+                for entry in entries[1:]:
+                    if entry.expected_kv_range != reference.expected_kv_range:
+                        raise AttentionContractError(
+                            "Split-KV owner range differs across TP/CP consumers"
+                        )
+                    try:
+                        validate_split_kv_alignment(
+                            reference.execution,
+                            entry.execution,
+                        )
+                    except AttentionContractError as exc:
+                        raise AttentionContractError(
+                            "Split-KV plan differs across TP/CP consumers for "
+                            f"batch={batch_index}, owner_cp={owner_cp_rank}: {exc}"
+                        ) from exc
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_size": self.batch_size,
+            "tp_world_size": self.tp_world_size,
+            "cp_world_size": self.cp_world_size,
+            "total_kv_tokens": list(self.total_kv_tokens),
+            "entries": [
+                entry.to_dict()
+                for entry in sorted(self.entries, key=lambda entry: entry.coordinate)
+            ],
+            "coverage": "complete_batch_tp_cp_owner_cartesian_product",
+        }
+
+
+def validate_split_kv_plan_set_alignment(
+    training: SplitKVRuntimePlanSet,
+    rollout: SplitKVRuntimePlanSet,
+) -> None:
+    """Fail closed unless complete train/rollout runtime plan sets align."""
+
+    topology_fields = (
+        "batch_size",
+        "tp_world_size",
+        "cp_world_size",
+        "total_kv_tokens",
+    )
+    topology_mismatches = [
+        field_name
+        for field_name in topology_fields
+        if getattr(training, field_name) != getattr(rollout, field_name)
+    ]
+    if topology_mismatches:
+        raise AttentionContractError(
+            "training/rollout Split-KV plan-set topology differs: "
+            + ", ".join(topology_mismatches)
+        )
+    training_by_coordinate = {
+        entry.coordinate: entry for entry in training.entries
+    }
+    rollout_by_coordinate = {entry.coordinate: entry for entry in rollout.entries}
+    if training_by_coordinate.keys() != rollout_by_coordinate.keys():
+        raise AttentionContractError(
+            "training/rollout Split-KV plan-set coordinates differ"
+        )
+    for coordinate in sorted(training_by_coordinate):
+        train_entry = training_by_coordinate[coordinate]
+        rollout_entry = rollout_by_coordinate[coordinate]
+        if train_entry.expected_kv_range != rollout_entry.expected_kv_range:
+            raise AttentionContractError(
+                f"training/rollout expected KV range differs at {coordinate}"
+            )
+        try:
+            validate_split_kv_alignment(
+                train_entry.execution,
+                rollout_entry.execution,
+            )
+        except AttentionContractError as exc:
+            raise AttentionContractError(
+                f"training/rollout Split-KV plan differs at {coordinate}: {exc}"
+                ) from exc
+
+
+def build_split_kv_runtime_plan_set(
+    total_kv_tokens: Iterable[int],
+    *,
+    tp_world_size: int,
+    cp_world_size: int,
+    split_kv: SplitKVSpec,
+    backend: str = "contract_reference",
+) -> SplitKVRuntimePlanSet:
+    """Build a complete owner-local plan set for contract tests and adapters."""
+
+    totals = _integer_tuple(total_kv_tokens, "total_kv_tokens")
+    if not totals or any(total < cp_world_size for total in totals):
+        raise AttentionContractError(
+            "contract plan sets require at least one KV token per CP owner"
+        )
+    tp_world_size = _positive_int(tp_world_size, "tp_world_size")
+    cp_world_size = _positive_int(cp_world_size, "cp_world_size")
+    if not isinstance(split_kv, SplitKVSpec):
+        raise AttentionContractError("split_kv must be a SplitKVSpec")
+
+    entries: list[SplitKVRuntimePlanEntry] = []
+    for batch_index, total in enumerate(totals):
+        base = total // cp_world_size
+        remainder = total % cp_world_size
+        owner_ranges: list[tuple[int, int]] = []
+        start = 0
+        for owner_cp_rank in range(cp_world_size):
+            end = start + base + (1 if owner_cp_rank < remainder else 0)
+            owner_ranges.append((start, end))
+            start = end
+        for tp_rank in range(tp_world_size):
+            for cp_rank in range(cp_world_size):
+                for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    local_total = owner_end - owner_start
+                    local = split_kv.resolve(local_total, backend=backend)
+                    execution = SplitKVExecutionPlan(
+                        requested_mode=local.requested_mode,
+                        requested_split_size=local.requested_split_size,
+                        actual_mode=local.actual_mode,
+                        actual_split_size=local.actual_split_size,
+                        boundaries=tuple(
+                            (owner_start + start, owner_start + end)
+                            for start, end in local.boundaries
+                        ),
+                        merge_order=local.merge_order,
+                        acc_dtype=local.acc_dtype,
+                        downcast_at=local.downcast_at,
+                        backend=local.backend,
+                        source=local.source,
+                        fallback=local.fallback,
+                        fallback_reason=local.fallback_reason,
+                    )
+                    entries.append(
+                        SplitKVRuntimePlanEntry(
+                            coordinate=SplitKVRuntimeCoordinate(
+                                batch_index=batch_index,
+                                tp_rank=tp_rank,
+                                cp_rank=cp_rank,
+                                owner_cp_rank=owner_cp_rank,
+                            ),
+                            expected_kv_range=(owner_start, owner_end),
+                            execution=execution,
+                        )
+                    )
+    return SplitKVRuntimePlanSet(
+        batch_size=len(totals),
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        total_kv_tokens=totals,
+        entries=tuple(entries),
+    )
+
+
+def _format_split_kv_coordinates(
+    coordinates: Iterable[SplitKVRuntimeCoordinate],
+) -> list[dict[str, int]]:
+    return [coordinate.to_dict() for coordinate in sorted(coordinates)]
 
 
 @dataclass(frozen=True)
@@ -536,6 +1181,7 @@ class AttentionContract:
     causal_offsets: tuple[int, ...] | None
     sharding: ShardingSpec
     reduction: ReductionSpec
+    split_kv: SplitKVSpec = field(default_factory=SplitKVSpec.disabled)
     kv_cache: KVCacheSpec | None = None
     rope: RoPESpec | None = None
     export_lse: bool = True
@@ -551,6 +1197,8 @@ class AttentionContract:
             raise AttentionContractError("sharding must be a ShardingSpec")
         if not isinstance(self.reduction, ReductionSpec):
             raise AttentionContractError("reduction must be a ReductionSpec")
+        if not isinstance(self.split_kv, SplitKVSpec):
+            raise AttentionContractError("split_kv must be a SplitKVSpec")
         if (
             self.mode is AttentionMode.PREFILL
             and query_sequence_length != self.sharding.local_sequence_length
@@ -713,6 +1361,7 @@ class AttentionContract:
             "lse_domain": "attention",
             "sharding": sharding,
             "reduction": reduction,
+            "split_kv": self.split_kv.to_dict(),
             "kv_cache": kv_cache,
             "rope": rope,
         }
@@ -734,6 +1383,10 @@ class AttentionBackendCapability:
     supports_kv_cache: bool = False
     supports_rope_metadata: bool = False
     supports_fused_rope_attention: bool = False
+    supports_split_kv_disabled: bool = True
+    supports_split_kv_fixed: bool = False
+    supports_split_kv_auto: bool = False
+    reports_actual_split_kv_plan: bool = False
     implementation_kind: str = "production"
 
     def __post_init__(self) -> None:
@@ -763,6 +1416,10 @@ class AttentionBackendCapability:
             "supports_kv_cache",
             "supports_rope_metadata",
             "supports_fused_rope_attention",
+            "supports_split_kv_disabled",
+            "supports_split_kv_fixed",
+            "supports_split_kv_auto",
+            "reports_actual_split_kv_plan",
         ):
             if not isinstance(getattr(self, field), bool):
                 raise AttentionContractError(f"{field} must be a bool")
@@ -811,6 +1468,17 @@ class AttentionBackendCapability:
             and not self.supports_fused_rope_attention
         ):
             reasons.append("fused RoPE+Attention boundary is unsupported")
+        split_support = {
+            SplitKVMode.DISABLED: self.supports_split_kv_disabled,
+            SplitKVMode.FIXED: self.supports_split_kv_fixed,
+            SplitKVMode.AUTO: self.supports_split_kv_auto,
+        }
+        if not split_support[contract.split_kv.mode]:
+            reasons.append(
+                f"Split-KV policy={contract.split_kv.mode.value} is unsupported"
+            )
+        if contract.split_kv.strict_consistency and not self.reports_actual_split_kv_plan:
+            reasons.append("actual Split-KV execution-plan provenance is unsupported")
         return tuple(reasons)
 
     def supports(self, contract: AttentionContract) -> bool:
@@ -830,6 +1498,10 @@ class AttentionBackendCapability:
             "supports_kv_cache": self.supports_kv_cache,
             "supports_rope_metadata": self.supports_rope_metadata,
             "supports_fused_rope_attention": self.supports_fused_rope_attention,
+            "supports_split_kv_disabled": self.supports_split_kv_disabled,
+            "supports_split_kv_fixed": self.supports_split_kv_fixed,
+            "supports_split_kv_auto": self.supports_split_kv_auto,
+            "reports_actual_split_kv_plan": self.reports_actual_split_kv_plan,
             "implementation_kind": self.implementation_kind,
         }
 
@@ -862,4 +1534,13 @@ __all__ = [
     "RoPESpec",
     "RoPEState",
     "ShardingSpec",
+    "build_split_kv_runtime_plan_set",
+    "SplitKVExecutionPlan",
+    "SplitKVMode",
+    "SplitKVRuntimeCoordinate",
+    "SplitKVRuntimePlanEntry",
+    "SplitKVRuntimePlanSet",
+    "SplitKVSpec",
+    "validate_split_kv_alignment",
+    "validate_split_kv_plan_set_alignment",
 ]
