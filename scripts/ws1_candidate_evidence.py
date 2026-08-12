@@ -32,8 +32,11 @@ def _object_path(value: Any) -> str:
 
 
 def _case_args(case: dict[str, Any], seed: int) -> SimpleNamespace:
-    shape = case["shape"]
-    operator_spec = case["operator_spec"]
+    try:
+        shape = case["shape"]
+        operator_spec = case["operator_spec"]
+    except KeyError as exc:
+        raise WorkloadError(f"candidate case missing {exc.args[0]!r}") from exc
     common: dict[str, Any] = {
         "op": operator_spec,
         "candidate": case["expected_backend_id"],
@@ -48,23 +51,28 @@ def _case_args(case: dict[str, Any], seed: int) -> SimpleNamespace:
         "eps": 1.0e-6,
         "seed": seed,
     }
-    if operator_spec == "det_gemm":
-        common.update(batch=1, seq=shape["M"], k_dim=shape["K"], n_dim=shape["N"])
-    elif operator_spec == "attention":
-        common.update(
-            batch=shape["B"],
-            seq=shape["Sq"],
-            skv=shape["Skv"],
-            n_heads=shape["Hq"],
-            n_kv_heads=shape["Hkv"],
-            causal=1,
-            use_padding=0,
-            scale_mode="default",
-        )
-    elif operator_spec in {"logp", "batch_invariant_logp"}:
-        common.update(batch=shape["B"], seq=shape["T"], vocab=shape["vocab"])
-    else:
-        raise WorkloadError(f"unsupported representative operator_spec {operator_spec!r}")
+    try:
+        if operator_spec == "det_gemm":
+            common.update(batch=1, seq=shape["M"], k_dim=shape["K"], n_dim=shape["N"])
+        elif operator_spec == "attention":
+            common.update(
+                batch=shape["B"],
+                seq=shape["Sq"],
+                skv=shape["Skv"],
+                n_heads=shape["Hq"],
+                n_kv_heads=shape["Hkv"],
+                causal=1,
+                use_padding=0,
+                scale_mode="default",
+            )
+        elif operator_spec in {"logp", "batch_invariant_logp"}:
+            common.update(batch=shape["B"], seq=shape["T"], vocab=shape["vocab"])
+        else:
+            raise WorkloadError(f"unsupported representative operator_spec {operator_spec!r}")
+    except KeyError as exc:
+        raise WorkloadError(
+            f"case {case.get('case_id')!r} {operator_spec!r} shape missing {exc.args[0]!r}"
+        ) from exc
     return SimpleNamespace(**common)
 
 
@@ -146,8 +154,9 @@ def main(argv: list[str] | None = None) -> int:
             if profiles.intersection(case["profile_ids"])
             and (not selected_ids or case["case_id"] in selected_ids)
         ]
-        if selected_ids - {case["case_id"] for case in cases}:
-            unknown = sorted(selected_ids - {case["case_id"] for case in cases})
+        resolved_ids = {case["case_id"] for case in cases}
+        if selected_ids - resolved_ids:
+            unknown = sorted(selected_ids - resolved_ids)
             raise WorkloadError(f"unknown or profile-filtered case IDs: {unknown}")
         device = torch.device("cuda:0")
         log_stream = sys.stderr if args.emit_json == "-" else sys.stdout
@@ -156,7 +165,14 @@ def main(argv: list[str] | None = None) -> int:
                 run_case(case, seed=manifest.seed + i, device=device)
                 for i, case in enumerate(cases)
             ]
-    except (RuntimeError, ValueError, WorkloadError) as exc:
+    except (
+        RuntimeError,
+        ValueError,
+        WorkloadError,
+        KeyError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

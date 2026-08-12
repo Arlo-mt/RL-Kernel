@@ -283,7 +283,7 @@ def validate_backend_provenance(
         "reference_dtype": policy.reference_dtype,
     }
     for field_name, expected in expected_dtypes.items():
-        actual = _dtype_name(getattr(provenance, field_name))
+        actual = normalize_dtype_name(getattr(provenance, field_name))
         if actual != expected:
             raise ContractResolveError(
                 f"backend provenance mismatch for {field_name}: expected "
@@ -550,14 +550,17 @@ def compute_logprob_aggregates(
     if not (lo < hi):
         raise ContractResolveError(f"clip_interval requires lo < hi, got [{lo}, {hi}]")
 
-    lhs = torch.as_tensor(lhs_logp).detach().float().reshape(-1)
-    rhs = torch.as_tensor(rhs_logp).detach().float().reshape(-1)
-    mask = torch.as_tensor(active_mask).detach().reshape(-1).bool()
-    if lhs.shape != rhs.shape or lhs.shape != mask.shape:
+    lhs_tensor = torch.as_tensor(lhs_logp).detach().float()
+    rhs_tensor = torch.as_tensor(rhs_logp).detach().float()
+    mask_tensor = torch.as_tensor(active_mask).detach().bool()
+    if lhs_tensor.shape != rhs_tensor.shape or lhs_tensor.shape != mask_tensor.shape:
         raise ContractResolveError(
-            f"lhs/rhs/mask shape mismatch: {tuple(lhs.shape)} vs "
-            f"{tuple(rhs.shape)} vs {tuple(mask.shape)}"
+            f"lhs/rhs/mask shape mismatch: {tuple(lhs_tensor.shape)} vs "
+            f"{tuple(rhs_tensor.shape)} vs {tuple(mask_tensor.shape)}"
         )
+    lhs = lhs_tensor.reshape(-1)
+    rhs = rhs_tensor.reshape(-1)
+    mask = mask_tensor.reshape(-1)
     active = int(mask.sum().item())
     if active == 0:
         raise ContractResolveError("empty active-token set is a hard fail for logprob aggregates")
@@ -918,7 +921,8 @@ def _lookup_cell(
     return base
 
 
-def _dtype_name(dtype: str | Any) -> str:
+def normalize_dtype_name(dtype: str | Any) -> str:
+    """Return the contract dtype name for a string alias or framework dtype."""
     if isinstance(dtype, str):
         name = dtype
         # Accept torch-style aliases.
@@ -996,6 +1000,11 @@ def _dtype_name(dtype: str | Any) -> str:
     raise ContractResolveError(f"unsupported dtype: {dtype!r}")
 
 
+# Private compatibility alias for callers outside this package that have not
+# migrated to the public normalizer yet.
+_dtype_name = normalize_dtype_name
+
+
 __all__ = [
     "ALL_DTYPES",
     "CHAIN_AGGREGATE_METRICS",
@@ -1017,6 +1026,7 @@ __all__ = [
     "default_clip_interval",
     "judge_logprob_aggregates",
     "load_contract",
+    "normalize_dtype_name",
     "resolve_chain_aggregate_thresholds",
     "resolve_comparison_roles",
     "resolve_dtype_policy",

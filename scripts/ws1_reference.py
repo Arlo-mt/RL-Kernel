@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.seed is not None and int(args.seed) != manifest.seed:
             raise WorkloadError(f"--seed {args.seed} does not match manifest seed {manifest.seed}")
         payload = workload.reference_payload(manifest, cell_id=args.cell_id, dtype=args.dtype)
-    except WorkloadError as exc:
+    except (WorkloadError, KeyError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

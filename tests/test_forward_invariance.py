@@ -13,6 +13,7 @@ import torch
 from rl_engine.kernels.gtest.forward_invariance import (
     ConfigSpec,
     ForwardInvarianceReport,
+    RuntimeObservation,
     TensorComparisonDetail,
     _validate_provenance,
 )
@@ -30,6 +31,9 @@ def assert_forward_batch_invariant(*args: Any, **kwargs: Any) -> ForwardInvarian
     kwargs.setdefault("candidate_id", "synthetic-test-candidate")
     kwargs.setdefault("device", "cpu:test-double")
     kwargs.setdefault("compute_capability", "synthetic")
+    kwargs.setdefault("observed_actual_backend", kwargs["provenance"].actual_backend)
+    kwargs.setdefault("observed_kernel_id", "synthetic-test-candidate")
+    kwargs.setdefault("observed_output_dtype", kwargs["provenance"].output_dtype)
     return _assert_forward_batch_invariant(*args, **kwargs)
 
 
@@ -420,6 +424,47 @@ class TestBackendProvenance:
             include_logprob_smoke=False,
         )
         assert report.provenance_valid is False
+        assert report.passed is False
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("observed_actual_backend", "triton"),
+            ("observed_kernel_id", "other-kernel"),
+            ("observed_output_dtype", "float32"),
+        ],
+    )
+    def test_runtime_observation_mismatch_fails_closed(self, contract, manifest, field, value):
+        kwargs = {
+            "observed_actual_backend": "cuda",
+            "observed_kernel_id": "synthetic-test-candidate",
+            "observed_output_dtype": "bfloat16",
+        }
+        kwargs[field] = value
+
+        def observed_op(config: ConfigSpec, **kwargs: Any):
+            return RuntimeObservation(
+                output=_make_identity_op()(config, **kwargs),
+                actual_backend="cuda",
+                kernel_id="synthetic-test-candidate",
+                output_dtype="bfloat16",
+                device="cpu:test-double",
+            )
+
+        report = _assert_forward_batch_invariant(
+            observed_op,
+            contract=contract,
+            manifest=manifest,
+            backend_profile="cuda_bf16",
+            provenance=_make_provenance(),
+            gold_fn=_make_identity_op(),
+            include_logprob_smoke=False,
+            candidate_id="synthetic-test-candidate",
+            device="cpu:test-double",
+            compute_capability="synthetic",
+            **kwargs,
+        )
+        assert report.metadata_valid is False
         assert report.passed is False
 
 

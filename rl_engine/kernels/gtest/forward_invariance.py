@@ -23,13 +23,11 @@ from rl_engine.kernels.gtest.tolerance import (
     BackendProvenance,
     ContractResolveError,
     LogprobAggregateVerdict,
-)
-from rl_engine.kernels.gtest.tolerance import _dtype_name as _normalize_dtype_name
-from rl_engine.kernels.gtest.tolerance import (
     compute_logprob_aggregates,
     default_clip_interval,
     judge_logprob_aggregates,
     load_contract,
+    normalize_dtype_name,
     resolve_comparison_roles,
     resolve_tolerance,
     validate_backend_provenance,
@@ -51,6 +49,8 @@ from rl_engine.testing.ws1_workload import (
     restore_logical_order_from_padded,
 )
 
+_normalize_dtype_name = normalize_dtype_name
+
 
 @dataclass(frozen=True)
 class ConfigSpec:
@@ -61,6 +61,17 @@ class ConfigSpec:
     logical_batch: LogicalBatch
     physical_layout: PhysicalLayout | PaddedBatch
     is_canonical: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimeObservation:
+    """Runtime facts returned alongside one candidate output."""
+
+    output: Any
+    actual_backend: str
+    kernel_id: str
+    output_dtype: str
+    device: str
 
 
 @dataclass(frozen=True)
@@ -157,6 +168,7 @@ class ForwardInvarianceReport:
     passed: bool
     provenance_valid: bool
     metadata_valid: bool
+    observed_kernel_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -176,6 +188,7 @@ class ForwardInvarianceReport:
             "passed": self.passed,
             "provenance_valid": self.provenance_valid,
             "metadata_valid": self.metadata_valid,
+            "observed_kernel_id": self.observed_kernel_id,
         }
 
 
@@ -378,7 +391,7 @@ def _collect_logical_outputs(
     config: ConfigSpec,
     *,
     op_kwargs: Mapping[str, Any] | None = None,
-) -> dict[tuple[str, int], torch.Tensor]:
+) -> tuple[dict[tuple[str, int], torch.Tensor], RuntimeObservation | None]:
     """Run op on a config and restore outputs to logical (sample_id, position) order."""
 
     kwargs = dict(op_kwargs) if op_kwargs else {}
@@ -387,8 +400,11 @@ def _collect_logical_outputs(
     else:
         raw_output = op(config=config, **kwargs)
 
+    observation = raw_output if isinstance(raw_output, RuntimeObservation) else None
+    if observation is not None:
+        raw_output = observation.output
     if isinstance(raw_output, dict):
-        return raw_output
+        return raw_output, observation
 
     if isinstance(raw_output, torch.Tensor):
         if isinstance(config.physical_layout, PaddedBatch):
@@ -401,9 +417,12 @@ def _collect_logical_outputs(
                     f"({len(config.physical_layout.restore_map)}, "
                     f"{config.physical_layout.padded_len})"
                 )
-            return restore_logical_order_from_padded(config.physical_layout, list(raw_output))
+            return (
+                restore_logical_order_from_padded(config.physical_layout, list(raw_output)),
+                observation,
+            )
         flat = raw_output.reshape(-1)
-        return restore_logical_order(config.physical_layout, list(flat))
+        return restore_logical_order(config.physical_layout, list(flat)), observation
 
     raise TypeError(f"op must return dict or Tensor, got {type(raw_output)!r}")
 
@@ -486,6 +505,9 @@ def assert_forward_batch_invariant(
     device: str = "unspecified",
     compute_capability: str | None = None,
     fallback_reason: str | None = None,
+    observed_actual_backend: str | None = None,
+    observed_kernel_id: str | None = None,
+    observed_output_dtype: str | None = None,
 ) -> ForwardInvarianceReport:
     """Run forward config-invariance and accuracy checks.
 
@@ -530,9 +552,17 @@ def assert_forward_batch_invariant(
         and compute_capability is not None
         and fallback_reason is None
     )
+    metadata_valid = metadata_valid and all(
+        value is not None
+        for value in (observed_actual_backend, observed_kernel_id, observed_output_dtype)
+    )
+    if provenance is not None and observed_actual_backend is not None:
+        metadata_valid = metadata_valid and observed_actual_backend == provenance.actual_backend
 
     canonical_config = next((c for c in config_list if c.is_canonical), config_list[0])
-    canonical_outputs = _collect_logical_outputs(op, canonical_config, op_kwargs=op_kwargs)
+    canonical_outputs, canonical_observation = _collect_logical_outputs(
+        op, canonical_config, op_kwargs=op_kwargs
+    )
 
     def expected_keys(config: ConfigSpec) -> set[tuple[str, int]]:
         return set(config.logical_batch.logical_keys(active_only=active_only))
@@ -551,12 +581,34 @@ def assert_forward_batch_invariant(
 
     canonical_keys = expected_keys(canonical_config)
     validate_keys(canonical_outputs, canonical_config, "canonical")
+    if canonical_observation is not None:
+        observed_device = str(canonical_observation.device)
+        report_device = str(device)
+        metadata_valid = metadata_valid and (
+            provenance is not None
+            and canonical_observation.actual_backend == provenance.actual_backend
+            and canonical_observation.actual_backend == observed_actual_backend
+            and canonical_observation.kernel_id == observed_kernel_id
+            and _normalize_dtype_name(canonical_observation.output_dtype)
+            == _normalize_dtype_name(observed_output_dtype)
+            and (
+                report_device == observed_device or report_device.startswith(observed_device + ":")
+            )
+            and _normalize_dtype_name(canonical_observation.output_dtype)
+            == _normalize_dtype_name(next(iter(canonical_outputs.values())).dtype)
+        )
 
     invariance_reports: list[InvarianceReport] = []
     for config in config_list:
         if config.is_canonical:
             continue
-        transformed_outputs = _collect_logical_outputs(op, config, op_kwargs=op_kwargs)
+        transformed_outputs, observation = _collect_logical_outputs(op, config, op_kwargs=op_kwargs)
+        if canonical_observation is not None and observation is not None:
+            metadata_valid = metadata_valid and (
+                observation.actual_backend == canonical_observation.actual_backend
+                and observation.kernel_id == canonical_observation.kernel_id
+                and observation.output_dtype == canonical_observation.output_dtype
+            )
         validate_keys(transformed_outputs, config, "transformed")
         detail = _align_and_compare_invariance(
             canonical_outputs,
@@ -587,9 +639,9 @@ def assert_forward_batch_invariant(
         candidate_outputs = (
             canonical_outputs
             if config.is_canonical
-            else _collect_logical_outputs(op, config, op_kwargs=op_kwargs)
+            else _collect_logical_outputs(op, config, op_kwargs=op_kwargs)[0]
         )
-        gold_outputs = _collect_logical_outputs(gold_fn, config, op_kwargs=op_kwargs)
+        gold_outputs = _collect_logical_outputs(gold_fn, config, op_kwargs=op_kwargs)[0]
         keys = expected_keys(config)
         validate_keys(candidate_outputs, config, "candidate accuracy")
         validate_keys(gold_outputs, config, "reference accuracy")
@@ -659,6 +711,7 @@ def assert_forward_batch_invariant(
         passed=overall_passed,
         provenance_valid=provenance_valid,
         metadata_valid=metadata_valid,
+        observed_kernel_id=observed_kernel_id,
     )
 
 
@@ -675,7 +728,7 @@ def _run_logprob_smoke(
 ) -> LogprobSmokeResult:
     """Run selected-logprob aggregate smoke check."""
 
-    gold_outputs = _collect_logical_outputs(gold_fn, config, op_kwargs=op_kwargs)
+    gold_outputs = _collect_logical_outputs(gold_fn, config, op_kwargs=op_kwargs)[0]
     if active_keys is not None:
         shared = sorted(k for k in candidate_outputs if k in gold_outputs and k in active_keys)
     else:

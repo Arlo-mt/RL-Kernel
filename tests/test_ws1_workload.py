@@ -472,7 +472,7 @@ def test_architecture_shrink_rejected():
 def test_missing_matrix_cell_rejected():
     raw = json.loads(default_manifest_path().read_text(encoding="utf-8"))
     raw["primary_matrix"]["cells"] = raw["primary_matrix"]["cells"][:3]
-    with pytest.raises(WorkloadError, match="primary_matrix.cells"):
+    with pytest.raises(WorkloadError, match=r"primary_matrix\.cells"):
         validate_manifest(raw)
 
 

@@ -444,10 +444,13 @@ def _validate_primary_matrix(matrix: Mapping[str, Any], fixtures: Mapping[str, A
         mode = cell["batch_mode"]
         if mode not in ("singleton_aggregate", "batched"):
             raise WorkloadError(f"unknown batch_mode {mode!r}")
-        if mode == "singleton_aggregate" and "singleton_aggregate" in str(
-            cell.get("comparison_lhs_role", "")
-        ):
-            raise WorkloadError("singleton_aggregate must not be used as a comparison role")
+        for role_key in ("comparison_lhs_role", "comparison_rhs_role"):
+            role = str(cell.get(role_key, ""))
+            if role in _FORBIDDEN_COMPARISON_ROLES:
+                raise WorkloadError(
+                    f"cell {cell.get('cell_id')!r}: {role_key} must not use "
+                    f"forbidden comparison role {role!r}"
+                )
 
 
 def _validate_fixtures(fixtures: Mapping[str, Any], matrix: Mapping[str, Any]) -> None:
@@ -701,7 +704,17 @@ def _validate_fixture_case_bindings(
         },
     }
     for case in cases:
-        required = expected_shapes[case["fixture_id"]][case["family"]]
+        fixture_shapes = expected_shapes.get(case["fixture_id"])
+        if fixture_shapes is None:
+            raise WorkloadError(
+                f"case {case['case_id']}: unknown fixture_id {case['fixture_id']!r}"
+            )
+        required = fixture_shapes.get(case["family"])
+        if required is None:
+            raise WorkloadError(
+                f"case {case['case_id']}: fixture {case['fixture_id']!r} does not "
+                f"cover family {case['family']!r}"
+            )
         mismatched = {
             key: (case["shape"].get(key), value)
             for key, value in required.items()

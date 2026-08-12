@@ -9,10 +9,11 @@ from typing import Any
 
 import torch
 
-from rl_engine.kernels.gtest.tolerance import BackendProvenance, ContractResolveError
-from rl_engine.kernels.gtest.tolerance import _dtype_name as _normalize_dtype_name
 from rl_engine.kernels.gtest.tolerance import (
+    BackendProvenance,
+    ContractResolveError,
     load_contract,
+    normalize_dtype_name,
     resolve_tolerance,
     validate_backend_provenance,
 )
@@ -159,8 +160,8 @@ def _run_candidate(
                 f"{candidate.provenance.actual_backend!r}"
             )
         for case in cases:
-            case_dtype = _normalize_dtype_name(case.dtype)
-            provenance_dtype = _normalize_dtype_name(candidate.provenance.execution_dtype)
+            case_dtype = normalize_dtype_name(case.dtype)
+            provenance_dtype = normalize_dtype_name(candidate.provenance.execution_dtype)
             if case_dtype != provenance_dtype:
                 raise ContractResolveError(
                     f"case {case.name!r} dtype {case.dtype} does not match "
@@ -337,14 +338,16 @@ def _compare_case_outputs(
         )
     if candidate.provenance is not None:
         for candidate_output, gold_output in zip(candidate_outputs, gold_outputs, strict=True):
-            candidate_dtype = _dtype_name(candidate_output.dtype)
-            gold_dtype = _dtype_name(gold_output.dtype)
-            if candidate_dtype != candidate.provenance.output_dtype:
+            candidate_dtype = normalize_dtype_name(candidate_output.dtype)
+            gold_dtype = normalize_dtype_name(gold_output.dtype)
+            provenance_output_dtype = normalize_dtype_name(candidate.provenance.output_dtype)
+            provenance_reference_dtype = normalize_dtype_name(candidate.provenance.reference_dtype)
+            if candidate_dtype != provenance_output_dtype:
                 raise ContractResolveError(
                     f"candidate output dtype {candidate_dtype!r} disagrees with provenance "
                     f"output_dtype {candidate.provenance.output_dtype!r}"
                 )
-            if gold_dtype != candidate.provenance.reference_dtype:
+            if gold_dtype != provenance_reference_dtype:
                 raise ContractResolveError(
                     f"gold output dtype {gold_dtype!r} disagrees with provenance "
                     f"reference_dtype {candidate.provenance.reference_dtype!r}"
@@ -518,7 +521,7 @@ def _resolve_tolerance(
         return float(spec.atol), float(spec.rtol)
 
     # Legacy fixtures used by some unit tests that inject a minimal contract.
-    dtype_name = _dtype_name(dtype)
+    dtype_name = normalize_dtype_name(dtype)
     if arch_key is not None:
         arch_values = (
             contract["accuracy"]
@@ -532,16 +535,6 @@ def _resolve_tolerance(
 
     values = contract["accuracy"]["default"][op_class][dtype_name]
     return float(values["atol"]), float(values.get("rtol", 0.0))
-
-
-def _dtype_name(dtype: torch.dtype) -> str:
-    if dtype is torch.float32:
-        return "float32"
-    if dtype is torch.bfloat16:
-        return "bfloat16"
-    if dtype is torch.float16:
-        return "float16"
-    raise ValueError(f"unsupported dtype: {dtype}")
 
 
 def _compare_output(

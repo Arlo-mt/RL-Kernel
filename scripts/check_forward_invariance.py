@@ -21,8 +21,10 @@ if str(REPO_ROOT) not in sys.path:
 from rl_engine.kernels.gtest import (  # noqa: E402
     BackendProvenance,
     ConfigSpec,
+    RuntimeObservation,
     assert_forward_batch_invariant,
     load_contract,
+    normalize_dtype_name,
 )
 from rl_engine.kernels.gtest.operator_specs import OP_SPECS, _load_object  # noqa: E402
 from rl_engine.kernels.gtest.tolerance import resolve_dtype_policy  # noqa: E402
@@ -126,12 +128,25 @@ def _make_runner(
     dtype: torch.dtype,
     vocab_size: int,
     reference: bool,
+    backend_family: str | None = None,
+    kernel_id: str | None = None,
 ):
     def run(config: ConfigSpec, **_: Any) -> torch.Tensor:
         logits, targets = _make_inputs(config, device=device, dtype=dtype, vocab_size=vocab_size)
         if reference:
             logits = logits.float()
-        return operator(logits, targets)
+        output = operator(logits, targets)
+        if reference:
+            return output
+        if backend_family is None or kernel_id is None:
+            raise RuntimeError("candidate telemetry must declare backend_family and kernel_id")
+        return RuntimeObservation(
+            output=output,
+            actual_backend=backend_family,
+            kernel_id=kernel_id,
+            output_dtype=normalize_dtype_name(output.dtype),
+            device=str(output.device),
+        )
 
     return run
 
@@ -230,6 +245,8 @@ def main() -> None:
             dtype=torch.bfloat16,
             vocab_size=args.vocab,
             reference=False,
+            backend_family=family,
+            kernel_id=_object_path(candidate_op),
         ),
         contract=contract,
         manifest=manifest,
@@ -248,6 +265,9 @@ def main() -> None:
         candidate_id=f"{_object_path(candidate_op)}::{node['expected_kernel_config_id']}",
         device=f"{device}:{torch.cuda.get_device_name(device)}",
         compute_capability=cc,
+        observed_actual_backend=family,
+        observed_kernel_id=_object_path(candidate_op),
+        observed_output_dtype=policy.output_dtype_default,
     )
 
     if args.json:
