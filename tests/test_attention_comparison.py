@@ -239,6 +239,15 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert drift.provenance["cache_position"] == [[4, 5], [4, 5]]
     assert drift.provenance["cp_block_owners"] == [[0, 1, 0], [0, 1, 0]]
     assert drift.provenance["merge_order"] == "global_block_index"
+    assert drift.provenance["accum_dtype"] == "fp32"
+    assert drift.provenance["lse_dtype"] == "fp32"
+    assert drift.provenance["downcast_at"] == "final_write"
+    assert drift.provenance["output_dtype"] == "float32"
+    assert drift.provenance["scale"] == pytest.approx(1.0 / (8.0**0.5))
+    assert drift.provenance["q_dtype"] == "float32"
+    assert drift.provenance["k_cache_dtype"] == "float32"
+    assert drift.provenance["v_cache_dtype"] == "float32"
+    assert drift.provenance["scale"] == pytest.approx(1.0 / (8.0**0.5))
     assert drift.provenance["logical_merge_orders"] == [
         [[0, 1, 2], [0, 1, 2]],
         [[0, 1, 2], [0, 1, 2]],
@@ -369,6 +378,88 @@ def test_decode_replay_rejects_stale_prefix_cache_content():
 
     with pytest.raises(ValueError, match="prefix_cache_fingerprint"):
         run_decode_kv_replay(replace(inputs, k_cache=stale_k))
+
+
+def test_decode_replay_rejects_prefix_cache_theta_drift():
+    inputs = _decode_inputs(prefix_cache_enabled=True)
+
+    with pytest.raises(ValueError, match="prefix_cache_fingerprint"):
+        run_decode_kv_replay(replace(inputs, rope_theta=10_000.0))
+
+
+def test_decode_replay_rejects_prefix_cache_storage_dtype_drift():
+    inputs = _decode_inputs(prefix_cache_enabled=True)
+
+    with pytest.raises(ValueError, match="prefix_cache_fingerprint"):
+        run_decode_kv_replay(replace(inputs, k_cache=inputs.k_cache.to(torch.bfloat16)))
+
+
+def test_decode_replay_rejects_unsupported_rope_cast_boundary():
+    inputs = _decode_inputs(prefix_cache_enabled=True)
+
+    with pytest.raises(ValueError, match="rope_cast_at"):
+        run_decode_kv_replay(replace(inputs, rope_cast_at="before_rope"))
+
+
+@pytest.mark.parametrize("theta", [float("nan"), float("inf"), float("-inf")])
+def test_decode_replay_rejects_non_finite_rope_theta(theta):
+    with pytest.raises(ValueError, match="rope_theta"):
+        run_decode_kv_replay(replace(_decode_inputs(), rope_theta=theta))
+
+
+def test_decode_replay_rejects_noncanonical_inactive_page_metadata():
+    inputs = _decode_inputs()
+    bad_metadata = replace(
+        inputs.metadata,
+        block_table=torch.cat(
+            [inputs.metadata.block_table, torch.zeros((2, 1), dtype=torch.long)], dim=1
+        ),
+        cp_block_owners=torch.cat(
+            [inputs.metadata.cp_block_owners, torch.full((2, 1), -1, dtype=torch.long)], dim=1
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unused block_table"):
+        run_decode_kv_replay(replace(inputs, metadata=bad_metadata))
+
+
+def test_decode_replay_rejects_negative_active_cp_owner():
+    inputs = _decode_inputs()
+    bad_owners = inputs.metadata.cp_block_owners.clone()
+    bad_owners[0, 1] = -1
+
+    with pytest.raises(ValueError, match="active cp_block_owners"):
+        run_decode_kv_replay(
+            replace(inputs, metadata=replace(inputs.metadata, cp_block_owners=bad_owners))
+        )
+
+
+def test_decode_replay_rejects_noncanonical_inactive_cp_owner():
+    inputs = _decode_inputs()
+    bad_metadata = replace(
+        inputs.metadata,
+        block_table=torch.cat(
+            [inputs.metadata.block_table, torch.full((2, 1), -1, dtype=torch.long)], dim=1
+        ),
+        cp_block_owners=torch.cat(
+            [inputs.metadata.cp_block_owners, torch.zeros((2, 1), dtype=torch.long)], dim=1
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unused cp_block_owners"):
+        run_decode_kv_replay(replace(inputs, metadata=bad_metadata))
+
+
+@pytest.mark.parametrize("scale", [float("nan"), float("inf"), 0.0, -1.0])
+def test_decode_replay_rejects_invalid_scale(scale):
+    with pytest.raises(ValueError, match="scale"):
+        run_decode_kv_replay(replace(_decode_inputs(), scale=scale))
+
+
+def test_decode_replay_rejects_non_floating_cache_dtypes():
+    inputs = _decode_inputs()
+    with pytest.raises(ValueError, match="floating-point dtypes"):
+        run_decode_kv_replay(replace(inputs, q=inputs.q.to(torch.int32)))
 
 
 def test_decode_replay_fails_loudly_on_position_identity_mismatch():

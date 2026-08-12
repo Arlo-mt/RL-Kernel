@@ -17,6 +17,7 @@ import importlib.metadata as importlib_metadata
 import inspect
 import math
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Literal
 
 import torch
@@ -329,6 +330,13 @@ def _run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> Attenti
             "materialization": "full_logical_kv",
             "lse_domain": "attention",
             "accum_dtype": "fp32",
+            "lse_dtype": "fp32",
+            "downcast_at": "final_write",
+            "output_dtype": str(inputs.output_dtype).replace("torch.", ""),
+            "scale": _decode_attention_scale(inputs),
+            "q_dtype": str(inputs.q.dtype).replace("torch.", ""),
+            "k_cache_dtype": str(inputs.k_cache.dtype).replace("torch.", ""),
+            "v_cache_dtype": str(inputs.v_cache.dtype).replace("torch.", ""),
         },
     )
 
@@ -433,7 +441,13 @@ def _run_decode_kv_replay(
         "lse_domain": "attention",
         "lse_exported": True,
         "accum_dtype": "fp32",
+        "lse_dtype": "fp32",
         "downcast_at": "final_write",
+        "output_dtype": str(inputs.output_dtype).replace("torch.", ""),
+        "scale": _decode_attention_scale(inputs),
+        "q_dtype": str(inputs.q.dtype).replace("torch.", ""),
+        "k_cache_dtype": str(inputs.k_cache.dtype).replace("torch.", ""),
+        "v_cache_dtype": str(inputs.v_cache.dtype).replace("torch.", ""),
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
@@ -667,16 +681,24 @@ def decode_prefix_cache_fingerprint(
     """Fingerprint logical prefix positions and cached K/V content.
 
     The fingerprint is invariant to physical page placement because cache slots
-    are first restored to logical token order. It intentionally includes the
-    cached-K RoPE state and tensor dtypes so it identifies the actual replay
-    boundary rather than only the token positions.
+    are first restored to logical token order. It includes every cache-side
+    RoPE materialization fact that can change the replayed K values, so a
+    prefix cannot be reused under a different rotary configuration.
     """
 
     prefix_length = _positive_int(prefix_length, "prefix_length")
     if bool((inputs.metadata.kv_seq_lens < prefix_length).any()):
         raise ValueError("prefix_length must not exceed any kv_seq_lens entry")
     digest = hashlib.sha256()
-    digest.update(f"k_rope_state={inputs.metadata.k_cache_rope_state}\n".encode())
+    digest.update(
+        (
+            f"k_rope_state={inputs.metadata.k_cache_rope_state};"
+            f"rope_theta={float(inputs.rope_theta):.17g};"
+            f"rotary_dim={_decode_rope_rotary_dim(inputs)};"
+            f"rope_cast_at={inputs.rope_cast_at};"
+            f"k_rope_output_dtype={_decode_k_rope_output_dtype(inputs)}\n"
+        ).encode()
+    )
     digest.update(f"k_dtype={inputs.k_cache.dtype};v_dtype={inputs.v_cache.dtype}\n".encode())
     for batch_index in range(inputs.q.size(0)):
         slots = _decode_logical_slot_index(inputs, batch_index)[:prefix_length]
@@ -823,6 +845,14 @@ def _decode_k_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
 
 def _decode_rope_rotary_dim(inputs: DecodeAttentionInputs) -> int:
     return inputs.q.size(-1) if inputs.rope_rotary_dim is None else inputs.rope_rotary_dim
+
+
+def _decode_attention_scale(inputs: DecodeAttentionInputs) -> float:
+    return (
+        1.0 / math.sqrt(inputs.q.size(-1))
+        if inputs.scale is None
+        else float(inputs.scale)
+    )
 
 
 def _rope_output_dtype(inputs: AttentionComparisonInputs) -> torch.dtype:
@@ -1191,9 +1221,12 @@ def _validate_comparison_inputs(inputs: AttentionComparisonInputs) -> None:
             raise ValueError("active_token_mask must have shape [B, Sq]")
         if inputs.active_token_mask.dtype != torch.bool:
             raise ValueError("active_token_mask must be bool")
-    if not isinstance(inputs.rope_theta, (float, int)) or isinstance(inputs.rope_theta, bool):
-        raise ValueError("rope_theta must be a positive number")
-    if float(inputs.rope_theta) <= 0:
+    if (
+        not isinstance(inputs.rope_theta, (float, int))
+        or isinstance(inputs.rope_theta, bool)
+        or not math.isfinite(float(inputs.rope_theta))
+        or float(inputs.rope_theta) <= 0
+    ):
         raise ValueError("rope_theta must be a positive number")
     if inputs.rope_output_dtype is not None and not isinstance(
         inputs.rope_output_dtype, torch.dtype
@@ -1236,6 +1269,25 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
     _validate_qkv(inputs.q, inputs.k_cache, inputs.v_cache)
     if inputs.q.device != inputs.k_cache.device or inputs.q.device != inputs.v_cache.device:
         raise ValueError("q, k_cache, and v_cache must be on the same device")
+    if (
+        not inputs.q.is_floating_point()
+        or not inputs.k_cache.is_floating_point()
+        or not inputs.v_cache.is_floating_point()
+    ):
+        raise ValueError("q, k_cache, and v_cache must use floating-point dtypes")
+    if (
+        not isinstance(inputs.output_dtype, torch.dtype)
+        or not inputs.output_dtype.is_floating_point
+    ):
+        raise ValueError("output_dtype must be a floating-point torch.dtype")
+    if inputs.scale is not None:
+        if (
+            not isinstance(inputs.scale, (float, int))
+            or isinstance(inputs.scale, bool)
+            or not math.isfinite(float(inputs.scale))
+            or float(inputs.scale) <= 0
+        ):
+            raise ValueError("scale must be a positive finite number")
     metadata = inputs.metadata
     batch, _, sq, head_dim = inputs.q.shape
     cache_capacity = inputs.k_cache.size(2)
@@ -1274,8 +1326,6 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
     if metadata.cp_block_owners is not None:
         if metadata.cp_block_owners.shape != metadata.block_table.shape:
             raise ValueError("cp_block_owners must have the same shape as block_table")
-        if bool((metadata.cp_block_owners < 0).any()):
-            raise ValueError("cp_block_owners must be non-negative")
     if not torch.equal(metadata.cache_position, metadata.query_position_ids):
         raise ValueError("cache_position and query_position_ids must identify the same positions")
     if metadata.q_rope_state not in {"pre_rope", "post_rope"}:
@@ -1303,7 +1353,12 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
         if inputs.rope_rotary_dim != head_dim:
             raise ValueError("rope_rotary_dim must equal head_dim")
         _positive_int(inputs.rope_rotary_dim, "rope_rotary_dim")
-    if float(inputs.rope_theta) <= 0:
+    if (
+        not isinstance(inputs.rope_theta, (float, int))
+        or isinstance(inputs.rope_theta, bool)
+        or not math.isfinite(float(inputs.rope_theta))
+        or float(inputs.rope_theta) <= 0
+    ):
         raise ValueError("rope_theta must be a positive number")
     if inputs.q_rope_output_dtype is not None and not isinstance(
         inputs.q_rope_output_dtype, torch.dtype
@@ -1313,6 +1368,12 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
         inputs.k_cache_rope_output_dtype, torch.dtype
     ):
         raise ValueError("k_cache_rope_output_dtype must be a torch.dtype when provided")
+    for name, dtype in (
+        ("q_rope_output_dtype", inputs.q_rope_output_dtype),
+        ("k_cache_rope_output_dtype", inputs.k_cache_rope_output_dtype),
+    ):
+        if dtype is not None and not dtype.is_floating_point:
+            raise ValueError(f"{name} must be a floating-point torch.dtype")
     if (
         metadata.q_rope_state == "post_rope"
         and inputs.q_rope_output_dtype is not None
@@ -1347,6 +1408,15 @@ def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
             raise ValueError("block_table contains an out-of-range physical page")
         if torch.unique(pages).numel() != block_count:
             raise ValueError("active block_table entries must not contain duplicate pages")
+        if bool((metadata.block_table[batch_index, block_count:] != -1).any()):
+            raise ValueError("unused block_table entries must be -1")
+        if metadata.cp_block_owners is not None:
+            active_owners = metadata.cp_block_owners[batch_index, :block_count]
+            inactive_owners = metadata.cp_block_owners[batch_index, block_count:]
+            if bool((active_owners < 0).any()):
+                raise ValueError("active cp_block_owners must be non-negative")
+            if bool((inactive_owners != -1).any()):
+                raise ValueError("unused cp_block_owners entries must be -1")
         slot_index = _decode_logical_slot_index(inputs, batch_index)
         active_slot_mask = torch.zeros(cache_capacity, device=inputs.q.device, dtype=torch.bool)
         active_slot_mask[slot_index] = True
@@ -1420,7 +1490,7 @@ def _chunk_bounds(length: int, chunk_size: int) -> list[tuple[int, int]]:
 
 
 def _positive_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return int(value)
 

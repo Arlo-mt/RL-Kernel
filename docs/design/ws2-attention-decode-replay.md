@@ -22,10 +22,12 @@ layout:
 - `cp_block_owners` records logical CP ownership without changing merge order.
 
 Metadata is validated before attention runs. Missing pages, duplicated active
-pages, out-of-range positions, mismatched RoPE positions, or inconsistent
-prefix-cache identity fail with an explicit error. Prefix identity is verified
-by recomputing a physical-layout-invariant SHA-256 fingerprint over logical
-prefix positions and cached K/V content. The current reference requires
+pages, non-canonical `-1` page/owner tails, out-of-range positions, mismatched
+RoPE positions, or inconsistent prefix-cache identity fail with an explicit
+error. Prefix identity is verified by recomputing a physical-layout-invariant
+SHA-256 fingerprint over logical prefix positions, cached K/V content, storage
+dtypes, and the cache-side RoPE materialization configuration (`theta`, rotary
+dimension, cast boundary, and output dtype). The current reference requires
 `rope_cast_at="after_rope"` and `rope_rotary_dim == head_dim`; partial rotary is
 not supported yet. Q and cached K retain separate RoPE output dtype contracts so
 mixed rollout query/KV storage dtypes are represented faithfully.
@@ -35,7 +37,9 @@ mixed rollout query/KV storage dtypes are represented faithfully.
 The replay restores logical KV order from the block table, computes one FP32
 partial `(out, lse)` state per logical block, and merges partial states in
 `global_block_index` order. CP ownership and physical page order never determine
-the numerical reduction order. Downcast occurs only at final write.
+the numerical reduction order. Both the full logical-KV reference and paged
+replay accumulate and export LSE in FP32; output downcast occurs only at final
+write.
 
 For each decode query at logical position `t`, only cached positions less than
 or equal to `t` participate. This supports `Sq=1` and few-query replay.
@@ -64,6 +68,9 @@ report instead of failing the core decode harness.
 
 The harness models CP block ownership on one device so cache construction,
 logical ordering, RoPE identity, and deterministic merging can be attributed
-without communication. A distributed caller can gather the same partial states
-using the PR3 transport layer; numerical merging must still happen in the fixed
-logical order described above.
+without communication. It does not implement P2P NCCL transport, production
+custom CUDA all-gather/reduce-scatter, FlashInfer runtime execution, or training
+backward. A distributed caller can gather the same partial states using the PR3
+transport layer; numerical merging must still happen in the fixed logical order
+described above. This PR targets the shared `test` integration branch and has a
+logical dependency on PR2/#253.
