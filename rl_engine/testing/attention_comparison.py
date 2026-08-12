@@ -11,6 +11,7 @@ single device while preserving global causal positions and attention-domain LSE.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.metadata as importlib_metadata
 import inspect
@@ -20,10 +21,16 @@ from typing import Any, Literal
 
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    SplitKVExecutionPlan,
+    SplitKVMode,
+    SplitKVSpec,
+)
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.testing.reference_ops import selected_logprobs_reference
 
 MergeBackend = Literal["rl_kernel", "transformer_engine"]
+RoPEState = Literal["pre_rope", "post_rope"]
 
 _TE_CONTEXT_PARALLEL_MODULE = (
     "transformer_engine.pytorch.attention.dot_product_attention.context_parallel"
@@ -69,6 +76,56 @@ class AttentionComparisonInputs:
     rope_rotary_dim: int | None = None
     rope_cast_at: str = "after_rope"
     rope_output_dtype: torch.dtype | None = None
+
+
+@dataclass(frozen=True)
+class DecodeKVCacheMetadata:
+    """Logical identity and physical layout for decode-stage cached KV.
+
+    ``block_table`` maps logical KV blocks to physical cache pages.  Positions
+    are stored per physical cache slot; unused slots must contain ``-1``.
+    Keeping both mappings explicit lets the harness distinguish layout changes
+    from changes to the logical token sequence.
+    """
+
+    cache_position: torch.Tensor
+    kv_seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    global_token_positions: torch.Tensor
+    query_position_ids: torch.Tensor
+    key_position_ids: torch.Tensor
+    page_size: int
+    prefix_cache_key: str | None = None
+    prefix_cache_enabled: bool = False
+    prefix_length: int = 0
+    prefix_cache_fingerprint: str | None = None
+    q_rope_state: RoPEState = "post_rope"
+    k_cache_rope_state: RoPEState = "post_rope"
+    cp_block_owners: torch.Tensor | None = None
+    cp_world_size: int = 1
+
+
+@dataclass(frozen=True)
+class DecodeAttentionInputs:
+    """Decode queries and physically paged KV cache used by the PR6 harness."""
+
+    q: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    metadata: DecodeKVCacheMetadata
+    scale: float | None = None
+    output_dtype: torch.dtype = torch.float32
+    rope_theta: float = 1_000_000.0
+    rope_rotary_dim: int | None = None
+    rope_cast_at: str = "after_rope"
+    q_rope_output_dtype: torch.dtype | None = None
+    k_cache_rope_output_dtype: torch.dtype | None = None
+    lm_head_weight: torch.Tensor | None = None
+    target_ids: torch.Tensor | None = None
+    active_token_mask: torch.Tensor | None = None
+    k_new: torch.Tensor | None = None
+    v_new: torch.Tensor | None = None
+    split_kv: SplitKVSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +265,218 @@ def compare_single_gpu_rope_attention(
     candidates = [run_fused_like_rope_attention(inputs)]
     drifts = tuple(_compare_path(candidate, reference, inputs) for candidate in candidates)
     return AttentionComparisonReport(reference_name=reference.name, drifts=drifts)
+
+
+def compare_decode_kv_replay(
+    inputs: DecodeAttentionInputs,
+    *,
+    include_transformer_engine: bool = False,
+) -> AttentionComparisonReport:
+    """Compare paged decode replay with a logical full-KV teacher-forcing view."""
+
+    _validate_decode_inputs(inputs)
+    reference = _run_decode_full_prefill_reference(inputs)
+    candidates = [_run_decode_kv_replay(inputs, merge_backend="rl_kernel")]
+    unavailable: list[str] = []
+    if include_transformer_engine:
+        try:
+            candidates.append(_run_decode_kv_replay(inputs, merge_backend="transformer_engine"))
+        except TransformerEngineUnavailable as exc:
+            unavailable.append(f"transformer_engine_decode_kv_replay: {exc}")
+    drifts = tuple(_compare_decode_path(candidate, reference, inputs) for candidate in candidates)
+    return AttentionComparisonReport(
+        reference_name=reference.name,
+        drifts=drifts,
+        unavailable=tuple(unavailable),
+    )
+
+
+def run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> AttentionPathResult:
+    """Materialize the full logical KV sequence for each decode query.
+
+    This is the teacher-forcing side of the PR6 comparison.  It deliberately
+    ignores physical page boundaries after restoring logical token order.
+    """
+
+    _validate_decode_inputs(inputs)
+    return _run_decode_full_prefill_reference(inputs)
+
+
+def _run_decode_full_prefill_reference(inputs: DecodeAttentionInputs) -> AttentionPathResult:
+    outs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    for batch_index in range(inputs.q.size(0)):
+        q, k, v, logical_positions = _decode_logical_qkv(inputs, batch_index)
+        batch_out: list[torch.Tensor] = []
+        batch_lse: list[torch.Tensor] = []
+        for query_index in range(q.size(2)):
+            query_position = int(inputs.metadata.cache_position[batch_index, query_index].item())
+            visible = logical_positions <= query_position
+            out, lse = _attention_with_lse(
+                q[:, :, query_index : query_index + 1, :],
+                k[:, :, visible, :],
+                v[:, :, visible, :],
+                causal=False,
+                scale=inputs.scale,
+                key_padding_mask=None,
+                q_start=0,
+                k_start=0,
+                total_query_len=1,
+                total_kv_len=int(visible.sum().item()),
+                output_dtype=inputs.output_dtype,
+            )
+            batch_out.append(out)
+            batch_lse.append(lse)
+        outs.append(torch.cat(batch_out, dim=2))
+        lses.append(torch.cat(batch_lse, dim=2))
+    return AttentionPathResult(
+        name="full_prefill_decode_reference",
+        out=torch.cat(outs, dim=0),
+        lse=torch.cat(lses, dim=0),
+        provenance={
+            "attention_mode": "decode",
+            "materialization": "full_logical_kv",
+            "lse_domain": "attention",
+            "accum_dtype": "fp32",
+        },
+    )
+
+
+def run_decode_kv_replay(
+    inputs: DecodeAttentionInputs,
+    *,
+    merge_backend: MergeBackend = "rl_kernel",
+) -> AttentionPathResult:
+    """Replay decode over physical KV pages and merge by logical block index."""
+
+    _validate_decode_inputs(inputs)
+    return _run_decode_kv_replay(inputs, merge_backend=merge_backend)
+
+
+def _run_decode_kv_replay(
+    inputs: DecodeAttentionInputs,
+    *,
+    merge_backend: MergeBackend,
+) -> AttentionPathResult:
+    outs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    merge_orders: list[list[list[int]]] = []
+    actual_split_plans: list[list[dict[str, Any]]] = []
+    cp_block_owners: list[list[int]] = []
+    split_kv = _resolved_decode_split_kv(inputs)
+    for batch_index in range(inputs.q.size(0)):
+        q, k, v, logical_positions = _decode_logical_qkv(inputs, batch_index)
+        owners = _logical_block_owners(inputs, batch_index)
+        cp_block_owners.append(owners)
+        batch_out: list[torch.Tensor] = []
+        batch_lse: list[torch.Tensor] = []
+        batch_orders: list[list[int]] = []
+        batch_split_plans: list[dict[str, Any]] = []
+        for query_index in range(q.size(2)):
+            query_position = int(inputs.metadata.cache_position[batch_index, query_index].item())
+            states: list[_PartialAttentionState] = []
+            order: list[int] = []
+            visible_count = int((logical_positions <= query_position).sum().item())
+            split_bounds = _decode_split_bounds(visible_count, split_kv)
+            for block_index, (block_start, block_end) in enumerate(
+                split_bounds
+            ):
+                block_positions = logical_positions[block_start:block_end]
+                visible = block_positions <= query_position
+                if not bool(visible.any()):
+                    continue
+                visible_end = block_start + int(visible.sum().item())
+                out, lse = _attention_with_lse(
+                    q[:, :, query_index : query_index + 1, :],
+                    k[:, :, block_start:visible_end, :],
+                    v[:, :, block_start:visible_end, :],
+                    causal=False,
+                    scale=inputs.scale,
+                    key_padding_mask=None,
+                    q_start=0,
+                    k_start=block_start,
+                    total_query_len=1,
+                    total_kv_len=visible_end,
+                    output_dtype=torch.float32,
+                )
+                states.append(
+                    _PartialAttentionState(
+                        out=out,
+                        lse=lse,
+                        block_start=block_index,
+                        block_end=block_index + 1,
+                    )
+                )
+                order.append(block_index)
+            if not states:
+                raise ValueError("each decode query must have at least one visible cached KV token")
+            out, lse = _merge_partial_states(states, backend=merge_backend)
+            batch_out.append(out.to(inputs.output_dtype))
+            batch_lse.append(lse)
+            batch_orders.append(order)
+            plan = SplitKVExecutionPlan(
+                requested_mode=split_kv.mode,
+                requested_split_size=split_kv.fixed_split_size,
+                actual_mode=split_kv.mode,
+                actual_split_size=split_kv.fixed_split_size,
+                boundaries=tuple(split_bounds),
+                backend=f"{merge_backend}_decode_kv_replay",
+                source="reference_execution",
+            )
+            batch_split_plans.append(plan.to_dict())
+        merge_orders.append(batch_orders)
+        actual_split_plans.append(batch_split_plans)
+        outs.append(torch.cat(batch_out, dim=2))
+        lses.append(torch.cat(batch_lse, dim=2))
+
+    provenance: dict[str, Any] = {
+        "attention_mode": "decode",
+        "decode_semantics": (
+            "past_kv_plus_new_kv_append" if inputs.k_new is not None else "cache_replay"
+        ),
+        "past_kv_lengths": inputs.metadata.kv_seq_lens.tolist(),
+        "new_kv_length": (0 if inputs.k_new is None else inputs.k_new.size(2)),
+        "materialization": "paged_kv_replay",
+        "sq": inputs.q.size(2),
+        "page_size": inputs.metadata.page_size,
+        "cache_position": inputs.metadata.cache_position.tolist(),
+        "kv_seq_lens": inputs.metadata.kv_seq_lens.tolist(),
+        "block_table": inputs.metadata.block_table.tolist(),
+        "global_token_positions": inputs.metadata.global_token_positions.tolist(),
+        "query_position_ids": inputs.metadata.query_position_ids.tolist(),
+        "key_position_ids": inputs.metadata.key_position_ids.tolist(),
+        "prefix_cache_enabled": inputs.metadata.prefix_cache_enabled,
+        "prefix_cache_key": inputs.metadata.prefix_cache_key,
+        "prefix_length": inputs.metadata.prefix_length,
+        "prefix_cache_fingerprint": inputs.metadata.prefix_cache_fingerprint,
+        "q_rope_state": inputs.metadata.q_rope_state,
+        "k_cache_rope_state": inputs.metadata.k_cache_rope_state,
+        "rope_theta": float(inputs.rope_theta),
+        "rotary_dim": _decode_rope_rotary_dim(inputs),
+        "rope_cast_at": inputs.rope_cast_at,
+        "q_rope_output_dtype": str(_decode_q_rope_output_dtype(inputs)).replace("torch.", ""),
+        "k_cache_rope_output_dtype": str(_decode_k_rope_output_dtype(inputs)).replace("torch.", ""),
+        "cp_block_owners": cp_block_owners,
+        "cp_world_size": inputs.metadata.cp_world_size,
+        "requested_split_kv_policy": split_kv.mode.value,
+        "requested_split_kv_size": split_kv.fixed_split_size,
+        "actual_split_kv_plans": actual_split_plans,
+        "merge_order": "global_block_index",
+        "logical_merge_orders": merge_orders,
+        "merge_backend": merge_backend,
+        "lse_domain": "attention",
+        "lse_exported": True,
+        "accum_dtype": "fp32",
+        "downcast_at": "final_write",
+    }
+    if merge_backend == "transformer_engine":
+        provenance.update(_te_context_parallel_provenance())
+    return AttentionPathResult(
+        name=f"{merge_backend}_decode_kv_replay",
+        out=torch.cat(outs, dim=0),
+        lse=torch.cat(lses, dim=0),
+        provenance=provenance,
+    )
 
 
 def run_full_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
@@ -424,6 +693,39 @@ def transformer_engine_context_parallel_available() -> bool:
     return True
 
 
+def decode_prefix_cache_fingerprint(
+    inputs: DecodeAttentionInputs,
+    *,
+    prefix_length: int,
+) -> str:
+    """Fingerprint logical prefix positions and cached K/V content.
+
+    The fingerprint is invariant to physical page placement because cache slots
+    are first restored to logical token order. It intentionally includes the
+    cached-K RoPE state and tensor dtypes so it identifies the actual replay
+    boundary rather than only the token positions.
+    """
+
+    prefix_length = _positive_int(prefix_length, "prefix_length")
+    if bool((inputs.metadata.kv_seq_lens < prefix_length).any()):
+        raise ValueError("prefix_length must not exceed any kv_seq_lens entry")
+    digest = hashlib.sha256()
+    digest.update(f"k_rope_state={inputs.metadata.k_cache_rope_state}\n".encode())
+    digest.update(f"k_dtype={inputs.k_cache.dtype};v_dtype={inputs.v_cache.dtype}\n".encode())
+    for batch_index in range(inputs.q.size(0)):
+        slots = _decode_logical_slot_index(inputs, batch_index)[:prefix_length]
+        for tensor in (
+            inputs.metadata.global_token_positions[batch_index, slots],
+            inputs.metadata.key_position_ids[batch_index, slots],
+            inputs.k_cache[batch_index, :, slots, :],
+            inputs.v_cache[batch_index, :, slots, :],
+        ):
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(str(tensor.dtype).encode())
+            digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _compare_path(
     candidate: AttentionPathResult,
     reference: AttentionPathResult,
@@ -454,6 +756,25 @@ def _compare_path(
     )
 
 
+def _compare_decode_path(
+    candidate: AttentionPathResult,
+    reference: AttentionPathResult,
+    inputs: DecodeAttentionInputs,
+) -> AttentionPathDrift:
+    dlogp = None
+    if inputs.lm_head_weight is not None and inputs.target_ids is not None:
+        candidate_logp = _selected_logps_from_decode_attention(candidate.out, inputs)
+        reference_logp = _selected_logps_from_decode_attention(reference.out, inputs)
+        dlogp = _drift_stats(candidate_logp, reference_logp, mask=inputs.active_token_mask)
+    return AttentionPathDrift(
+        candidate_name=candidate.name,
+        out=_drift_stats(candidate.out, reference.out),
+        lse=_drift_stats(candidate.lse, reference.lse),
+        dlogp=dlogp,
+        provenance=candidate.provenance,
+    )
+
+
 def _apply_rope_to_qk(inputs: AttentionComparisonInputs) -> tuple[torch.Tensor, torch.Tensor]:
     _validate_rope_inputs(inputs)
     assert inputs.rope_positions is not None
@@ -462,6 +783,97 @@ def _apply_rope_to_qk(inputs: AttentionComparisonInputs) -> tuple[torch.Tensor, 
     q = rope.forward_fp32(inputs.q, inputs.rope_positions, theta=inputs.rope_theta).to(output_dtype)
     k = rope.forward_fp32(inputs.k, inputs.rope_positions, theta=inputs.rope_theta).to(output_dtype)
     return q, k
+
+
+def _decode_logical_qkv(
+    inputs: DecodeAttentionInputs,
+    batch_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Restore one batch's cache to logical order and materialize RoPE state."""
+
+    metadata = inputs.metadata
+    slot_index = _decode_logical_slot_index(inputs, batch_index)
+    logical_position_tensor = metadata.global_token_positions[batch_index, slot_index].long()
+    k = inputs.k_cache[batch_index : batch_index + 1, :, slot_index, :]
+    v = inputs.v_cache[batch_index : batch_index + 1, :, slot_index, :]
+    q = inputs.q[batch_index : batch_index + 1]
+
+    rope = NativeRoPEOp()
+    if metadata.q_rope_state == "pre_rope":
+        q = rope.forward_fp32(
+            q,
+            metadata.query_position_ids[batch_index : batch_index + 1],
+            theta=inputs.rope_theta,
+        ).to(_decode_q_rope_output_dtype(inputs))
+    if metadata.k_cache_rope_state == "pre_rope":
+        key_positions = metadata.key_position_ids[batch_index, slot_index].unsqueeze(0)
+        k = rope.forward_fp32(k, key_positions, theta=inputs.rope_theta).to(
+            _decode_k_rope_output_dtype(inputs)
+        )
+    if inputs.k_new is not None:
+        assert inputs.v_new is not None
+        k_new = inputs.k_new[batch_index : batch_index + 1]
+        if metadata.k_cache_rope_state == "pre_rope":
+            k_new = rope.forward_fp32(
+                k_new,
+                metadata.query_position_ids[batch_index : batch_index + 1],
+                theta=inputs.rope_theta,
+            ).to(_decode_k_rope_output_dtype(inputs))
+        k = torch.cat((k, k_new), dim=2)
+        v = torch.cat((v, inputs.v_new[batch_index : batch_index + 1]), dim=2)
+        logical_position_tensor = torch.cat(
+            (
+                logical_position_tensor,
+                metadata.query_position_ids[batch_index].long(),
+            )
+        )
+    return q, k, v, logical_position_tensor
+
+
+def _decode_logical_slot_index(
+    inputs: DecodeAttentionInputs,
+    batch_index: int,
+) -> torch.Tensor:
+    metadata = inputs.metadata
+    sequence_length = int(metadata.kv_seq_lens[batch_index].item())
+    logical_block_count = math.ceil(sequence_length / metadata.page_size)
+    logical_index = torch.arange(
+        sequence_length,
+        device=inputs.k_cache.device,
+        dtype=torch.long,
+    )
+    pages = metadata.block_table[batch_index, :logical_block_count].long()
+    return (
+        pages[logical_index // metadata.page_size] * metadata.page_size
+        + logical_index % metadata.page_size
+    )
+
+
+def _logical_block_owners(inputs: DecodeAttentionInputs, batch_index: int) -> list[int]:
+    block_count = math.ceil(
+        int(inputs.metadata.kv_seq_lens[batch_index].item()) / inputs.metadata.page_size
+    )
+    if inputs.metadata.cp_block_owners is None:
+        return [0] * block_count
+    return [
+        int(owner) for owner in inputs.metadata.cp_block_owners[batch_index, :block_count].tolist()
+    ]
+
+
+def _decode_q_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
+    return inputs.q.dtype if inputs.q_rope_output_dtype is None else inputs.q_rope_output_dtype
+
+
+def _decode_k_rope_output_dtype(inputs: DecodeAttentionInputs) -> torch.dtype:
+    return (
+        inputs.k_cache.dtype
+        if inputs.k_cache_rope_output_dtype is None
+        else inputs.k_cache_rope_output_dtype
+    )
+
+
+def _decode_rope_rotary_dim(inputs: DecodeAttentionInputs) -> int:
+    return inputs.q.size(-1) if inputs.rope_rotary_dim is None else inputs.rope_rotary_dim
 
 
 def _rope_output_dtype(inputs: AttentionComparisonInputs) -> torch.dtype:
@@ -743,6 +1155,28 @@ def _selected_logps_from_attention(
     )
 
 
+def _selected_logps_from_decode_attention(
+    out: torch.Tensor,
+    inputs: DecodeAttentionInputs,
+) -> torch.Tensor:
+    if inputs.lm_head_weight is None or inputs.target_ids is None:
+        raise ValueError("lm_head_weight and target_ids are required for decode dlogp drift")
+    batch, heads, seq, dim = out.shape
+    hidden = out.transpose(1, 2).reshape(batch, seq, heads * dim)
+    if inputs.lm_head_weight.shape[1] != hidden.size(-1):
+        raise ValueError(
+            "lm_head_weight hidden dimension must equal Hq * D; "
+            f"got {inputs.lm_head_weight.shape[1]} and {hidden.size(-1)}"
+        )
+    logits = torch.matmul(hidden.float(), inputs.lm_head_weight.float().transpose(0, 1))
+    return selected_logprobs_reference(
+        logits,
+        inputs.target_ids,
+        mask=inputs.active_token_mask,
+        output_dtype=torch.float32,
+    )
+
+
 def _drift_stats(
     candidate: torch.Tensor,
     reference: torch.Tensor,
@@ -849,6 +1283,193 @@ def _validate_rope_inputs(inputs: AttentionComparisonInputs) -> None:
         raise ValueError("rope_positions must have shape [Sq] or [B, Sq]")
 
 
+def _validate_decode_inputs(inputs: DecodeAttentionInputs) -> None:
+    _validate_qkv(inputs.q, inputs.k_cache, inputs.v_cache)
+    if inputs.q.device != inputs.k_cache.device or inputs.q.device != inputs.v_cache.device:
+        raise ValueError("q, k_cache, and v_cache must be on the same device")
+    metadata = inputs.metadata
+    batch, _, sq, head_dim = inputs.q.shape
+    cache_capacity = inputs.k_cache.size(2)
+    page_size = _positive_int(metadata.page_size, "page_size")
+    if cache_capacity % page_size != 0:
+        raise ValueError("physical KV cache capacity must be divisible by page_size")
+    physical_page_count = cache_capacity // page_size
+    if metadata.cache_position.shape != (batch, sq):
+        raise ValueError("cache_position must have shape [B, Sq]")
+    if metadata.query_position_ids.shape != (batch, sq):
+        raise ValueError("query_position_ids must have shape [B, Sq]")
+    if metadata.kv_seq_lens.shape != (batch,):
+        raise ValueError("kv_seq_lens must have shape [B]")
+    if metadata.block_table.ndim != 2 or metadata.block_table.size(0) != batch:
+        raise ValueError("block_table must have shape [B, max_blocks]")
+    expected_cache_shape = (batch, cache_capacity)
+    if metadata.global_token_positions.shape != expected_cache_shape:
+        raise ValueError("global_token_positions must have shape [B, cache_capacity]")
+    if metadata.key_position_ids.shape != expected_cache_shape:
+        raise ValueError("key_position_ids must have shape [B, cache_capacity]")
+    integer_tensors = {
+        "cache_position": metadata.cache_position,
+        "query_position_ids": metadata.query_position_ids,
+        "kv_seq_lens": metadata.kv_seq_lens,
+        "block_table": metadata.block_table,
+        "global_token_positions": metadata.global_token_positions,
+        "key_position_ids": metadata.key_position_ids,
+    }
+    if metadata.cp_block_owners is not None:
+        integer_tensors["cp_block_owners"] = metadata.cp_block_owners
+    for name, tensor in integer_tensors.items():
+        if tensor.device != inputs.q.device:
+            raise ValueError(f"{name} must be on the same device as q/k/v")
+        if tensor.dtype not in {torch.int32, torch.int64, torch.long}:
+            raise ValueError(f"{name} must contain integers")
+    if metadata.cp_block_owners is not None:
+        if metadata.cp_block_owners.shape != metadata.block_table.shape:
+            raise ValueError("cp_block_owners must have the same shape as block_table")
+        if bool((metadata.cp_block_owners < 0).any()):
+            raise ValueError("cp_block_owners must be non-negative")
+        cp_world_size = _positive_int(metadata.cp_world_size, "cp_world_size")
+        if bool((metadata.cp_block_owners >= cp_world_size).any()):
+            raise ValueError("cp_block_owners must be smaller than cp_world_size")
+    if not torch.equal(metadata.cache_position, metadata.query_position_ids):
+        raise ValueError("cache_position and query_position_ids must identify the same positions")
+    if metadata.q_rope_state not in {"pre_rope", "post_rope"}:
+        raise ValueError("q_rope_state must be 'pre_rope' or 'post_rope'")
+    if metadata.k_cache_rope_state not in {"pre_rope", "post_rope"}:
+        raise ValueError("k_cache_rope_state must be 'pre_rope' or 'post_rope'")
+    if metadata.prefix_cache_enabled:
+        if not metadata.prefix_cache_key:
+            raise ValueError("prefix_cache_key is required when prefix cache is enabled")
+        _positive_int(metadata.prefix_length, "prefix_length")
+        if not metadata.prefix_cache_fingerprint:
+            raise ValueError("prefix_cache_fingerprint is required when prefix cache is enabled")
+    elif (
+        metadata.prefix_cache_key is not None
+        or metadata.prefix_length != 0
+        or metadata.prefix_cache_fingerprint is not None
+    ):
+        raise ValueError(
+            "prefix cache key/fingerprint must be None and prefix_length must be 0 "
+            "when prefix cache is disabled"
+        )
+    if inputs.rope_cast_at != "after_rope":
+        raise ValueError("rope_cast_at must be 'after_rope' for the current fp32 RoPE reference")
+    if inputs.rope_rotary_dim is not None:
+        if inputs.rope_rotary_dim != head_dim:
+            raise ValueError("rope_rotary_dim must equal head_dim")
+        _positive_int(inputs.rope_rotary_dim, "rope_rotary_dim")
+    if float(inputs.rope_theta) <= 0:
+        raise ValueError("rope_theta must be a positive number")
+    if inputs.q_rope_output_dtype is not None and not isinstance(
+        inputs.q_rope_output_dtype, torch.dtype
+    ):
+        raise ValueError("q_rope_output_dtype must be a torch.dtype when provided")
+    if inputs.k_cache_rope_output_dtype is not None and not isinstance(
+        inputs.k_cache_rope_output_dtype, torch.dtype
+    ):
+        raise ValueError("k_cache_rope_output_dtype must be a torch.dtype when provided")
+    if (inputs.k_new is None) != (inputs.v_new is None):
+        raise ValueError("k_new and v_new must be provided together")
+    append_mode = inputs.k_new is not None
+    if append_mode:
+        assert inputs.k_new is not None and inputs.v_new is not None
+        if inputs.k_new.shape != inputs.v_new.shape:
+            raise ValueError("k_new and v_new must have matching shapes")
+        expected_new_shape = (batch, inputs.k_cache.size(1), sq, head_dim)
+        if inputs.k_new.shape != expected_new_shape:
+            raise ValueError("k_new and v_new must have shape [B, Hkv, Sq, D]")
+        if inputs.k_new.device != inputs.q.device or inputs.v_new.device != inputs.q.device:
+            raise ValueError("k_new and v_new must be on the same device as q")
+    if inputs.split_kv is not None and not isinstance(inputs.split_kv, SplitKVSpec):
+        raise ValueError("split_kv must be a SplitKVSpec when provided")
+    if inputs.split_kv is not None and inputs.split_kv.mode is SplitKVMode.AUTO:
+        raise ValueError("decode replay requires disabled or fixed Split-KV, not auto")
+    if (
+        metadata.q_rope_state == "post_rope"
+        and inputs.q_rope_output_dtype is not None
+        and inputs.q.dtype != inputs.q_rope_output_dtype
+    ):
+        raise ValueError("post-RoPE q dtype must match q_rope_output_dtype")
+    if (
+        metadata.k_cache_rope_state == "post_rope"
+        and inputs.k_cache_rope_output_dtype is not None
+        and inputs.k_cache.dtype != inputs.k_cache_rope_output_dtype
+    ):
+        raise ValueError("post-RoPE k_cache dtype must match k_cache_rope_output_dtype")
+    if (inputs.lm_head_weight is None) != (inputs.target_ids is None):
+        raise ValueError("lm_head_weight and target_ids must be provided together")
+    if inputs.target_ids is not None and inputs.target_ids.shape != (batch, sq):
+        raise ValueError("target_ids must have shape [B, Sq]")
+    if inputs.active_token_mask is not None:
+        if inputs.active_token_mask.shape != (batch, sq):
+            raise ValueError("active_token_mask must have shape [B, Sq]")
+        if inputs.active_token_mask.dtype != torch.bool:
+            raise ValueError("active_token_mask must be bool")
+
+    for batch_index in range(batch):
+        sequence_length = int(metadata.kv_seq_lens[batch_index].item())
+        if sequence_length <= 0 or sequence_length > cache_capacity:
+            raise ValueError("each kv_seq_lens entry must be in [1, cache_capacity]")
+        block_count = math.ceil(sequence_length / page_size)
+        if block_count > metadata.block_table.size(1):
+            raise ValueError("block_table does not contain enough logical KV blocks")
+        pages = metadata.block_table[batch_index, :block_count]
+        if bool(((pages < 0) | (pages >= physical_page_count)).any()):
+            raise ValueError("block_table contains an out-of-range physical page")
+        if torch.unique(pages).numel() != block_count:
+            raise ValueError("active block_table entries must not contain duplicate pages")
+        slot_index = _decode_logical_slot_index(inputs, batch_index)
+        active_slot_mask = torch.zeros(cache_capacity, device=inputs.q.device, dtype=torch.bool)
+        active_slot_mask[slot_index] = True
+        if bool((metadata.global_token_positions[batch_index, ~active_slot_mask] != -1).any()):
+            raise ValueError("unused global_token_positions entries must be -1")
+        if bool((metadata.key_position_ids[batch_index, ~active_slot_mask] != -1).any()):
+            raise ValueError("unused key_position_ids entries must be -1")
+        global_positions = metadata.global_token_positions[batch_index, slot_index]
+        position_offset = int(global_positions[0].item())
+        expected_positions = torch.arange(
+            position_offset,
+            position_offset + sequence_length,
+            device=inputs.q.device,
+            dtype=global_positions.dtype,
+        )
+        if not torch.equal(global_positions, expected_positions):
+            raise ValueError(
+                "block_table/global_token_positions must reconstruct logical positions "
+                "as one contiguous global range"
+            )
+        key_positions = metadata.key_position_ids[batch_index, slot_index]
+        if not torch.equal(key_positions, global_positions):
+            raise ValueError("key_position_ids must match cached global token positions")
+        cache_positions = metadata.cache_position[batch_index]
+        if append_mode:
+            expected_new_positions = torch.arange(
+                position_offset + sequence_length,
+                position_offset + sequence_length + sq,
+                device=inputs.q.device,
+                dtype=cache_positions.dtype,
+            )
+            if not torch.equal(cache_positions, expected_new_positions):
+                raise ValueError(
+                    "append cache_position must identify the contiguous new-token suffix"
+                )
+        elif bool((cache_positions < position_offset).any()) or bool(
+            (cache_positions >= position_offset + sequence_length).any()
+        ):
+            raise ValueError("cache_position must refer to a token present in the KV cache")
+        if sq > 1 and bool((cache_positions[1:] <= cache_positions[:-1]).any()):
+            raise ValueError("few-query cache_position values must be strictly increasing")
+
+    if metadata.prefix_cache_enabled:
+        actual_fingerprint = decode_prefix_cache_fingerprint(
+            inputs,
+            prefix_length=metadata.prefix_length,
+        )
+        if actual_fingerprint != metadata.prefix_cache_fingerprint:
+            raise ValueError(
+                "prefix_cache_fingerprint does not match the logical prefix positions/content"
+            )
+
+
 def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [B, H, S, D]")
@@ -861,13 +1482,17 @@ def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
 
 
 def _validate_partial_states(states: list[_PartialAttentionState]) -> None:
+    if not states:
+        raise ValueError("at least one partial attention state is required")
     first = states[0]
+    if first.block_start != 0:
+        raise ValueError("partial state coverage must start at logical KV token 0")
     previous_end = first.block_end
     for state in states[1:]:
         if state.out.shape != first.out.shape or state.lse.shape != first.lse.shape:
             raise ValueError("all partial states must have matching shapes")
-        if state.block_start < previous_end:
-            raise ValueError("partial state block ranges must not overlap")
+        if state.block_start != previous_end:
+            raise ValueError("partial state block ranges must be gap-free and non-overlapping")
         previous_end = state.block_end
 
 
@@ -883,6 +1508,23 @@ def _chunk_bounds(length: int, chunk_size: int) -> list[tuple[int, int]]:
     return bounds
 
 
+def _resolved_decode_split_kv(inputs: DecodeAttentionInputs) -> SplitKVSpec:
+    # Existing replay behavior used one partial state per logical cache page.
+    # Keep that as the explicit default while allowing disabled/fixed sweeps on
+    # the same physical page layout.
+    return inputs.split_kv or SplitKVSpec.fixed(inputs.metadata.page_size)
+
+
+def _decode_split_bounds(length: int, split_kv: SplitKVSpec) -> list[tuple[int, int]]:
+    if split_kv.mode is SplitKVMode.AUTO:
+        raise ValueError("decode replay cannot materialize an unknown auto Split-KV plan")
+    chunk_size = length
+    if split_kv.mode is SplitKVMode.FIXED:
+        assert split_kv.fixed_split_size is not None
+        chunk_size = split_kv.fixed_split_size
+    return _chunk_bounds(length, chunk_size)
+
+
 def _positive_int(value: int, name: str) -> int:
     if isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -894,13 +1536,19 @@ __all__ = [
     "AttentionComparisonReport",
     "AttentionPathDrift",
     "AttentionPathResult",
+    "DecodeAttentionInputs",
+    "DecodeKVCacheMetadata",
     "DriftStats",
     "TransformerEngineUnavailable",
     "compare_single_gpu_rope_attention",
     "compare_single_gpu_attention",
+    "compare_decode_kv_replay",
+    "decode_prefix_cache_fingerprint",
     "run_chunked_query_attention",
     "run_fused_like_rope_attention",
     "run_full_attention",
+    "run_decode_full_prefill_reference",
+    "run_decode_kv_replay",
     "run_paged_kv_attention",
     "run_unfused_rope_attention",
     "transformer_engine_context_parallel_available",
