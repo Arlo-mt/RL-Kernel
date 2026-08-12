@@ -330,10 +330,10 @@ def _validate_model_identity(identity: Mapping[str, Any]) -> None:
         digest = str(shard.get("sha256", ""))
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise WorkloadError("every weight shard must pin a lowercase SHA-256")
-    expected = weight_snapshot_hash(shards)
+    expected_content_hash = weight_snapshot_hash(shards)
     if weight["content_hash_algorithm"] != "sha256-of-sorted-shard-records-v1":
         raise WorkloadError("unsupported weight_snapshot content_hash_algorithm")
-    if weight["content_hash"] != expected:
+    if weight["content_hash"] != expected_content_hash:
         raise WorkloadError("weight_snapshot content_hash does not match shard records")
 
 
@@ -682,7 +682,7 @@ def _validate_fixture_case_bindings(
     long = fixtures["long_full_model_fixture"]
     primary_total_tokens = sum(int(sample["seq_len"]) for sample in fixtures["samples"])
     primary_max_seq = max(int(sample["seq_len"]) for sample in fixtures["samples"])
-    expected_shapes = {
+    expected_shapes: dict[str, dict[str, dict[str, Any]]] = {
         "short_full_model_seq8": {
             "gemm": {"M": int(short["seq_len"])},
             "logprob": {"B": 1, "T": int(short["seq_len"]) - int(short["prompt_len"])},
