@@ -8,6 +8,7 @@ with fp32 online-softmax arithmetic in logical global-block order.
 """
 
 import contextlib
+import json
 import math
 
 import pytest
@@ -16,7 +17,9 @@ import torch
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
+    compare_cp_attention_backward,
     merge_attention_partial_states,
+    split_kv_execution_plan_provenance,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
@@ -26,6 +29,7 @@ _N_HEADS = 32
 _N_KV = 8
 _HEAD_DIM = 128
 _ATOL = 3.0e-6
+_GRAD_ATOL = 1.0e-5
 
 
 @contextlib.contextmanager
@@ -350,6 +354,203 @@ def test_cp2_chunked_gradients_match_cp1_reference():
     torch.testing.assert_close(v_cp.grad, v_ref.grad, atol=1.0e-5, rtol=0.0)
 
 
+def test_backward_report_cp2_prefill_matches_cp1_reference():
+    q, k, v = _qkv(1, 5, 5, seed=15, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn(1, 4, 5, 8, generator=torch.Generator().manual_seed(16))
+
+    with _single_thread():
+        report = compare_cp_attention_backward(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            candidate_cp_world_size=2,
+            output_dtype=torch.float32,
+        )
+
+    assert report.reference_name == "cp1_backward_reference"
+    drift = report.drifts[0]
+    assert drift.candidate_name == "cp2_backward"
+    assert drift.dq.max_abs <= _GRAD_ATOL
+    assert drift.dk.max_abs <= _GRAD_ATOL
+    assert drift.dv.max_abs <= _GRAD_ATOL
+    assert drift.out.max_abs <= _ATOL
+    assert drift.lse.max_abs <= _ATOL
+    assert len(drift.per_rank) == 2
+    assert drift.per_rank[0].dq.active_count > 0
+    assert drift.per_rank[1].dk.active_count > 0
+    assert drift.provenance["saved_forward_state"][0] == "out"
+    assert drift.provenance["merge_order"] == "global_block_index"
+    assert drift.provenance["te_backward_oracle"] == "not_used"
+    assert drift.provenance["decode_backward"] == "not_supported"
+    json.dumps(report.to_dict())
+
+
+def test_backward_report_cp2_chunked_prefill_matches_cp1_reference():
+    q, k, v = _qkv(1, 6, 6, seed=17, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn(1, 4, 6, 8, generator=torch.Generator().manual_seed(18))
+
+    with _single_thread():
+        report = compare_cp_attention_backward(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            candidate_cp_world_size=2,
+            candidate_kv_chunk_size=2,
+            output_dtype=torch.float32,
+        )
+
+    drift = report.drifts[0]
+    assert drift.candidate_name == "cp2_chunked_backward"
+    assert drift.dq.max_abs <= _GRAD_ATOL
+    assert drift.dk.max_abs <= _GRAD_ATOL
+    assert drift.dv.max_abs <= _GRAD_ATOL
+    assert drift.provenance["attention_mode"] == "chunked_prefill"
+    assert drift.provenance["kv_chunk_size"] == 2
+    assert drift.provenance["requested_split_kv_policy"] == "fixed"
+    assert drift.provenance["actual_split_kv_plans"] == [
+        {
+            "owner_cp_rank": 0,
+            "requested_split_kv_policy": "fixed",
+            "requested_split_kv_size": 2,
+            "actual_split_kv_policy": "fixed",
+            "actual_split_kv_size": 2,
+            "actual_split_kv_count": 2,
+            "actual_split_boundaries": [[0, 2], [2, 3]],
+            "split_kv_merge_order": "global_block_index",
+            "split_kv_accum_dtype": "fp32",
+            "split_kv_downcast_at": "final_write",
+            "split_kv_backend": "deterministic_cp_backward_reference",
+            "split_kv_plan_source": "reference_execution",
+            "split_kv_fallback": False,
+            "split_kv_fallback_reason": None,
+        },
+        {
+            "owner_cp_rank": 1,
+            "requested_split_kv_policy": "fixed",
+            "requested_split_kv_size": 2,
+            "actual_split_kv_policy": "fixed",
+            "actual_split_kv_size": 2,
+            "actual_split_kv_count": 2,
+            "actual_split_boundaries": [[3, 5], [5, 6]],
+            "split_kv_merge_order": "global_block_index",
+            "split_kv_accum_dtype": "fp32",
+            "split_kv_downcast_at": "final_write",
+            "split_kv_backend": "deterministic_cp_backward_reference",
+            "split_kv_plan_source": "reference_execution",
+            "split_kv_fallback": False,
+            "split_kv_fallback_reason": None,
+        },
+    ]
+
+
+def test_split_kv_plan_never_crosses_cp_owner_boundaries():
+    plans = split_kv_execution_plan_provenance(
+        10,
+        cp_world_size=3,
+        kv_chunk_size=3,
+        backend="test-reference",
+    )
+
+    assert [plan["actual_split_boundaries"] for plan in plans] == [
+        [[0, 3], [3, 4]],
+        [[4, 7]],
+        [[7, 10]],
+    ]
+    assert [plan["owner_cp_rank"] for plan in plans] == [0, 1, 2]
+
+
+def test_backward_report_preserves_post_rope_position_metadata():
+    rope = NativeRoPEOp()
+    pre_rope_q, pre_rope_k, v = _qkv(2, 5, 5, seed=19, heads=4, kv_heads=2, dim=8)
+    position_offsets = torch.tensor([23, 101], dtype=torch.long)
+    positions = position_offsets[:, None] + torch.arange(pre_rope_q.size(2), dtype=torch.long)
+    q = rope.forward_fp32(pre_rope_q, positions, theta=1_000_000.0)
+    k = rope.forward_fp32(pre_rope_k, positions, theta=1_000_000.0)
+    dout = torch.randn(2, 4, 5, 8, generator=torch.Generator().manual_seed(20))
+
+    with _single_thread():
+        report = compare_cp_attention_backward(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            query_position_offsets=position_offsets,
+            key_position_offsets=position_offsets,
+            candidate_cp_world_size=2,
+            candidate_kv_chunk_size=2,
+            output_dtype=torch.float32,
+        )
+
+    drift = report.drifts[0]
+    assert drift.dq.max_abs <= _GRAD_ATOL
+    assert drift.dk.max_abs <= _GRAD_ATOL
+    assert drift.dv.max_abs <= _GRAD_ATOL
+
+
+def test_qwen3_8b_local_tp2_cp2_bf16_backward_report_smoke():
+    # Qwen3-8B global Hq/Hkv is 32/8. A TP=2 local shard owns 16/4 heads.
+    q, k, v = _qkv(
+        1,
+        4,
+        4,
+        seed=21,
+        dtype=torch.bfloat16,
+        heads=16,
+        kv_heads=4,
+        dim=_HEAD_DIM,
+    )
+    dout = torch.randn(
+        1,
+        16,
+        4,
+        _HEAD_DIM,
+        generator=torch.Generator().manual_seed(22),
+        dtype=torch.bfloat16,
+    )
+
+    with _single_thread():
+        report = compare_cp_attention_backward(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            candidate_cp_world_size=2,
+            candidate_kv_chunk_size=2,
+            output_dtype=torch.bfloat16,
+        )
+
+    drift = report.drifts[0]
+    assert drift.provenance["q_dtype"] == "bfloat16"
+    assert drift.provenance["output_dtype"] == "bfloat16"
+    assert drift.provenance["downcast_at"] == "final_write"
+    assert drift.dq.max_abs <= 5.0e-2
+    assert drift.dk.max_abs <= 5.0e-2
+    assert drift.dv.max_abs <= 5.0e-2
+
+
+def test_backward_report_validates_dout_shape_and_dtype():
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=23, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="dout must have shape"):
+        op.backward_reference(q, k, v, torch.randn(1, 4, 3, 8), cp_world_size=2)
+
+    with pytest.raises(ValueError, match="dout must be a real floating-point tensor"):
+        op.backward_reference(
+            q,
+            k,
+            v,
+            torch.ones(1, 4, 4, 8, dtype=torch.long),
+            cp_world_size=2,
+        )
+
+
 def test_inputs_are_not_mutated():
     op = DeterministicCPAttentionReferenceOp()
     q, k, v = _qkv(2, 6, 6, seed=7)
@@ -415,6 +616,18 @@ def test_overlapping_partial_ranges_raise():
             [
                 AttentionPartialState(out=out, lse=lse, block_start=0, block_end=3),
                 AttentionPartialState(out=out, lse=lse, block_start=2, block_end=4),
+            ]
+        )
+
+
+def test_gapped_partial_ranges_raise():
+    out = torch.zeros(1, 1, 1, 1)
+    lse = torch.zeros(1, 1, 1)
+    with pytest.raises(ValueError, match="gap-free"):
+        merge_attention_partial_states(
+            [
+                AttentionPartialState(out=out, lse=lse, block_start=0, block_end=2),
+                AttentionPartialState(out=out, lse=lse, block_start=3, block_end=4),
             ]
         )
 

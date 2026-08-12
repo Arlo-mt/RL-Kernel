@@ -16,6 +16,13 @@ from typing import Optional, Sequence
 
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    SplitKVExecutionPlan,
+    SplitKVMode,
+    SplitKVRuntimeCoordinate,
+    SplitKVRuntimePlanEntry,
+    SplitKVRuntimePlanSet,
+)
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
 
@@ -43,6 +50,104 @@ class AttentionPartialState:
             raise ValueError("block_start must be non-negative")
         if self.block_end < self.block_start:
             raise ValueError("block_end must be >= block_start")
+
+
+@dataclass(frozen=True)
+class AttentionBackwardGradients:
+    """Training-side gradients emitted by the CP attention backward reference."""
+
+    dq: torch.Tensor
+    dk: torch.Tensor
+    dv: torch.Tensor
+
+
+@dataclass(frozen=True)
+class AttentionBackwardPathResult:
+    """One materialized CP attention backward path."""
+
+    name: str
+    out: torch.Tensor
+    lse: torch.Tensor
+    gradients: AttentionBackwardGradients
+    provenance: dict[str, object]
+
+
+@dataclass(frozen=True)
+class GradientDriftStats:
+    """Shape-aware absolute drift summary for backward validation reports."""
+
+    max_abs: float
+    mean_abs: float
+    p95_abs: float
+    p99_abs: float
+    active_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "max_abs": self.max_abs,
+            "mean_abs": self.mean_abs,
+            "p95_abs": self.p95_abs,
+            "p99_abs": self.p99_abs,
+            "active_count": self.active_count,
+        }
+
+
+@dataclass(frozen=True)
+class AttentionBackwardRankDrift:
+    """Backward drift for one logical CP rank's sequence ownership."""
+
+    rank: int
+    dq: GradientDriftStats
+    dk: GradientDriftStats
+    dv: GradientDriftStats
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rank": self.rank,
+            "dq": self.dq.to_dict(),
+            "dk": self.dk.to_dict(),
+            "dv": self.dv.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class AttentionBackwardPathDrift:
+    """Candidate-vs-reference backward drift for one CP path."""
+
+    candidate_name: str
+    dq: GradientDriftStats
+    dk: GradientDriftStats
+    dv: GradientDriftStats
+    out: GradientDriftStats
+    lse: GradientDriftStats
+    per_rank: tuple[AttentionBackwardRankDrift, ...]
+    provenance: dict[str, object]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "candidate_name": self.candidate_name,
+            "dq": self.dq.to_dict(),
+            "dk": self.dk.to_dict(),
+            "dv": self.dv.to_dict(),
+            "out": self.out.to_dict(),
+            "lse": self.lse.to_dict(),
+            "per_rank": [item.to_dict() for item in self.per_rank],
+            "provenance": self.provenance,
+        }
+
+
+@dataclass(frozen=True)
+class AttentionBackwardComparisonReport:
+    """Structured PR8 report for CP attention gradient drift validation."""
+
+    reference_name: str
+    drifts: tuple[AttentionBackwardPathDrift, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reference_name": self.reference_name,
+            "drifts": [drift.to_dict() for drift in self.drifts],
+        }
 
 
 def merge_attention_partial_states(
@@ -96,6 +201,24 @@ class DeterministicCPAttentionReferenceOp:
     LSE arithmetic. ``forward`` returns the input dtype after the final write;
     ``forward_fp32`` keeps the fp32 merged output.
     """
+
+    op_class = "attention"
+
+    @staticmethod
+    def split_kv_execution_plans(
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> list[dict[str, object]]:
+        """Export the actual logical Split-KV plan before execution."""
+
+        return split_kv_execution_plan_provenance(
+            total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_reference",
+        )
 
     def __call__(
         self,
@@ -250,6 +373,108 @@ class DeterministicCPAttentionReferenceOp:
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
             output_dtype=torch.float32,
+        )
+
+    def backward_reference(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dout: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: Optional[float] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        query_position_offsets: Optional[torch.Tensor] = None,
+        key_position_offsets: Optional[torch.Tensor] = None,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+        output_dtype: Optional[torch.dtype] = torch.float32,
+        name: Optional[str] = None,
+    ) -> AttentionBackwardPathResult:
+        """Run the deterministic training-side backward validation path.
+
+        The semantic backward input is ``dout`` plus the forward attention state
+        produced from the same Q/K/V, masks, position offsets, CP world, and KV
+        block order. The reference keeps the softmax/merge math in fp32 and
+        records the final-write dtype in provenance; decode backward is
+        intentionally out of scope for PR8.
+        """
+
+        _validate_qkv(q, k, v)
+        if dout.shape != q.shape:
+            raise ValueError("dout must have shape [B, Hq, Sq, D], matching q")
+        if not torch.is_floating_point(dout) or torch.is_complex(dout):
+            raise ValueError("dout must be a real floating-point tensor")
+        q_leaf = q.detach().clone().requires_grad_(True)
+        k_leaf = k.detach().clone().requires_grad_(True)
+        v_leaf = v.detach().clone().requires_grad_(True)
+
+        resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
+        out, lse = self.forward_with_lse(
+            q_leaf,
+            k_leaf,
+            v_leaf,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            output_dtype=resolved_output_dtype,
+        )
+        torch.autograd.backward(out, dout.to(device=out.device, dtype=out.dtype))
+        if q_leaf.grad is None or k_leaf.grad is None or v_leaf.grad is None:
+            raise RuntimeError("CP attention backward did not produce dq/dk/dv")
+
+        return AttentionBackwardPathResult(
+            name=name
+            or _backward_path_name(cp_world_size=cp_world_size, kv_chunk_size=kv_chunk_size),
+            out=out.detach(),
+            lse=lse.detach(),
+            gradients=AttentionBackwardGradients(
+                dq=q_leaf.grad.detach(),
+                dk=k_leaf.grad.detach(),
+                dv=v_leaf.grad.detach(),
+            ),
+            provenance={
+                "attention_mode": "prefill" if kv_chunk_size is None else "chunked_prefill",
+                "gradient_mode": "training_backward",
+                "gradient_inputs": ["q", "k", "v"],
+                "gradient_outputs": ["out"],
+                "saved_forward_state": [
+                    "out",
+                    "attention_lse",
+                    "causal_mask",
+                    "key_padding_mask",
+                    "query_position_offsets",
+                    "key_position_offsets",
+                    "global_block_index",
+                ],
+                "cp_world_size": cp_world_size,
+                "kv_chunk_size": kv_chunk_size,
+                "requested_split_kv_policy": (
+                    "disabled" if kv_chunk_size is None else "fixed"
+                ),
+                "requested_split_kv_size": kv_chunk_size,
+                "actual_split_kv_plans": split_kv_execution_plan_provenance(
+                    k.size(2),
+                    cp_world_size=cp_world_size,
+                    kv_chunk_size=kv_chunk_size,
+                    backend="deterministic_cp_backward_reference",
+                ),
+                "merge_order": "global_block_index",
+                "accum_dtype": "fp32",
+                "downcast_at": "final_write",
+                "output_dtype": str(resolved_output_dtype).replace("torch.", ""),
+                "q_dtype": str(q.dtype).replace("torch.", ""),
+                "k_dtype": str(k.dtype).replace("torch.", ""),
+                "v_dtype": str(v.dtype).replace("torch.", ""),
+                "dout_dtype": str(dout.dtype).replace("torch.", ""),
+                "te_backward_oracle": "not_used",
+                "decode_backward": "not_supported",
+            },
         )
 
     def local_partial_state(
@@ -456,6 +681,143 @@ class DeterministicCPAttentionReferenceOp:
         return torch.cat(out_chunks, dim=2), torch.cat(lse_chunks, dim=2)
 
 
+def compare_cp_attention_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    causal: bool = True,
+    scale: Optional[float] = None,
+    key_padding_mask: Optional[torch.Tensor] = None,
+    query_position_offsets: Optional[torch.Tensor] = None,
+    key_position_offsets: Optional[torch.Tensor] = None,
+    candidate_cp_world_size: int = 2,
+    candidate_kv_chunk_size: Optional[int] = None,
+    output_dtype: Optional[torch.dtype] = torch.float32,
+) -> AttentionBackwardComparisonReport:
+    """Compare CP=1 backward with a CP/chunked-prefill candidate.
+
+    The report includes whole-tensor ``dq/dk/dv`` drift and per-logical-CP-rank
+    slices. It is a validation/reporting helper, not a separate production
+    backward kernel.
+    """
+
+    op = DeterministicCPAttentionReferenceOp()
+    reference = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        causal=causal,
+        scale=scale,
+        key_padding_mask=key_padding_mask,
+        query_position_offsets=query_position_offsets,
+        key_position_offsets=key_position_offsets,
+        cp_world_size=1,
+        kv_chunk_size=None,
+        output_dtype=output_dtype,
+        name="cp1_backward_reference",
+    )
+    candidate = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        causal=causal,
+        scale=scale,
+        key_padding_mask=key_padding_mask,
+        query_position_offsets=query_position_offsets,
+        key_position_offsets=key_position_offsets,
+        cp_world_size=candidate_cp_world_size,
+        kv_chunk_size=candidate_kv_chunk_size,
+        output_dtype=output_dtype,
+    )
+    return AttentionBackwardComparisonReport(
+        reference_name=reference.name,
+        drifts=(_compare_backward_path(candidate, reference),),
+    )
+
+
+def _compare_backward_path(
+    candidate: AttentionBackwardPathResult,
+    reference: AttentionBackwardPathResult,
+) -> AttentionBackwardPathDrift:
+    cp_world_size = _provenance_int(candidate.provenance, "cp_world_size")
+    return AttentionBackwardPathDrift(
+        candidate_name=candidate.name,
+        dq=_drift_stats(candidate.gradients.dq, reference.gradients.dq),
+        dk=_drift_stats(candidate.gradients.dk, reference.gradients.dk),
+        dv=_drift_stats(candidate.gradients.dv, reference.gradients.dv),
+        out=_drift_stats(candidate.out, reference.out),
+        lse=_drift_stats(candidate.lse, reference.lse),
+        per_rank=_per_rank_backward_drifts(candidate, reference, cp_world_size),
+        provenance=candidate.provenance,
+    )
+
+
+def _per_rank_backward_drifts(
+    candidate: AttentionBackwardPathResult,
+    reference: AttentionBackwardPathResult,
+    cp_world_size: int,
+) -> tuple[AttentionBackwardRankDrift, ...]:
+    q_bounds = _split_bounds(candidate.gradients.dq.size(2), cp_world_size)
+    kv_bounds = _split_bounds(candidate.gradients.dk.size(2), cp_world_size)
+    per_rank = []
+    for rank, ((q_start, q_end), (kv_start, kv_end)) in enumerate(zip(q_bounds, kv_bounds)):
+        per_rank.append(
+            AttentionBackwardRankDrift(
+                rank=rank,
+                dq=_drift_stats(
+                    candidate.gradients.dq[:, :, q_start:q_end, :],
+                    reference.gradients.dq[:, :, q_start:q_end, :],
+                ),
+                dk=_drift_stats(
+                    candidate.gradients.dk[:, :, kv_start:kv_end, :],
+                    reference.gradients.dk[:, :, kv_start:kv_end, :],
+                ),
+                dv=_drift_stats(
+                    candidate.gradients.dv[:, :, kv_start:kv_end, :],
+                    reference.gradients.dv[:, :, kv_start:kv_end, :],
+                ),
+            )
+        )
+    return tuple(per_rank)
+
+
+def _drift_stats(candidate: torch.Tensor, reference: torch.Tensor) -> GradientDriftStats:
+    if candidate.shape != reference.shape:
+        raise ValueError(
+            f"candidate shape {tuple(candidate.shape)} must match "
+            f"reference shape {tuple(reference.shape)}"
+        )
+    diff = (candidate.float() - reference.float()).abs().reshape(-1)
+    active_count = int(diff.numel())
+    if active_count == 0:
+        return GradientDriftStats(0.0, 0.0, 0.0, 0.0, 0)
+    return GradientDriftStats(
+        max_abs=float(diff.max().item()),
+        mean_abs=float(diff.mean().item()),
+        p95_abs=float(torch.quantile(diff, 0.95).item()),
+        p99_abs=float(torch.quantile(diff, 0.99).item()),
+        active_count=active_count,
+    )
+
+
+def _backward_path_name(*, cp_world_size: int, kv_chunk_size: Optional[int]) -> str:
+    prefix = f"cp{cp_world_size}"
+    if kv_chunk_size is None:
+        return f"{prefix}_backward"
+    return f"{prefix}_chunked_backward"
+
+
+def _provenance_int(provenance: dict[str, object], key: str) -> int:
+    value = provenance[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"provenance field {key!r} must be an int")
+    return value
+
+
 def _merge_two_states(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,
@@ -476,8 +838,8 @@ def _validate_merge_shapes_and_ranges(states: Sequence[AttentionPartialState]) -
     for state in states[1:]:
         if state.out.shape != first.out.shape or state.lse.shape != first.lse.shape:
             raise ValueError("all partial states must have matching out/lse shapes")
-        if state.block_start < previous_end:
-            raise ValueError("partial state block ranges must not overlap")
+        if state.block_start != previous_end:
+            raise ValueError("partial state block ranges must be gap-free and non-overlapping")
         previous_end = state.block_end
 
 
@@ -546,8 +908,128 @@ def _kv_block_bounds(
     return bounds
 
 
+def split_kv_execution_plan_provenance(
+    length: int,
+    *,
+    cp_world_size: int,
+    kv_chunk_size: Optional[int],
+    backend: str,
+) -> list[dict[str, object]]:
+    """Return the actual backend-local Split-KV plan for every CP owner."""
+
+    if length < 1:
+        raise ValueError("Split-KV sequence length must be >= 1")
+    if cp_world_size < 1:
+        raise ValueError("cp_world_size must be >= 1")
+    if kv_chunk_size is not None and kv_chunk_size < 1:
+        raise ValueError("kv_chunk_size must be >= 1 when provided")
+    result: list[dict[str, object]] = []
+    for owner_cp_rank, (rank_start, rank_end) in enumerate(
+        _split_bounds(length, cp_world_size)
+    ):
+        if rank_start == rank_end:
+            continue
+        if kv_chunk_size is None:
+            boundaries = ((rank_start, rank_end),)
+            mode = SplitKVMode.DISABLED
+        else:
+            boundaries = tuple(
+                (start, min(start + kv_chunk_size, rank_end))
+                for start in range(rank_start, rank_end, kv_chunk_size)
+            )
+            mode = SplitKVMode.FIXED
+        plan = SplitKVExecutionPlan(
+            requested_mode=mode,
+            requested_split_size=kv_chunk_size,
+            actual_mode=mode,
+            actual_split_size=kv_chunk_size,
+            boundaries=boundaries,
+            backend=backend,
+            source="reference_execution",
+        )
+        result.append({"owner_cp_rank": owner_cp_rank, **plan.to_dict()})
+    return result
+
+
+def build_reference_split_kv_runtime_plan_set(
+    total_kv_tokens: Sequence[int],
+    *,
+    tp_world_size: int,
+    cp_world_size: int,
+    kv_chunk_size: Optional[int],
+    backend: str = "deterministic_cp_reference",
+) -> SplitKVRuntimePlanSet:
+    """Build complete per-batch/TP/CP/owner plans for the reference path."""
+
+    totals = tuple(total_kv_tokens)
+    if not totals or any(total < cp_world_size for total in totals):
+        raise ValueError(
+            "reference runtime plan sets require at least one KV token per CP owner"
+        )
+    if tp_world_size < 1 or cp_world_size < 1:
+        raise ValueError("TP and CP world sizes must be >= 1")
+    if kv_chunk_size is not None and kv_chunk_size < 1:
+        raise ValueError("kv_chunk_size must be >= 1 when provided")
+
+    entries: list[SplitKVRuntimePlanEntry] = []
+    for batch_index, total in enumerate(totals):
+        owner_ranges = _split_bounds(total, cp_world_size)
+        for tp_rank in range(tp_world_size):
+            for cp_rank in range(cp_world_size):
+                for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    if kv_chunk_size is None:
+                        mode = SplitKVMode.DISABLED
+                        boundaries = ((owner_start, owner_end),)
+                    else:
+                        mode = SplitKVMode.FIXED
+                        boundaries = tuple(
+                            (start, min(start + kv_chunk_size, owner_end))
+                            for start in range(owner_start, owner_end, kv_chunk_size)
+                        )
+                    execution = SplitKVExecutionPlan(
+                        requested_mode=mode,
+                        requested_split_size=kv_chunk_size,
+                        actual_mode=mode,
+                        actual_split_size=kv_chunk_size,
+                        boundaries=boundaries,
+                        backend=backend,
+                        source="reference_execution",
+                    )
+                    entries.append(
+                        SplitKVRuntimePlanEntry(
+                            coordinate=SplitKVRuntimeCoordinate(
+                                batch_index=batch_index,
+                                tp_rank=tp_rank,
+                                cp_rank=cp_rank,
+                                owner_cp_rank=owner_cp_rank,
+                            ),
+                            expected_kv_range=(owner_start, owner_end),
+                            execution=execution,
+                        )
+                    )
+    return SplitKVRuntimePlanSet(
+        batch_size=len(totals),
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        total_kv_tokens=totals,
+        entries=tuple(entries),
+    )
+
+
+CPAttentionReferenceOp = DeterministicCPAttentionReferenceOp
+
 __all__ = [
+    "AttentionBackwardComparisonReport",
+    "AttentionBackwardGradients",
+    "AttentionBackwardPathDrift",
+    "AttentionBackwardPathResult",
+    "AttentionBackwardRankDrift",
     "AttentionPartialState",
+    "build_reference_split_kv_runtime_plan_set",
+    "CPAttentionReferenceOp",
     "DeterministicCPAttentionReferenceOp",
+    "GradientDriftStats",
+    "compare_cp_attention_backward",
     "merge_attention_partial_states",
+    "split_kv_execution_plan_provenance",
 ]
