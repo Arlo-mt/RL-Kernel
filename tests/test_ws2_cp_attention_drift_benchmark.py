@@ -53,7 +53,21 @@ def test_smoke_report_has_pr5_schema_and_qwen3_tp2_cp2_case():
     assert chunked["topology"]["local_query_head_range"] == [0, 16]
     assert chunked["topology"]["local_kv_head_range"] == [0, 4]
     assert chunked["provenance"]["merge_order"] == "global_block_index"
-    assert chunked["provenance"]["split_kv_policy"] == "fixed_kv_chunk"
+    assert chunked["provenance"]["split_kv_policy"] == "fixed"
+    assert chunked["provenance"]["requested_split_kv_size"] == 1
+    assert chunked["provenance"]["actual_split_kv_plans"][0][
+        "actual_split_boundaries"
+    ]
+    assert chunked["provenance"]["actual_split_kv_plans"][0][
+        "split_kv_accum_dtype"
+    ] == "fp32"
+    assert chunked["provenance"]["actual_split_kv_plans"][0][
+        "split_kv_downcast_at"
+    ] == "final_write"
+    plan_set = chunked["provenance"]["actual_split_kv_plan_set"]
+    assert plan_set["coverage"] == "complete_batch_tp_cp_owner_cartesian_product"
+    assert len(plan_set["entries"]) == 8
+    assert chunked["distributed_p2p_reference"]["status"] == "not_requested"
     assert chunked["provenance"]["block_metadata_hash"]
     assert chunked["provenance"]["rope"]["rope_state"] == "post_rope"
     assert chunked["drift"]["rope"]["status"] == "available"

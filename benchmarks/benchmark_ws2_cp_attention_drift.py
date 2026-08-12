@@ -26,11 +26,25 @@ from typing import Any, Iterator, Sequence
 
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
+    build_reference_split_kv_runtime_plan_set,
     compare_cp_attention_backward,
     merge_attention_partial_states,
+    split_kv_execution_plan_provenance,
+)
+from rl_engine.kernels.ops.cuda.attention.cp_comm import (
+    AttentionCPBlockMetadata,
+    AttentionCPCommunicationPlan,
+    AttentionCPMergedState,
+    AttentionCPPartialState,
+    AttentionParallelSpec,
+    P2PNCCLAttentionCPCommunication,
 )
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 
@@ -366,10 +380,17 @@ def _run_case(
         output_dtype=dtype,
     )
 
-    split_kv_policy = "none" if kv_chunk_size is None else "fixed_kv_chunk"
+    split_kv_policy = "disabled" if kv_chunk_size is None else "fixed"
     attention_mode = "prefill" if kv_chunk_size is None else "chunked_prefill"
     q_bounds = _split_bounds(seq_len, cp_world_size)
     kv_bounds = _kv_block_bounds(seq_len, cp_world_size, kv_chunk_size)
+    runtime_plan_set = build_reference_split_kv_runtime_plan_set(
+        (seq_len,) * args.batch,
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        kv_chunk_size=kv_chunk_size,
+        backend="deterministic_cp_reference",
+    )
     case: dict[str, object] = {
         "case_name": _case_name(tp_world_size, cp_world_size, kv_chunk_size, args.dtype),
         "attention_mode": attention_mode,
@@ -397,6 +418,15 @@ def _run_case(
             "lse_domain": "attention",
             "merge_order": "global_block_index",
             "split_kv_policy": split_kv_policy,
+            "requested_split_kv_policy": split_kv_policy,
+            "requested_split_kv_size": kv_chunk_size,
+            "actual_split_kv_plans": split_kv_execution_plan_provenance(
+                seq_len,
+                cp_world_size=cp_world_size,
+                kv_chunk_size=kv_chunk_size,
+                backend="deterministic_cp_reference",
+            ),
+            "actual_split_kv_plan_set": runtime_plan_set.to_dict(),
             "kv_chunk_size": kv_chunk_size,
             "block_metadata_hash": _block_metadata_hash(kv_bounds),
             "scale_placement": "scores_after_qk_matmul",
@@ -447,6 +477,19 @@ def _run_case(
         ),
         "backward": {"status": "not_requested"},
     }
+    distributed_reference = _run_distributed_p2p_reference(
+        q,
+        k,
+        v,
+        reference_out,
+        reference_lse,
+        device=device,
+        seq_len=seq_len,
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        kv_chunk_size=kv_chunk_size,
+    )
+    case["distributed_p2p_reference"] = distributed_reference
     if args.include_backward:
         backward = compare_cp_attention_backward(
             q,
@@ -463,6 +506,139 @@ def _run_case(
             "report": backward.to_dict(),
         }
     return case
+
+
+def _run_distributed_p2p_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    reference_out: torch.Tensor,
+    reference_lse: torch.Tensor,
+    *,
+    device: torch.device,
+    seq_len: int,
+    tp_world_size: int,
+    cp_world_size: int,
+    kv_chunk_size: int | None,
+) -> dict[str, object]:
+    """Exercise the actual P2P reference when launched as a matching NCCL job."""
+
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return {"status": "not_requested", "reason": "process_group_not_initialized"}
+    backend = str(dist.get_backend()).lower()
+    world_size = int(dist.get_world_size())
+    if device.type != "cuda":
+        return {
+            "status": "skipped",
+            "reason": "P2P NCCL reference requires CUDA",
+            "backend": backend,
+        }
+    if "nccl" not in backend:
+        return {
+            "status": "skipped",
+            "reason": "P2P reference requires NCCL",
+            "backend": backend,
+        }
+    if world_size != cp_world_size:
+        return {
+            "status": "skipped",
+            "reason": "WORLD_SIZE must equal cp_world_size for the CP reference",
+            "world_size": world_size,
+            "cp_world_size": cp_world_size,
+        }
+
+    rank = int(dist.get_rank())
+    owner_ranges = _split_bounds(seq_len, cp_world_size)
+    block_bounds = _kv_block_bounds(seq_len, cp_world_size, kv_chunk_size)
+    blocks: list[AttentionCPBlockMetadata] = []
+    owner_block_counts = [0] * cp_world_size
+    for block_index, (start, end) in enumerate(block_bounds):
+        owner = next(
+            owner_rank
+            for owner_rank, (owner_start, owner_end) in enumerate(owner_ranges)
+            if owner_start <= start < owner_end
+        )
+        blocks.append(
+            AttentionCPBlockMetadata(
+                global_block_index=block_index,
+                kv_block_start=start,
+                kv_block_end=end,
+                owner_cp_rank=owner,
+                owner_tp_rank=0,
+            )
+        )
+        owner_block_counts[owner] += 1
+
+    plan = AttentionCPCommunicationPlan(
+        parallel=AttentionParallelSpec(
+            tp_world_size=tp_world_size,
+            tp_rank=0,
+            cp_world_size=cp_world_size,
+            cp_rank=rank,
+        ),
+        backend="p2p_nccl_reference",
+        status="implemented",
+        expected_blocks=tuple(blocks),
+        expected_kv_token_range=(0, seq_len),
+        query_token_ranges=tuple(_split_bounds(q.size(2), cp_world_size)),
+    )
+    attention = DeterministicCPAttentionReferenceOp()
+    local_states: list[AttentionCPPartialState] = []
+    for block in blocks:
+        if block.owner_cp_rank != rank:
+            continue
+        state = attention.local_partial_state(
+            q,
+            k[:, :, block.kv_block_start : block.kv_block_end, :],
+            v[:, :, block.kv_block_start : block.kv_block_end, :],
+            q_start=0,
+            k_start=block.kv_block_start,
+            total_kv_len=seq_len,
+            total_query_len=q.size(2),
+            causal=True,
+        )
+        local_states.append(
+            AttentionCPPartialState(
+                out=state.out,
+                lse=state.lse,
+                block=block,
+            )
+        )
+    communication = P2PNCCLAttentionCPCommunication()
+    gathered = communication.all_gather_partial_states(tuple(local_states), plan)
+    merged = merge_attention_partial_states(
+        [
+            AttentionPartialState(
+                out=state.out,
+                lse=state.lse,
+                block_start=state.block.kv_block_start,
+                block_end=state.block.kv_block_end,
+            )
+            for state in gathered
+        ]
+    )
+    local = communication.reduce_scatter_merged_state(
+        AttentionCPMergedState(out=merged.out, lse=merged.lse),
+        plan,
+    )
+    q_start, q_end = plan.query_token_ranges[rank]
+    reference_local_out = reference_out[:, :, q_start:q_end, :]
+    reference_local_lse = reference_lse[:, :, q_start:q_end]
+    return {
+        "status": "available",
+        "backend": backend,
+        "rank": rank,
+        "world_size": world_size,
+        "transport": "p2p_nccl_reference",
+        "manifest_block_count": len(blocks),
+        "owner_block_counts": owner_block_counts,
+        "gathered_block_indices": [state.block.global_block_index for state in gathered],
+        "query_range": [q_start, q_end],
+        "out": _drift_stats(local.out, reference_local_out),
+        "lse": _drift_stats(local.lse, reference_local_lse),
+    }
 
 
 def _make_qkv(

@@ -2,8 +2,9 @@
 
 PR5 adds the report artifact path for issue #235. It does not introduce a
 production communication kernel. The benchmark is a rank-aware, torchrun-style
-driver around the deterministic CP attention reference so the same artifact can
-be produced locally or under a multi-process launcher.
+driver around the deterministic CP attention reference. Under a matching
+two-rank CUDA/NCCL launch it executes the P2P reference transport; CPU/Gloo
+remains a report-generation smoke path.
 
 ## Scope
 
@@ -27,6 +28,7 @@ The report separates two drift classes:
 | `merge_order_probe` | Reversed-arrival partial states vs canonical sorted merge. This verifies that arrival order is ignored. |
 | `te_merge_oracle` | Optional Transformer Engine merge-oracle drift when TE is installed and passes capability probes. |
 | `backward` | Optional PR8 `dq/dk/dv` drift report when `--include-backward` is used. |
+| `distributed_p2p_reference` | Real NCCL P2P partial-state gather, FP32 merge, and query scatter drift. |
 
 Selected-logprob `dlogp` remains `not_available` here because the full logprob
 chain integration is outside PR5. PR4/WS2 runtime integration should fill that
@@ -52,16 +54,31 @@ python benchmarks/benchmark_ws2_cp_attention_drift.py \
   --output artifacts/ws2-cp-attention-drift.json
 ```
 
-Torchrun-style launch:
+Two-GPU NCCL transport check:
 
 ```bash
-torchrun --nproc-per-node=2 benchmarks/benchmark_ws2_cp_attention_drift.py \
+torchrun --standalone --nproc-per-node=2 \
+  scripts/ws2_p2p_nccl_attention_reference_check.py
+```
+
+Two-GPU benchmark report with real P2P transport:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  benchmarks/benchmark_ws2_cp_attention_drift.py \
   --smoke \
+  --device cuda \
+  --init-process-group \
+  --tp-world-sizes 2 \
+  --cp-world-sizes 2 \
   --json
 ```
 
 Rank 0 prints or writes the shared report. Other ranks can run the same
-rank-aware benchmark without changing the numerical reducer.
+rank-aware benchmark without changing the numerical reducer.  The recommended
+container is the repository CUDA image built from `docker/Dockerfile.cuda`
+(`ghcr.io/rl-align/rl-kernel/rl-kernel-ci:cuda` when using the repository image
+workflow). It is based on PyTorch 2.4 / CUDA 12.4 and includes NCCL support.
 
 ## Transformer Engine Reuse
 
