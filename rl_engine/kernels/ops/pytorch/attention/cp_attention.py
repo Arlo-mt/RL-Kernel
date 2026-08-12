@@ -16,6 +16,13 @@ from typing import Optional, Sequence
 
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    SplitKVExecutionPlan,
+    SplitKVMode,
+    SplitKVRuntimeCoordinate,
+    SplitKVRuntimePlanEntry,
+    SplitKVRuntimePlanSet,
+)
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
 
@@ -194,6 +201,24 @@ class DeterministicCPAttentionReferenceOp:
     LSE arithmetic. ``forward`` returns the input dtype after the final write;
     ``forward_fp32`` keeps the fp32 merged output.
     """
+
+    op_class = "attention"
+
+    @staticmethod
+    def split_kv_execution_plans(
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> list[dict[str, object]]:
+        """Export the actual logical Split-KV plan before execution."""
+
+        return split_kv_execution_plan_provenance(
+            total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_reference",
+        )
 
     def __call__(
         self,
@@ -429,6 +454,16 @@ class DeterministicCPAttentionReferenceOp:
                 ],
                 "cp_world_size": cp_world_size,
                 "kv_chunk_size": kv_chunk_size,
+                "requested_split_kv_policy": (
+                    "disabled" if kv_chunk_size is None else "fixed"
+                ),
+                "requested_split_kv_size": kv_chunk_size,
+                "actual_split_kv_plans": split_kv_execution_plan_provenance(
+                    k.size(2),
+                    cp_world_size=cp_world_size,
+                    kv_chunk_size=kv_chunk_size,
+                    backend="deterministic_cp_backward_reference",
+                ),
                 "merge_order": "global_block_index",
                 "accum_dtype": "fp32",
                 "downcast_at": "final_write",
@@ -803,8 +838,8 @@ def _validate_merge_shapes_and_ranges(states: Sequence[AttentionPartialState]) -
     for state in states[1:]:
         if state.out.shape != first.out.shape or state.lse.shape != first.lse.shape:
             raise ValueError("all partial states must have matching out/lse shapes")
-        if state.block_start < previous_end:
-            raise ValueError("partial state block ranges must not overlap")
+        if state.block_start != previous_end:
+            raise ValueError("partial state block ranges must be gap-free and non-overlapping")
         previous_end = state.block_end
 
 
@@ -873,6 +908,116 @@ def _kv_block_bounds(
     return bounds
 
 
+def split_kv_execution_plan_provenance(
+    length: int,
+    *,
+    cp_world_size: int,
+    kv_chunk_size: Optional[int],
+    backend: str,
+) -> list[dict[str, object]]:
+    """Return the actual backend-local Split-KV plan for every CP owner."""
+
+    if length < 1:
+        raise ValueError("Split-KV sequence length must be >= 1")
+    if cp_world_size < 1:
+        raise ValueError("cp_world_size must be >= 1")
+    if kv_chunk_size is not None and kv_chunk_size < 1:
+        raise ValueError("kv_chunk_size must be >= 1 when provided")
+    result: list[dict[str, object]] = []
+    for owner_cp_rank, (rank_start, rank_end) in enumerate(
+        _split_bounds(length, cp_world_size)
+    ):
+        if rank_start == rank_end:
+            continue
+        if kv_chunk_size is None:
+            boundaries = ((rank_start, rank_end),)
+            mode = SplitKVMode.DISABLED
+        else:
+            boundaries = tuple(
+                (start, min(start + kv_chunk_size, rank_end))
+                for start in range(rank_start, rank_end, kv_chunk_size)
+            )
+            mode = SplitKVMode.FIXED
+        plan = SplitKVExecutionPlan(
+            requested_mode=mode,
+            requested_split_size=kv_chunk_size,
+            actual_mode=mode,
+            actual_split_size=kv_chunk_size,
+            boundaries=boundaries,
+            backend=backend,
+            source="reference_execution",
+        )
+        result.append({"owner_cp_rank": owner_cp_rank, **plan.to_dict()})
+    return result
+
+
+def build_reference_split_kv_runtime_plan_set(
+    total_kv_tokens: Sequence[int],
+    *,
+    tp_world_size: int,
+    cp_world_size: int,
+    kv_chunk_size: Optional[int],
+    backend: str = "deterministic_cp_reference",
+) -> SplitKVRuntimePlanSet:
+    """Build complete per-batch/TP/CP/owner plans for the reference path."""
+
+    totals = tuple(total_kv_tokens)
+    if not totals or any(total < cp_world_size for total in totals):
+        raise ValueError(
+            "reference runtime plan sets require at least one KV token per CP owner"
+        )
+    if tp_world_size < 1 or cp_world_size < 1:
+        raise ValueError("TP and CP world sizes must be >= 1")
+    if kv_chunk_size is not None and kv_chunk_size < 1:
+        raise ValueError("kv_chunk_size must be >= 1 when provided")
+
+    entries: list[SplitKVRuntimePlanEntry] = []
+    for batch_index, total in enumerate(totals):
+        owner_ranges = _split_bounds(total, cp_world_size)
+        for tp_rank in range(tp_world_size):
+            for cp_rank in range(cp_world_size):
+                for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    if kv_chunk_size is None:
+                        mode = SplitKVMode.DISABLED
+                        boundaries = ((owner_start, owner_end),)
+                    else:
+                        mode = SplitKVMode.FIXED
+                        boundaries = tuple(
+                            (start, min(start + kv_chunk_size, owner_end))
+                            for start in range(owner_start, owner_end, kv_chunk_size)
+                        )
+                    execution = SplitKVExecutionPlan(
+                        requested_mode=mode,
+                        requested_split_size=kv_chunk_size,
+                        actual_mode=mode,
+                        actual_split_size=kv_chunk_size,
+                        boundaries=boundaries,
+                        backend=backend,
+                        source="reference_execution",
+                    )
+                    entries.append(
+                        SplitKVRuntimePlanEntry(
+                            coordinate=SplitKVRuntimeCoordinate(
+                                batch_index=batch_index,
+                                tp_rank=tp_rank,
+                                cp_rank=cp_rank,
+                                owner_cp_rank=owner_cp_rank,
+                            ),
+                            expected_kv_range=(owner_start, owner_end),
+                            execution=execution,
+                        )
+                    )
+    return SplitKVRuntimePlanSet(
+        batch_size=len(totals),
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        total_kv_tokens=totals,
+        entries=tuple(entries),
+    )
+
+
+CPAttentionReferenceOp = DeterministicCPAttentionReferenceOp
+
 __all__ = [
     "AttentionBackwardComparisonReport",
     "AttentionBackwardGradients",
@@ -880,8 +1025,11 @@ __all__ = [
     "AttentionBackwardPathResult",
     "AttentionBackwardRankDrift",
     "AttentionPartialState",
+    "build_reference_split_kv_runtime_plan_set",
+    "CPAttentionReferenceOp",
     "DeterministicCPAttentionReferenceOp",
     "GradientDriftStats",
     "compare_cp_attention_backward",
     "merge_attention_partial_states",
+    "split_kv_execution_plan_provenance",
 ]

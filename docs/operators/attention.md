@@ -85,68 +85,31 @@ Calling it (`__call__` -> `forward(...)`) computes in the input dtype; `forward_
 the explicit fp32 golden path (NativeAttentionOp only). The production `"attn"` op_type
 (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is a separate dispatch chain and is unaffected.
 
-`kernel_registry.get_op("cp_attention")` resolves to
-`DeterministicCPAttentionReferenceOp`, the WS2 correctness-first context-parallel
-reference. It emulates CP prefill and chunked-prefill by splitting logical query
-and KV sequence blocks, computing per-block `(out, lse)` partial states, and
-merging them in fp32 by global KV block index. This path is not a production
-fused backend; it defines the CP/LSE merge behavior that downstream fused paths
-must match. Optional per-batch `query_position_offsets` / `key_position_offsets`
-cover varlen causal-mask metadata while keeping the dense tensor layout.
+### WS2 CP-aware dispatch
 
-For Qwen3 WS2, `cp_attention` consumes post-QK-Norm, post-RoPE Q/K. It does not
-call `NativeRoPEOp` internally and does not hide RoPE inside the CP merge. The
-position offsets passed to CP attention must describe the same absolute token
-positions used when RoPE was applied, so PR3 validates the post-RoPE Q/K boundary
-while PR7 can later validate production fused `RoPE+Attention` kernels.
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_attention_op(contract)`. It validates explicit TP/CP ownership, fixed
+`(out, lse)` merge semantics, causal or packed-sequence offsets, and decode KV-cache identity
+before selecting a backend. Legacy `get_op("attention")` behavior remains unchanged.
 
-PR8 extends the CP reference with training-side backward validation:
+Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
+CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
+a silent fallback. See [WS2 CP-aware Attention contract](../design/ws2-cp-attention-contract.md).
 
-```python
-from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
-    compare_cp_attention_backward,
-)
+Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
+`disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
+boundaries, FP32 `(out, lse)` merge order, final downcast point, backend, and fallback reason.
+Runtime-selected `auto` plans are diagnostic only unless both training and rollout export and
+validate the same actual plan.
 
-report = compare_cp_attention_backward(
-    q,
-    k,
-    v,
-    dout,
-    candidate_cp_world_size=2,
-    candidate_kv_chunk_size=512,
-)
-```
-
-The report compares CP=1 against the CP/chunked candidate for `dq`, `dk`, `dv`,
-`out`, and attention-domain `lse`. It also includes per-logical-CP-rank gradient
-drift slices, fixed `global_block_index` merge provenance, final-write downcast
-metadata, and the saved forward state required by training backward validation.
-Decode backward remains out of scope. Transformer Engine backward is not claimed
-in this reference path because compatible saved forward state is not exposed here.
-
-PR5 adds a rank-aware drift artifact benchmark around the same reference path:
+The rank-aware drift benchmark can emit a CPU smoke artifact or a torchrun-friendly GPU report:
 
 ```bash
 python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
-python benchmarks/benchmark_ws2_cp_attention_drift.py \
-  --smoke \
-  --tp-world-sizes 2 \
-  --cp-world-sizes 2 \
-  --kv-chunk-sizes none,1 \
-  --include-backward \
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2 \
+  --cp-world-sizes 2 --kv-chunk-sizes none,1 --include-backward \
   --output artifacts/ws2-cp-attention-drift.json
 ```
-
-The report covers Qwen3-8B-style TP-local head shards, CP=1/2, full prefill,
-chunked-prefill, BF16-vs-FP32 drift, per-logical-CP-rank metrics, optional
-PR8 backward drift, RoPE provenance, and optional Transformer Engine
-context-parallel merge-oracle drift. TE reuse is limited to
-`transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py`
-helpers:
-`flash_attn_fwd_softmax_lse_correction`,
-`flash_attn_fwd_out_correction_init`, and
-`flash_attn_fwd_out_correction`.
-See `docs/design/ws2-attention-pr5-distributed-drift-benchmark.md`.
 
 ## Accuracy
 
@@ -201,7 +164,6 @@ memory.
 ```bash
 python -m pytest tests/test_attention.py -v
 python -m pytest tests/test_cp_attention.py -v
-python -m pytest tests/test_cp_attention_transformer_engine.py -v  # optional TE oracle
 ```
 
 Covers: `forward_fp32` vs an independent fp32 reference (bitwise), strict-fp32 under hostile
@@ -211,31 +173,14 @@ invariance (slice + chunked, bitwise; padding is near-equality only, see below),
 gradient flow, registry dispatch, and a
 GPU-only LARGE Qwen3-8B real-shape smoke test.
 
-`tests/test_cp_attention.py` covers the WS2 CP reference: CP=1 vs standard
-attention, CP=2 prefill vs CP=1, post-RoPE Q/K input semantics with shared
-global position metadata, chunked-prefill replay, global-position causal masking
-across CP boundaries, order-independent LSE merge by global block index,
-padding/all-masked stability, BF16 final-write behavior, backward drift reports
-for `dq/dk/dv`, Qwen3-8B local TP=2/CP=2 BF16 backward smoke coverage, input
-purity, argument validation, and registry dispatch.
-`make_operator_inputs("cp_attention", ...)` also emits a CP=2 chunked-prefill
-synthetic case for local harnesses.
-`tests/test_cp_attention_transformer_engine.py` optionally imports NVIDIA
-Transformer Engine's context-parallel PyTorch correction helpers and checks that
-RL-Kernel's fp32 `(out, lse)` merge matches those helpers; the test skips when
-Transformer Engine is not installed.
-
 ## Implementation Files
 
 - `rl_engine/kernels/ops/pytorch/attention/standard_attn.py` — ground-truth reference
-- `rl_engine/kernels/ops/pytorch/attention/cp_attention.py` — CP prefill/chunked reference
 - `rl_engine/kernels/ops/cuda/attention/deterministic_attn.py` — CUDA deterministic op
 - `csrc/cuda/attention/deterministic_attention.cu` — CUDA kernels
 - `rl_engine/kernels/registry.py`
 - `tests/test_attention.py`
 - `tests/test_deterministic_attention_cuda.py`
-- `tests/test_cp_attention.py`
-- `tests/test_cp_attention_transformer_engine.py`
 
 ## Fixed Reduction Order (CUDA Deterministic Backend)
 
@@ -304,14 +249,6 @@ for measured peak memory at representative shapes.
 - First version: `D=128` only (Qwen3-8B alignment).
 - Supported dtypes: BF16, FP16.
 - Full materialization of scores/P limits practical sequence length.
-- `cp_attention` is a PyTorch reference for CP prefill/chunked-prefill semantics,
-  not a distributed runtime or fused kernel.
-- `cp_attention` consumes post-RoPE Q/K for Qwen3 WS2; RoPE execution and fused
-  `RoPE+Attention` backend alignment are outside PR3.
-- PR8 backward validation is for training prefill/chunked-prefill only. Decode
-  replay remains forward-only unless a future issue scopes differentiable decode.
-- Transformer Engine backward is not used or claimed by PR8 unless a later backend
-  exposes compatible saved forward state for `dq/dk/dv` comparison.
 - `Hq` must be divisible by `Hkv` (raises `ValueError` otherwise).
 - CUDA KV-cache op wrapper is not in scope (caller does cat + calls this op).
 - No FP8, no multi-GPU / sequence-parallel.
