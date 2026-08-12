@@ -71,9 +71,18 @@ def main() -> int:
             "head_dim": args.head_dim,
         },
         "rope": config.rope.provenance(args.head_dim),
-        "split_kv": config.split_kv.provenance(
-            require_batch_invariant=config.require_batch_invariant
-        ),
+        "split_kv": {
+            **config.split_kv.to_dict(),
+            "provenance_status": "requested_only_dry_run",
+            "actual_plan_required_for_strict_pass": config.require_batch_invariant,
+            "requested_execution_plans": [
+                config.split_kv.resolve(
+                    int(seq_len),
+                    backend="flashinfer_dry_run_requested_only",
+                ).to_dict()
+                for seq_len in plan.kv_seq_lens.tolist()
+            ],
+        },
         "communication": config.cp_comm_plan.provenance()
         | {"cp_comm_required": config.require_cp_comm},
         "paged_kv_plan": plan.provenance(),
@@ -264,6 +273,7 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
         page_size=args.page_size,
         q_rope_state="pre_rope",
         k_cache_rope_state="pre_rope",
+        cp_world_size=args.cp_world_size,
     )
     return DecodeAttentionInputs(q=q, k_cache=k_cache, v_cache=v_cache, metadata=metadata)
 
@@ -326,12 +336,15 @@ def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> Decode
         q_rope_state=metadata.q_rope_state,
         k_cache_rope_state=metadata.k_cache_rope_state,
         cp_block_owners=cp_block_owners,
+        cp_world_size=metadata.cp_world_size,
     )
     return replace(
         inputs,
         q=inputs.q[batch_index : batch_index + 1],
         k_cache=inputs.k_cache[batch_index : batch_index + 1],
         v_cache=inputs.v_cache[batch_index : batch_index + 1],
+        k_new=(None if inputs.k_new is None else inputs.k_new[batch_index : batch_index + 1]),
+        v_new=(None if inputs.v_new is None else inputs.v_new[batch_index : batch_index + 1]),
         metadata=selected_metadata,
     )
 

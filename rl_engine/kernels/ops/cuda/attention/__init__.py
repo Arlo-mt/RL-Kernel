@@ -11,6 +11,7 @@ from .cp_comm import (
     CPCommunicationBackend,
     CPCommunicationStatus,
     CUDAAGRSAttentionCPCommunication,
+    P2PNCCLAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
 from .deterministic_attn import DeterministicAttentionOp
@@ -35,6 +36,7 @@ __all__ = [
     "CPCommunicationBackend",
     "CPCommunicationStatus",
     "CUDAAGRSAttentionCPCommunication",
+    "P2PNCCLAttentionCPCommunication",
     "DeterministicAttentionOp",
     "FlashAttentionOp",
     "FlashInferPagedAttentionConfig",

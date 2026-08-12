@@ -178,7 +178,9 @@ backend defaults:
 | `fixed:<N>` | `fixed_split_size=N`, `disable_split_kv=False` | candidate; must pass drift sweep |
 | `auto` | `disable_split_kv=False` | rejected when batch invariance is required |
 
-This aligns with PR4's current recorded-extra treatment of `split_kv_policy`.
+The shared WS2 contract now treats Split-KV as a first-class semantic field. PR7 still
+must export the backend's actual token boundaries; a requested FlashInfer knob alone is
+not sufficient evidence of train/rollout equivalence.
 Once PR1/PR4 add a first-class field, the PR7 provenance can be wired into that
 field without changing the backend adapter.
 
@@ -240,7 +242,7 @@ shared gate:
 
 | PR | Relationship |
 | --- | --- |
-| PR1 | Should eventually carry `rope_fusion_boundary`, `split_kv_policy`, `lse_exported`, `paged_kv_policy`, and `batch_invariant_claim` as contract/capability fields. |
+| PR1 | Carries the strict Split-KV policy and capability requirements; runtime adapters still export actual boundaries and fallback provenance. |
 | PR2 | Provides full/chunked/paged single-GPU references and fused-like RoPE attribution. PR7 uses the same semantic boundary, but calls a real backend candidate. |
 | PR3 | Owns CP=1/2 deterministic semantics and `global_block_index` merge. PR7 does not replace this. |
 | PR4 / #263 | Records actual backend and split-KV provenance. PR7 matches that policy and can later wire into PR4 fields. |
@@ -257,7 +259,7 @@ shared gate:
 | CP=2/TP=2 target vs missing communication operator | The issue requires distributed semantics, but the custom CUDA AG/RS communication operators are not ready. | PR7 exposes `AttentionCPCommunicationPlan` / `AttentionCPPartialState` / `CUDAAGRSAttentionCPCommunication` as interface-only, and fails if execution is required. |
 | Batch-invariant claim vs backend heuristics | Auto split-KV may depend on batch composition/runtime scheduling. | Reject `auto` when `require_batch_invariant=True`; report disabled/fixed policy explicitly. |
 | TE training lane vs FlashInfer rollout lane | Two libraries may have different materialization boundaries. | Both bind to the same RL-Kernel semantic contract and are judged by shared `out/lse/dlogp` reports. |
-| PR4 recorded extras vs future PR1 fields | `split_kv_policy` may move from provenance into first-class contract. | Keep the current provenance field stable; later wiring should be mechanical. |
+| Requested policy vs actual plan | A requested fixed/max-splits knob may not equal the runtime token boundaries. | Require actual runtime plan callbacks in strict fixed mode; fail closed when unavailable. |
 | Decode vs training full prefill | Training does not own a persistent paged KV cache. | PR7 compares rollout paged KV decode/prefill to training-style full logical KV reference, not to a nonexistent training decode cache. |
 
 No direct conflict was found between the three new points and the original PR7
@@ -318,3 +320,29 @@ This scaffold does not enable FlashInfer by default, does not implement the TE
 training lane, does not implement the custom CUDA AG/RS communication operators,
 does not replace PR3 CP merge, does not prove real H-card batch-invariance
 locally, and does not implement training backward.
+# P2P NCCL reference and strict arithmetic provenance
+
+The existing `CUDAAGRSAttentionCPCommunication` interface is preserved and
+remains fail-closed until the self-owned CUDA AG/RS kernels exist.  For GPU
+validation, `P2PNCCLAttentionCPCommunication` implements the same partial-state
+protocol with `torch.distributed.batch_isend_irecv` on an NCCL process group.
+It requires an authoritative manifest containing every logical KV block,
+token range, CP owner, TP owner, and query scatter range.  Missing blocks,
+gaps, overlaps, wrong owners, incomplete gathers, non-NCCL groups, and CPU
+tensors are rejected before merge.
+
+Strict FlashInfer validation also requires runtime callbacks for both:
+
+- the actual Split-KV token boundaries for every request; and
+- arithmetic provenance declaring FP32 accumulation, FP32 LSE, and downcast
+  only at the final output write.
+
+Requested knobs, maximum split counts, or labels such as
+`flashinfer_internal` are not accepted as proof.
+
+Run the two-GPU transport check with:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  scripts/ws2_p2p_nccl_attention_reference_check.py
+```
