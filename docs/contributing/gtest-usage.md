@@ -53,7 +53,10 @@ The CLI primarily covers **accuracy** (candidate vs gold).
 | `rl_engine/kernels/gtest/op_checks.py` | Suite execution and comparison |
 | `rl_engine/kernels/gtest/tolerance_contract.json` | Numerical contract SSOT |
 | `rl_engine/kernels/gtest/tolerance.py` | `load_contract` / `resolve_tolerance` / chain aggregates |
-| `scripts/check_operator.py` | **CLI entry** |
+| `scripts/check_operator.py` | **CLI entry** (accuracy) |
+| `rl_engine/kernels/gtest/gradient_invariance.py` | C4 gradient invariance API |
+| `rl_engine/kernels/gtest/gradient_adapters.py` | C4 enumerable adapters + status matrix |
+| `scripts/check_gradient_invariance.py` | C4 GPU evidence CLI |
 
 ---
 
@@ -225,7 +228,37 @@ python scripts/check_operator.py --op rms_norm --candidate cuda --dtype bf16 --d
 | Output vs gold | `forward_accuracy` |
 | Gradient vs gold | `gradient_accuracy` |
 
-Batch/chunk **bitwise invariance** and train/infer **three aggregates** are not separate CLI switches. Use:
+Batch/chunk **bitwise invariance** and train/infer **three aggregates** are not separate `check_operator.py` switches. Use C3/C4:
+
+```python
+from rl_engine.kernels.gtest import (
+    assert_forward_batch_invariant,
+    assert_gradient_batch_invariant,
+)
+from rl_engine.kernels.gtest.gradient_adapters import get_adapter
+
+# C4: training-style gradient accuracy + invariance (thresholds from C1 only)
+adapter = get_adapter("rms_norm")
+report = assert_gradient_batch_invariant(
+    op,
+    contract=contract,
+    backend_profile="cuda_bf16",
+    provenance=provenance,
+    gold_fn=gold_fn,
+    grad_tensors=adapter.tensors,
+    op_class=adapter.op_class,
+)
+```
+
+The three logprob aggregates judge **outputs only**. Gradient pass/fail uses only
+`gradient_accuracy` / `gradient_invariance`. GPU evidence:
+
+```bash
+python scripts/check_gradient_invariance.py \
+  --op rms_norm --candidate cuda --backend-profile cuda_bf16
+```
+
+C4 does not claim the full-model C10 gate. Use:
 
 ```python
 from rl_engine.kernels.gtest.tolerance import (
@@ -331,7 +364,7 @@ comes from the shared resolver—not hard-coded constants inside `check_operator
 
 4. --arch-key sm90 only when you need arch-specific contract overrides
 
-5. Cross batch/layout: not CLI-only; use invariance judgments + dedicated tests
+5. Cross batch/layout: C3 `check_forward_invariance.py` / C4 `check_gradient_invariance.py`
 ```
 
 ---
@@ -389,3 +422,5 @@ New pytest code should call `resolve_tolerance` instead of copying magic numbers
 | Date | Notes |
 |------|--------|
 | 2026-08-11 | Initial English guide aligned with C1; documents CLI, `OP_SPECS`, inputs, and contract usage |
+| 2026-08-13 | Document C4 `assert_gradient_batch_invariant` and `check_gradient_invariance.py` |
+| 2026-08-13 | C4 adapters run on `config.physical_layout` (packed / chunked / padded / permuted) and return physical tensors restored through the C2 map; a new adapter must vary with the layout or its bitwise verdicts are tautologies |

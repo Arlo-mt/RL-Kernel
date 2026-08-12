@@ -12,6 +12,13 @@ from .forward_invariance import (
     assert_forward_batch_invariant,
     build_config_matrix,
 )
+from .gradient_invariance import (
+    GradientInvarianceReport,
+    GradientObservation,
+    GradientTensorSpec,
+    MissingBackwardError,
+    assert_gradient_batch_invariant,
+)
 from .op_checks import CandidateSpec, OperatorCase, run_operator_suite
 from .tolerance import (
     BackendProvenance,
@@ -30,12 +37,17 @@ __all__ = [
     "CandidateSpec",
     "ConfigSpec",
     "ForwardInvarianceReport",
+    "GradientInvarianceReport",
+    "GradientObservation",
+    "GradientTensorSpec",
+    "MissingBackwardError",
     "InvarianceReport",
     "LogprobSmokeResult",
     "RuntimeObservation",
     "OperatorCase",
     "TensorComparisonDetail",
     "assert_forward_batch_invariant",
+    "assert_gradient_batch_invariant",
     "build_config_matrix",
     "run_operator_suite",
     "BackendProvenance",
