@@ -84,7 +84,6 @@ the inputs' device.
 Calling it (`__call__` -> `forward(...)`) computes in the input dtype; `forward_fp32(...)` is
 the explicit fp32 golden path (NativeAttentionOp only). The production `"attn"` op_type
 (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is a separate dispatch chain and is unaffected.
-
 ### WS2 CP-aware dispatch
 
 WS2 distributed callers use a separate contract-aware entry point,
