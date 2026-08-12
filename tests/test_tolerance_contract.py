@@ -332,6 +332,16 @@ def test_chain_aggregate_named_resolve():
         resolve_chain_aggregate_thresholds(contract, "mean_abs_dlogp", "bfloat16")
 
 
+def test_provisional_thresholds_record_calibration_rationale():
+    contract = load_contract()
+    gradient = contract["judgments"]["gradient_accuracy"]
+    assert gradient["calibration_status"] == "provisional_pending_measured_backward_evidence"
+    assert "measured evidence" in gradient["calibration_note"]
+
+    approx_kl0 = contract["chain_logprob_aggregates"]["metrics"]["approx_kl0"]
+    assert "max_abs_dlogp is therefore the stricter guard" in approx_kl0["threshold_rationale"]
+
+
 def test_compute_logprob_aggregates_formulas():
     # lhs - rhs = [0.0, 0.1, -0.2]
     lhs = torch.tensor([1.0, 2.1, 0.8], dtype=torch.float32)
@@ -469,10 +479,15 @@ def test_clipfrac0_counts_ratios_outside_the_interval():
 
 
 def test_clip_interval_endpoints_count_as_inside():
-    lo, hi = 0.5, 2.0
+    # Drive endpoints through the same float32 exp path the implementation uses so
+    # ratio0 lands exactly on the clip interval bounds (no log/exp float round-trip).
+    dlogp = torch.tensor([-1.0, 1.0], dtype=torch.float32)
+    ratio0 = torch.exp(dlogp)
+    lo = float(ratio0[0].item())
+    hi = float(ratio0[1].item())
     agg = compute_logprob_aggregates(
-        torch.tensor([math.log(lo), math.log(hi)]),
-        torch.zeros(2),
+        dlogp,
+        torch.zeros(2, dtype=torch.float32),
         torch.ones(2, dtype=torch.bool),
         contract=load_contract(),
         report_kind="train_infer_logprob_parity",

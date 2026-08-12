@@ -259,7 +259,12 @@ def validate_backend_provenance(
     policy = resolve_dtype_policy(contract)
     if provenance.backend_profile not in policy.backend_profiles:
         raise ContractResolveError(f"unknown backend_profile {provenance.backend_profile!r}")
-    profile_contract = contract["policy"]["backend_profile_contracts"][provenance.backend_profile]
+    profile_contracts = contract["policy"]["backend_profile_contracts"]
+    if provenance.backend_profile not in profile_contracts:
+        raise ContractResolveError(
+            f"missing backend_profile_contracts entry for {provenance.backend_profile!r}"
+        )
+    profile_contract = profile_contracts[provenance.backend_profile]
     expected_backend = str(profile_contract["backend_family"])
     for field_name, actual in (
         ("requested_backend", provenance.requested_backend),
@@ -922,6 +927,14 @@ def _dtype_name(dtype: str | Any) -> str:
             "torch.bfloat16": "bfloat16",
             "torch.float16": "float16",
             "torch.float8": "float8",
+            "torch.float8_e4m3fn": "float8",
+            "torch.float8_e5m2": "float8",
+            "torch.float8_e4m3fnuz": "float8",
+            "torch.float8_e5m2fnuz": "float8",
+            "float8_e4m3fn": "float8",
+            "float8_e5m2": "float8",
+            "float8_e4m3fnuz": "float8",
+            "float8_e5m2fnuz": "float8",
             "fp32": "float32",
             "bf16": "bfloat16",
             "fp16": "float16",
@@ -940,9 +953,19 @@ def _dtype_name(dtype: str | Any) -> str:
             "torch.float32": "float32",
             "torch.bfloat16": "bfloat16",
             "torch.float16": "float16",
+            "torch.float8": "float8",
+            "torch.float8_e4m3fn": "float8",
+            "torch.float8_e5m2": "float8",
+            "torch.float8_e4m3fnuz": "float8",
+            "torch.float8_e5m2fnuz": "float8",
             "float32": "float32",
             "bfloat16": "bfloat16",
             "float16": "float16",
+            "float8": "float8",
+            "float8_e4m3fn": "float8",
+            "float8_e5m2": "float8",
+            "float8_e4m3fnuz": "float8",
+            "float8_e5m2fnuz": "float8",
         }
         # torch.dtype str is like "torch.float32"
         as_str = str(dtype)
@@ -959,6 +982,15 @@ def _dtype_name(dtype: str | Any) -> str:
                 return "bfloat16"
             if dtype is torch.float16:
                 return "float16"
+            for attr in (
+                "float8_e4m3fn",
+                "float8_e5m2",
+                "float8_e4m3fnuz",
+                "float8_e5m2fnuz",
+            ):
+                torch_dtype = getattr(torch, attr, None)
+                if torch_dtype is not None and dtype is torch_dtype:
+                    return "float8"
         except ImportError:  # pragma: no cover
             pass
     raise ContractResolveError(f"unsupported dtype: {dtype!r}")

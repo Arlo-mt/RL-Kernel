@@ -1,6 +1,6 @@
 {
-  "version": "ws1-c2-v3",
-  "workload_id": "ws1-qwen3-8b-dense-primary-v3",
+  "version": "ws1-c2-v4",
+  "workload_id": "ws1-qwen3-8b-dense-primary-v4",
   "seed": 20260812,
   "model_identity": {
     "model_id": "Qwen/Qwen3-8B",
@@ -108,15 +108,14 @@
       "note": "C2 freezes naming rules; C3+ emit reports that must obey these roles."
     },
     "backend_actual_semantics": {
-      "c2_actual_backend_id": "registry_resolved_expected_candidate",
-      "c2_actual_kernel_config_id": "operator_specs_candidate_path",
-      "runtime_observed_actual_owner": [
+      "c2_representative_actual_source": "scripts/ws1_candidate_evidence.py runtime execution",
+      "full_model_runtime_observed_actual_owner": [
         "C3",
         "C8",
         "C10",
         "C11"
       ],
-      "note": "For C2, actual_* equals expected_* after operator_specs resolution. GPU runtime provenance that proves a live kernel hit is owned by later closeout children; missing required Triton nodes stay status=missing_required (red)."
+      "note": "C2 executes every representative case and records runtime-observed actual backend/kernel provenance. Later children own full-model dispatch provenance; missing required Triton nodes stay status=missing_required (red)."
     }
   },
   "stochastic_policy": {
@@ -365,8 +364,10 @@
       ],
       "note": "Shorter sequence on full architecture+weights only; never shrinks layers/hidden/heads/vocab.",
       "candidate_case_ids": [
-        "gemm-m127-k4096-n4096-no-splitk-v1",
-        "logp-vocab151936-btok17-reduction-boundary-v1"
+        "gemm-short-m8-k4096-n4096-cuda-v2",
+        "gemm-short-m8-k4096-n4096-triton-v2",
+        "logp-short-vocab151936-t4-cuda-v2",
+        "logp-short-vocab151936-t4-triton-v2"
       ]
     },
     "long_full_model_fixture": {
@@ -409,8 +410,8 @@
       ],
       "note": "Long fixed sequence on the same full architecture and pinned weight snapshot.",
       "candidate_case_ids": [
-        "attn-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
-        "attn-triton-prefill-gqa-b2-sq33-skv33-no-splitkv-v1"
+        "attn-long-decode-gqa-b1-sq1-skv32-cuda-v2",
+        "attn-long-decode-gqa-b1-sq1-skv32-triton-v2"
       ]
     },
     "representative_full_model_fixture": {
@@ -425,8 +426,10 @@
       ],
       "note": "Primary variable-length matrix fixture; full architecture+weights.",
       "candidate_case_ids": [
-        "gemm-m256-k4096-n12288-no-splitk-v1",
-        "logp-bi-triton-vocab151936-btok15-v1"
+        "gemm-primary-m59-k4096-n12288-cuda-v2",
+        "gemm-primary-m59-k4096-n12288-triton-v2",
+        "attn-primary-prefill-gqa-b4-sq19-skv19-cuda-v2",
+        "attn-primary-prefill-gqa-b4-sq19-skv19-triton-v2"
       ]
     },
     "prompt_lens": [
@@ -707,319 +710,339 @@
   },
   "representative_cases": [
     {
-      "case_id": "gemm-m127-k4096-n4096-no-splitk-v1",
+      "case_id": "gemm-short-m8-k4096-n4096-cuda-v2",
       "family": "gemm",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "short_full_model_seq8",
+      "operator_spec": "det_gemm",
       "shape": {
-        "M": 127,
+        "M": 8,
         "K": 4096,
         "N": 4096,
-        "note": "Non-tile-aligned flattened-token M on full-model projection K/N."
+        "note": "Short-fixture flattened-token M; non-tile-aligned on full-model projection K/N."
       },
       "expected_backend_id": "cuda",
       "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
       "actual_backend_id": "cuda",
       "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_k_deterministic_gemm",
       "profile_ids": [
         "cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "cuda",
         "resolved_path": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
-        "algorithm_source": "rl_engine/kernels/ops/cuda/matmul/det_gemm.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "csrc/cuda/gemm/det_gemm_kernel.cu:det_gemm_naive",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id gemm-short-m8-k4096-n4096-cuda-v2"
       }
     },
     {
-      "case_id": "gemm-m256-k4096-n12288-no-splitk-v1",
+      "case_id": "gemm-primary-m59-k4096-n12288-cuda-v2",
       "family": "gemm",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "rep_full_model_seq16",
+      "operator_spec": "det_gemm",
       "shape": {
-        "M": 256,
+        "M": 59,
         "K": 4096,
         "N": 12288,
-        "note": "Gate/up projection width (intermediate_size)."
+        "note": "Primary varlen fixture total tokens; full gate/up projection width."
       },
       "expected_backend_id": "cuda",
       "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
       "actual_backend_id": "cuda",
       "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_k_deterministic_gemm",
       "profile_ids": [
         "cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "cuda",
         "resolved_path": "rl_engine.kernels.ops.cuda.matmul.det_gemm.DetGemmOp",
-        "algorithm_source": "rl_engine/kernels/ops/cuda/matmul/det_gemm.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "csrc/cuda/gemm/det_gemm_kernel.cu:det_gemm_naive",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id gemm-primary-m59-k4096-n12288-cuda-v2"
       }
     },
     {
-      "case_id": "gemm-triton-m63-k4096-n4096-no-splitk-v1",
+      "case_id": "gemm-short-m8-k4096-n4096-triton-v2",
       "family": "gemm",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "short_full_model_seq8",
+      "operator_spec": "det_gemm",
       "shape": {
-        "M": 63,
+        "M": 8,
         "K": 4096,
         "N": 4096,
-        "note": "Non-tile-aligned M on Triton det_gemm path."
+        "note": "Short-fixture flattened-token M on Triton det_gemm path."
       },
       "expected_backend_id": "triton",
       "expected_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
       "actual_backend_id": "triton",
       "actual_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_k_deterministic_gemm",
       "profile_ids": [
         "triton_cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "triton",
         "resolved_path": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
-        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:_det_gemm_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id gemm-short-m8-k4096-n4096-triton-v2"
       }
     },
     {
-      "case_id": "gemm-triton-m256-k4096-n12288-no-splitk-v1",
+      "case_id": "gemm-primary-m59-k4096-n12288-triton-v2",
       "family": "gemm",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "rep_full_model_seq16",
+      "operator_spec": "det_gemm",
       "shape": {
-        "M": 256,
+        "M": 59,
         "K": 4096,
         "N": 12288,
-        "note": "Second Triton M and full gate/up projection width."
+        "note": "Primary varlen fixture total tokens and full gate/up projection width."
       },
       "expected_backend_id": "triton",
       "expected_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
       "actual_backend_id": "triton",
       "actual_kernel_config_id": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_k_deterministic_gemm",
       "profile_ids": [
         "triton_cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "triton",
         "resolved_path": "rl_engine.kernels.ops.triton.matmul.det_gemm.TritonDetGemmOp",
-        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "rl_engine/kernels/ops/triton/matmul/det_gemm.py:_det_gemm_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id gemm-primary-m59-k4096-n12288-triton-v2"
       }
     },
     {
-      "case_id": "attn-prefill-gqa-b2-sq31-skv31-no-splitkv-v1",
+      "case_id": "attn-primary-prefill-gqa-b4-sq19-skv19-cuda-v2",
       "family": "attention",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "rep_full_model_seq16",
+      "operator_spec": "attention",
       "shape": {
-        "B": 2,
+        "B": 4,
         "Hq": 32,
         "Hkv": 8,
-        "Sq": 31,
-        "Skv": 31,
+        "Sq": 19,
+        "Skv": 19,
         "D": 128,
         "mode": "prefill",
-        "note": "Non-tile-aligned sequence; GQA as official."
+        "note": "Primary max-varlen prefill; non-tile-aligned sequence and official GQA."
       },
       "expected_backend_id": "cuda",
       "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
       "actual_backend_id": "cuda",
       "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_kv_batch_invariant_attention",
       "profile_ids": [
         "cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "cuda",
         "resolved_path": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
-        "algorithm_source": "rl_engine/kernels/ops/cuda/attention/deterministic_attn.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "csrc/cuda/attention/deterministic_attention.cu:deterministic_attention_forward",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id attn-primary-prefill-gqa-b4-sq19-skv19-cuda-v2"
       }
     },
     {
-      "case_id": "attn-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
+      "case_id": "attn-long-decode-gqa-b1-sq1-skv32-cuda-v2",
       "family": "attention",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "long_full_model_seq32",
+      "operator_spec": "attention",
       "shape": {
         "B": 1,
         "Hq": 32,
         "Hkv": 8,
         "Sq": 1,
-        "Skv": 129,
+        "Skv": 32,
         "D": 128,
         "mode": "decode",
-        "note": "Decode step with non-tile-aligned KV length."
+        "note": "Decode step over the fixed long fixture KV length."
       },
       "expected_backend_id": "cuda",
       "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
       "actual_backend_id": "cuda",
       "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_kv_batch_invariant_attention",
       "profile_ids": [
         "cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "cuda",
         "resolved_path": "rl_engine.kernels.ops.cuda.attention.deterministic_attn.DeterministicAttentionOp",
-        "algorithm_source": "rl_engine/kernels/ops/cuda/attention/deterministic_attn.py:3",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "csrc/cuda/attention/deterministic_attention.cu:deterministic_attention_forward",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id attn-long-decode-gqa-b1-sq1-skv32-cuda-v2"
       }
     },
     {
-      "case_id": "attn-triton-prefill-gqa-b2-sq33-skv33-no-splitkv-v1",
+      "case_id": "attn-primary-prefill-gqa-b4-sq19-skv19-triton-v2",
       "family": "attention",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "rep_full_model_seq16",
+      "operator_spec": "attention",
       "shape": {
-        "B": 2,
+        "B": 4,
         "Hq": 32,
         "Hkv": 8,
-        "Sq": 33,
-        "Skv": 33,
+        "Sq": 19,
+        "Skv": 19,
         "D": 128,
         "mode": "prefill",
-        "note": "Triton batch-invariant attention; non-power-of-two seq."
+        "note": "Triton primary max-varlen prefill; non-power-of-two sequence."
       },
       "expected_backend_id": "triton",
       "expected_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
       "actual_backend_id": "triton",
       "actual_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_kv_batch_invariant_attention",
       "profile_ids": [
         "triton_cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "triton",
         "resolved_path": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
-        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:1",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:_standard_attn_fwd_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id attn-primary-prefill-gqa-b4-sq19-skv19-triton-v2"
       }
     },
     {
-      "case_id": "attn-triton-decode-gqa-b1-sq1-skv129-no-splitkv-v1",
+      "case_id": "attn-long-decode-gqa-b1-sq1-skv32-triton-v2",
       "family": "attention",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "long_full_model_seq32",
+      "operator_spec": "attention",
       "shape": {
         "B": 1,
         "Hq": 32,
         "Hkv": 8,
         "Sq": 1,
-        "Skv": 129,
+        "Skv": 32,
         "D": 128,
         "mode": "decode",
-        "note": "Triton decode with non-tile-aligned KV length."
+        "note": "Triton decode over the fixed long fixture KV length."
       },
       "expected_backend_id": "triton",
       "expected_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
       "actual_backend_id": "triton",
       "actual_kernel_config_id": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "no_split_kv_batch_invariant_attention",
       "profile_ids": [
         "triton_cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "triton",
         "resolved_path": "rl_engine.kernels.ops.triton.attention.standard_attn.TritonBatchInvariantAttentionOp",
-        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:1",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "rl_engine/kernels/ops/triton/attention/standard_attn.py:_standard_attn_fwd_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id attn-long-decode-gqa-b1-sq1-skv32-triton-v2"
       }
     },
     {
-      "case_id": "logp-vocab151936-btok17-reduction-boundary-v1",
+      "case_id": "logp-short-vocab151936-t4-cuda-v2",
       "family": "logprob",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "short_full_model_seq8",
+      "operator_spec": "logp",
       "shape": {
         "B": 1,
-        "T": 17,
+        "T": 4,
         "vocab": 151936,
-        "note": "Full vocab; token count crosses common 16-aligned reduction boundary."
+        "note": "Short-fixture active selected tokens; full vocab crosses the CUDA reduction boundary."
       },
       "expected_backend_id": "cuda",
       "expected_kernel_config_id": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
       "actual_backend_id": "cuda",
       "actual_kernel_config_id": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "deterministic_selected_logprob",
       "profile_ids": [
         "cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "cuda",
         "resolved_path": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
-        "algorithm_source": "rl_engine/kernels/ops/cuda/loss/logp.py:213",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "csrc/fused_logp_kernel.cu:fused_logp_forward_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id logp-short-vocab151936-t4-cuda-v2"
       }
     },
     {
-      "case_id": "logp-bi-triton-vocab151936-btok15-v1",
+      "case_id": "logp-short-vocab151936-t4-triton-v2",
       "family": "logprob",
-      "revision": 1,
+      "revision": 2,
+      "fixture_id": "short_full_model_seq8",
+      "operator_spec": "batch_invariant_logp",
       "shape": {
         "B": 1,
-        "T": 15,
+        "T": 4,
         "vocab": 151936,
-        "note": "Triton batch-invariant logp on full vocab; non-aligned T."
+        "note": "Short-fixture active selected tokens; full vocab crosses Triton BLOCK_V reductions."
       },
       "expected_backend_id": "triton",
       "expected_kernel_config_id": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
       "actual_backend_id": "triton",
       "actual_kernel_config_id": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
-      "provenance_status": "registry_resolved_runtime_pending",
+      "provenance_status": "runtime_evidence_required",
       "algorithm_property": "batch_invariant_logprob_reduction",
       "profile_ids": [
         "triton_cuda_bf16"
       ],
       "architecture_identity": "full_qwen3_8b_dense",
       "provenance_evidence": {
-        "kind": "operator_specs_registry_resolution",
+        "kind": "runtime_execution_via_operator_specs",
         "registry": "rl_engine/kernels/gtest/operator_specs.py",
         "candidate_name": "triton",
         "resolved_path": "rl_engine.kernels.ops.triton.loss.batch_invariant_logp.TritonBatchInvariantLogpOp",
-        "algorithm_source": "rl_engine/kernels/ops/triton/loss/batch_invariant_logp.py:1",
-        "runtime_evidence_owner": "C8/C10/C11"
+        "algorithm_source": "rl_engine/kernels/ops/triton/loss/batch_invariant_logp.py:_batch_invariant_logp_kernel",
+        "runtime_evidence_command": "python scripts/ws1_candidate_evidence.py --case-id logp-short-vocab151936-t4-triton-v2"
       }
     }
   ],
-  "fixture_identity_sha256": "c2ec565a575aa3a02c3a27d89ffba3162d93455efd53a7fcb1de11f7e9db7f3d",
+  "fixture_identity_sha256": "9ebc2c68f411622656c66ab93fa35f39a417e6521cea3d179448626fd1a82675",
   "provenance_boundary": {
-    "c2_scope": "logical_workload_identity_and_registry_path_binding",
+    "c2_scope": "logical_workload_identity_and_executed_representative_candidate_binding",
     "not_in_c2": [
       "full_model_forward",
       "numerical_150_asserts",
-      "runtime_kernel_dispatch_observation",
+      "full_model_runtime_kernel_dispatch_observation",
       "multi_gpu"
     ],
     "runtime_evidence_owner": [

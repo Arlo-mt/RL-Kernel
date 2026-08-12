@@ -1,7 +1,9 @@
 # WS1 C2 (#268) Landing Plan — Canonical Workload & Logical Identity
 
-**Parent:** #266 · **Issue:** #268 · **Depends on:** C1 (#267) contract roles only  
-**Branch:** `feat/ws1-c2-canonical-workload-268` (from `feat/ws1-c1-tolerance-contract-267@81ddd65`)  
+**Parent:** #266 · **Issue:** #268 · **Depends on:** C1 (#267) contract roles only
+
+**Branch:** `feat/ws1-c2-canonical-workload-268` (from `feat/ws1-c1-tolerance-contract-267@81ddd65`)
+
 **Does not modify:** C1 branch tip
 
 ---
@@ -140,13 +142,13 @@ Changing any pinned field → new `case_id` / revision.
 
 ```text
 load_manifest() / validate_manifest()
-build_logical_batch(workload_id) -> LogicalBatch
+build_logical_batch(manifest=None, *, cell_id=None, sample_ids=None) -> LogicalBatch
   samples: list[LogicalSample]  # sample_id, token_ids, positions, loss_mask, ...
 apply_padding(batch) / apply_chunking(batch) / apply_packing(batch) -> physical layout
 restore_logical_order(physical, values) -> aligned values keyed by (sample_id, token_position)
 singleton_aggregate_plan(N samples) -> execution schedule for B1×N vs BN
 fixture_hash(batch|manifest) -> stable hex
-matrix_cells() / get_cell(cell_id)
+matrix_cell_ids() / get_matrix_cell(manifest, cell_id)
 profile_required_nodes(profile_id)
 get_case(case_id)
 ```
@@ -171,7 +173,7 @@ python scripts/ws1_reference.py \
 ```
 
 Emits: workload_id, seed, dtype, fixture_hash, model identity pins, cell descriptor,
-clip_interval, profile ids, and deterministic logical/pad/chunk/pack/short/long tensor digests.  
+clip_interval, profile ids, and deterministic logical/pad/chunk/pack/short/long tensor digests.
 Does **not** run full 8B forward (owned by C9/C10); may emit tensor fixture digests for token/mask tensors only.
 
 ---
@@ -261,5 +263,5 @@ CPU-only; no GPU / no weight download required for C2 unit tests.
 - [x] `pytest tests/test_ws1_workload.py -q` green — 33 passed (CPU).
 - [x] `python scripts/ws1_reference.py` emits workload_id / seed / dtype / fixture digests.
 - [x] Closeout evidence: `docs/design/ws1-c2-268-closeout-evidence.md`.
-- [x] #268 residual closeout: per-sample `completion_lens`, TF32 ref, report naming, registry-vs-runtime actual boundary.
+- [x] #268 residual closeout: per-sample `completion_lens`, TF32 ref, report naming, fixture-derived representative shapes, and executable CUDA/Triton actual provenance.
 - [x] Explicit non-claim: does not close #266 or turn Triton missing_required green.

@@ -7,7 +7,8 @@ RL-Kernel uses focused tests for dispatch behavior and operator accuracy.
 Primary entry for single-operator forward/backward checks against a PyTorch gold path:
 
 ```bash
-python scripts/check_operator.py --op logp --candidate pytorch --device cpu --dtype fp32
+python scripts/check_operator.py --op logp --candidate pytorch --device cpu --dtype fp32 \
+  --batch 1 --seq 2 --vocab 17
 ```
 
 Full usage (register `OP_SPECS`, build inputs, CLI flags, and the WS1 four-judgment

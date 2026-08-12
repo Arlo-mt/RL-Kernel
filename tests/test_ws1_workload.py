@@ -5,18 +5,20 @@
 
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from rl_engine.kernels.gtest.operator_specs import OP_SPECS
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_SCRIPT = REPO_ROOT / "scripts" / "ws1_reference.py"
+CANDIDATE_EVIDENCE_SCRIPT = REPO_ROOT / "scripts" / "ws1_candidate_evidence.py"
 CONTRACT_PATH = REPO_ROOT / "rl_engine/kernels/gtest/tolerance_contract.json"
-OPERATOR_SPECS_PATH = REPO_ROOT / "rl_engine/kernels/gtest/operator_specs.py"
 
 
 def _load_pure_workload_module():
@@ -60,6 +62,7 @@ validate_manifest = ws1.validate_manifest
 
 def load_contract():
     return json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+
 
 REQUIRED_CELLS = {
     "B1-singleton_aggregate/full",
@@ -194,18 +197,14 @@ def test_chain_semantics_report_and_actual_boundaries(manifest):
         "baseline",
         "singleton_aggregate",
     }
+    assert sem["report_naming"]["singleton_aggregate_is"] == "c2_execution_aggregation_mode_only"
     assert (
-        sem["report_naming"]["singleton_aggregate_is"]
-        == "c2_execution_aggregation_mode_only"
+        sem["backend_actual_semantics"]["c2_representative_actual_source"]
+        == "scripts/ws1_candidate_evidence.py runtime execution"
     )
-    assert (
-        sem["backend_actual_semantics"]["c2_actual_backend_id"]
-        == "registry_resolved_expected_candidate"
-    )
-    assert "C8" in sem["backend_actual_semantics"]["runtime_observed_actual_owner"]
+    assert "C8" in sem["backend_actual_semantics"]["full_model_runtime_observed_actual_owner"]
     boundary = manifest.raw["provenance_boundary"]
     assert "full_model_forward" in boundary["not_in_c2"]
-    assert "runtime_kernel_dispatch_observation" in boundary["not_in_c2"]
 
 
 def test_stale_primary_completion_len_rejected():
@@ -255,6 +254,7 @@ def test_batch_permutation_restores_multiset(manifest):
     perm = batch_permutation_from_manifest(manifest)
     permuted = permute_batch(batch, perm)
     assert permuted.sample_ids != batch.sample_ids
+
     # Multiset equality is order-sensitive in token_multiset (fixed order).
     # After sorting by sample_id, the pairs must match.
     def sorted_multiset(b):
@@ -268,9 +268,7 @@ def test_batch_permutation_restores_multiset(manifest):
     # samples in permuted are batch.samples[perm[i]]; map back:
     restored_samples = []
     for old_i in range(len(batch.samples)):
-        # find which permuted index holds original old_i
-        new_i = list(perm).index(old_i)
-        restored_samples.append(permuted.samples[new_i])
+        restored_samples.append(permuted.samples[inverse[old_i]])
     restored = ws1.LogicalBatch(
         workload_id=batch.workload_id,
         seed=batch.seed,
@@ -382,8 +380,9 @@ def test_representative_cases_stable_ids_and_pins(manifest):
         assert case["architecture_identity"] == "full_qwen3_8b_dense"
         assert case["expected_backend_id"] == case["actual_backend_id"]
         assert case["expected_kernel_config_id"] == case["actual_kernel_config_id"]
-        assert case["provenance_status"] == "registry_resolved_runtime_pending"
+        assert case["provenance_status"] == "runtime_evidence_required"
         assert case["provenance_evidence"]["resolved_path"] == case["actual_kernel_config_id"]
+        assert case["provenance_evidence"]["runtime_evidence_command"]
         assert case["algorithm_property"]
         assert "shape" in case
     for profile in ("cuda_bf16", "triton_cuda_bf16"):
@@ -394,26 +393,51 @@ def test_representative_cases_stable_ids_and_pins(manifest):
         ]
         assert {c["family"] for c in cases} == {"gemm", "attention", "logprob"}
         assert len({c["shape"]["M"] for c in cases if c["family"] == "gemm"}) >= 2
-        attention_modes = {
-            c["shape"]["mode"] for c in cases if c["family"] == "attention"
-        }
+        attention_modes = {c["shape"]["mode"] for c in cases if c["family"] == "attention"}
         assert attention_modes == {"prefill", "decode"}
 
 
+def test_fixture_case_shapes_are_derived_from_fixed_fixtures(manifest):
+    fixtures = manifest.fixtures
+    cases = {case["case_id"]: case for case in manifest.representative_cases}
+    for fixture_name in (
+        "short_full_model_fixture",
+        "long_full_model_fixture",
+        "representative_full_model_fixture",
+    ):
+        fixture = fixtures[fixture_name]
+        for case_id in fixture["candidate_case_ids"]:
+            assert cases[case_id]["fixture_id"] == fixture["fixture_id"]
+
+    short_cases = [
+        cases[case_id] for case_id in fixtures["short_full_model_fixture"]["candidate_case_ids"]
+    ]
+    assert {case["shape"]["M"] for case in short_cases if case["family"] == "gemm"} == {8}
+    assert {case["shape"]["T"] for case in short_cases if case["family"] == "logprob"} == {4}
+    primary_cases = [
+        cases[case_id]
+        for case_id in fixtures["representative_full_model_fixture"]["candidate_case_ids"]
+    ]
+    assert {case["shape"]["M"] for case in primary_cases if case["family"] == "gemm"} == {59}
+    assert {
+        (case["shape"]["B"], case["shape"]["Sq"], case["shape"]["Skv"])
+        for case in primary_cases
+        if case["family"] == "attention"
+    } == {(4, 19, 19)}
+
+
 def test_declared_candidates_resolve_to_real_operator_specs(manifest):
-    source = OPERATOR_SPECS_PATH.read_text(encoding="utf-8")
     spec_map = manifest.raw["capabilities"]["operator_spec_map"]
     for node, spec_name in spec_map.items():
-        assert f'"{spec_name}": OperatorSpec(' in source, node
+        assert spec_name in OP_SPECS, node
     for case in manifest.representative_cases:
         evidence = case["provenance_evidence"]
-        resolved_class = evidence["resolved_path"].rsplit(".", 1)[1]
-        assert resolved_class in source
-        assert f'"{evidence["candidate_name"]}"' in source
-        algorithm_path, line = evidence["algorithm_source"].rsplit(":", 1)
+        spec = OP_SPECS[case["operator_spec"]]
+        assert spec.candidate_paths[evidence["candidate_name"]] == evidence["resolved_path"]
+        algorithm_path, symbol = evidence["algorithm_source"].rsplit(":", 1)
         algorithm_file = REPO_ROOT / algorithm_path
         assert algorithm_file.is_file()
-        assert 1 <= int(line) <= len(algorithm_file.read_text(encoding="utf-8").splitlines())
+        assert symbol in algorithm_file.read_text(encoding="utf-8")
 
 
 def test_capabilities_packing_and_qk_norm(manifest):
@@ -460,6 +484,7 @@ def test_reference_payload_contains_required_fields(manifest):
     assert payload["fixture_hash"] == fixture_hash(manifest)
     assert payload["cell_id"] == "BN/full"
     assert payload["clip_interval"] == [0.8, 1.2]
+    assert "c2_representative_actual_source" in payload["backend_actual_semantics"]
 
 
 def test_ws1_reference_cli_emits_identity():
@@ -478,6 +503,7 @@ def test_ws1_reference_cli_emits_identity():
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
+        timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
@@ -485,6 +511,19 @@ def test_ws1_reference_cli_emits_identity():
     assert "seed" in payload
     assert payload["dtype"] == "bfloat16"
     assert len(payload["fixture_hash"]) == 64
+
+
+def test_candidate_evidence_cli_help_is_available():
+    proc = subprocess.run(
+        [sys.executable, str(CANDIDATE_EVIDENCE_SCRIPT), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "representative candidates on a real GPU" in proc.stdout
 
 
 def test_build_chunk_plan_edges():

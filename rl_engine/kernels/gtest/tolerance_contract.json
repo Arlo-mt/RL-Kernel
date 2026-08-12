@@ -126,6 +126,8 @@
     },
     "gradient_accuracy": {
       "default_mode": "tolerance",
+      "calibration_status": "provisional_pending_measured_backward_evidence",
+      "calibration_note": "C1 keeps gradient rows independent from forward rows. The initial values intentionally match the forward table until per-operator CUDA and Triton backward error distributions are recorded; revise them only from measured evidence.",
       "by_op_class": {
         "elementwise": {
           "float32": {"status": "applicable", "mode": "tolerance", "atol": 1.0e-5, "rtol": 1.0e-5},
@@ -217,6 +219,7 @@
       "approx_kl0": {
         "formula": "mean(exp(dlogp) - 1 - dlogp)",
         "pass_rule": "value <= threshold",
+        "threshold_rationale": "The initial C1 thresholds intentionally preserve the same drift scale as max_abs_dlogp for compatibility. max_abs_dlogp is therefore the stricter guard in this version; approx_kl0 remains a required reported metric pending measured chain-level distributions, after which its threshold may be tightened without introducing an unevidenced C2-local value.",
         "by_execution_dtype": {
           "bfloat16": {"threshold": 5.0e-2},
           "float32": {"threshold": 1.0e-5},

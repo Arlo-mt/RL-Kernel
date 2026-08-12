@@ -19,12 +19,14 @@ from .ws1_workload import (
     WorkloadError,
     WS1Manifest,
     apply_chunking,
+    apply_padding,
     apply_packing,
     build_logical_batch,
     fixture_hash,
     load_manifest,
     reference_payload,
     restore_logical_order,
+    restore_logical_order_from_padded,
 )
 
 __all__ = [
@@ -35,6 +37,7 @@ __all__ = [
     "WorkloadError",
     "active_token_count",
     "apply_chunking",
+    "apply_padding",
     "apply_packing",
     "build_logical_batch",
     "compute_policy_ratio",
@@ -46,6 +49,7 @@ __all__ = [
     "masked_sum",
     "reference_payload",
     "restore_logical_order",
+    "restore_logical_order_from_padded",
     "selected_logprobs_reference",
     "summarize_kernel_drift",
 ]

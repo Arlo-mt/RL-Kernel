@@ -74,6 +74,13 @@ class WorkloadError(ValueError):
     """Raised when the WS1 workload manifest or fixture is invalid."""
 
 
+def _require(mapping: Mapping[str, Any], key: str, *, context: str) -> Any:
+    """Return mapping[key] or raise WorkloadError (never bare KeyError)."""
+    if key not in mapping:
+        raise WorkloadError(f"{context} missing {key!r}")
+    return mapping[key]
+
+
 @dataclass(frozen=True)
 class LogicalToken:
     """One active or inactive logical token position."""
@@ -276,6 +283,7 @@ def validate_manifest(raw: Mapping[str, Any]) -> None:
     _validate_capabilities(raw["capabilities"])
     _validate_backend_profiles(raw["backend_profiles"], raw["capabilities"])
     _validate_representative_cases(raw["representative_cases"])
+    _validate_fixture_case_bindings(raw["fixtures"], raw["representative_cases"])
     expected_identity = manifest_identity_hash(raw)
     if raw["fixture_identity_sha256"] != expected_identity:
         raise WorkloadError(
@@ -309,15 +317,14 @@ def _validate_model_identity(identity: Mapping[str, Any]) -> None:
         "content_hash_algorithm",
         "content_hash",
         "shards",
+        "weight_files_total_size_bytes",
     ):
         if key not in weight:
             raise WorkloadError(f"weight_snapshot missing {key!r}")
     shards = weight["shards"]
     if not isinstance(shards, list) or not shards:
         raise WorkloadError("weight_snapshot.shards must be a non-empty list")
-    if int(weight["weight_files_total_size_bytes"]) != sum(
-        int(s["size_bytes"]) for s in shards
-    ):
+    if int(weight["weight_files_total_size_bytes"]) != sum(int(s["size_bytes"]) for s in shards):
         raise WorkloadError("weight_snapshot file total does not match shard sizes")
     for shard in shards:
         digest = str(shard.get("sha256", ""))
@@ -378,14 +385,12 @@ def _validate_chain_semantics(sem: Mapping[str, Any]) -> None:
     actual_sem = sem["backend_actual_semantics"]
     if not isinstance(actual_sem, Mapping):
         raise WorkloadError("backend_actual_semantics must be an object")
-    if actual_sem.get("c2_actual_backend_id") != "registry_resolved_expected_candidate":
-        raise WorkloadError(
-            "C2 actual_backend_id semantics must be registry_resolved_expected_candidate"
-        )
-    if "C8" not in actual_sem.get("runtime_observed_actual_owner", []):
-        raise WorkloadError(
-            "backend_actual_semantics must assign runtime observed actuals to C8+"
-        )
+    if actual_sem.get("c2_representative_actual_source") != (
+        "scripts/ws1_candidate_evidence.py runtime execution"
+    ):
+        raise WorkloadError("C2 representative actual provenance must come from runtime execution")
+    if "C8" not in actual_sem.get("full_model_runtime_observed_actual_owner", []):
+        raise WorkloadError("backend_actual_semantics must assign full-model actuals to C8+")
 
 
 def _validate_stochastic_policy(policy: Mapping[str, Any]) -> None:
@@ -401,22 +406,24 @@ def _validate_stochastic_policy(policy: Mapping[str, Any]) -> None:
 
 
 def _validate_primary_matrix(matrix: Mapping[str, Any], fixtures: Mapping[str, Any]) -> None:
-    n = int(matrix["N"])
+    n = int(_require(matrix, "N", context="primary_matrix"))
     if n <= 1:
         raise WorkloadError("primary_matrix.N must be > 1")
-    sample_ids = list(matrix["sample_ids"])
+    sample_ids = list(_require(matrix, "sample_ids", context="primary_matrix"))
     if len(sample_ids) != n:
         raise WorkloadError("sample_ids length must equal N")
     if len(set(sample_ids)) != n:
         raise WorkloadError("sample_ids must be unique")
     perm = matrix.get("batch_permutation", {})
     if perm.get("enabled"):
-        p = list(perm["permutation"])
+        p = list(_require(perm, "permutation", context="primary_matrix.batch_permutation"))
         if sorted(p) != list(range(n)):
             raise WorkloadError("batch_permutation.permutation must be a permutation of [0..N)")
-    chunk = matrix["chunk"]
-    chunk_size = int(chunk["chunk_size_tokens"])
-    seq_len = int(fixtures["primary_seq_len"])
+    chunk = _require(matrix, "chunk", context="primary_matrix")
+    if not isinstance(chunk, Mapping):
+        raise WorkloadError("primary_matrix.chunk must be an object")
+    chunk_size = int(_require(chunk, "chunk_size_tokens", context="primary_matrix.chunk"))
+    seq_len = int(_require(fixtures, "primary_seq_len", context="fixtures"))
     if chunk_size <= 0:
         raise WorkloadError("chunk_size_tokens must be positive")
     plan = build_chunk_plan(seq_len, chunk_size)
@@ -425,7 +432,7 @@ def _validate_primary_matrix(matrix: Mapping[str, Any], fixtures: Mapping[str, A
     if chunk.get("non_divisible_case") and seq_len % chunk_size == 0:
         raise WorkloadError("non_divisible_case requires seq_len % chunk_size != 0")
 
-    cells = matrix["cells"]
+    cells = _require(matrix, "cells", context="primary_matrix")
     if not isinstance(cells, list):
         raise WorkloadError("primary_matrix.cells must be a list")
     cell_ids = [c["cell_id"] for c in cells]
@@ -454,8 +461,8 @@ def _validate_fixtures(fixtures: Mapping[str, Any], matrix: Mapping[str, Any]) -
             f"fixtures.samples order/ids must match primary_matrix.sample_ids "
             f"{expected_ids}, got {got_ids}"
         )
-    primary_seq = int(fixtures["primary_seq_len"])
-    declared_varlen = [int(x) for x in fixtures["varlen_seq_lens"]]
+    primary_seq = int(_require(fixtures, "primary_seq_len", context="fixtures"))
+    declared_varlen = [int(x) for x in _require(fixtures, "varlen_seq_lens", context="fixtures")]
     if declared_varlen != [int(s["seq_len"]) for s in samples]:
         raise WorkloadError("varlen_seq_lens must match fixtures.samples seq_len values")
     for sample in samples:
@@ -471,15 +478,11 @@ def _validate_fixtures(fixtures: Mapping[str, Any], matrix: Mapping[str, Any]) -
         raise WorkloadError("primary_seq_len must equal the maximum varlen sequence length")
     # Per-sample prompt/completion lengths are authoritative (no stale scalar pin).
     expected_prompt_lens = [int(s["prompt_len"]) for s in samples]
-    expected_completion_lens = [
-        int(s["seq_len"]) - int(s["prompt_len"]) for s in samples
-    ]
+    expected_completion_lens = [int(s["seq_len"]) - int(s["prompt_len"]) for s in samples]
     if list(fixtures.get("prompt_lens", [])) != expected_prompt_lens:
         raise WorkloadError("fixtures.prompt_lens must match per-sample prompt_len values")
     if list(fixtures.get("completion_lens", [])) != expected_completion_lens:
-        raise WorkloadError(
-            "fixtures.completion_lens must match per-sample (seq_len - prompt_len)"
-        )
+        raise WorkloadError("fixtures.completion_lens must match per-sample (seq_len - prompt_len)")
     if int(fixtures.get("max_completion_len", -1)) != max(expected_completion_lens):
         raise WorkloadError("fixtures.max_completion_len must equal max(completion_lens)")
     if "primary_completion_len" in fixtures:
@@ -487,10 +490,14 @@ def _validate_fixtures(fixtures: Mapping[str, Any], matrix: Mapping[str, Any]) -
             "fixtures.primary_completion_len is forbidden under varlen primary samples; "
             "use completion_lens / max_completion_len"
         )
-    padding = fixtures["padding"]
+    padding = _require(fixtures, "padding", context="fixtures")
+    if not isinstance(padding, Mapping):
+        raise WorkloadError("fixtures.padding must be an object")
     if "right" not in padding["modes"] or "left" not in padding["modes"]:
         raise WorkloadError("padding.modes must include left and right")
-    packing = fixtures["packing"]
+    packing = _require(fixtures, "packing", context="fixtures")
+    if not isinstance(packing, Mapping):
+        raise WorkloadError("fixtures.packing must be an object")
     if packing["status"] not in {
         "supported",
         "n_a_with_capability_proof",
@@ -502,9 +509,13 @@ def _validate_fixtures(fixtures: Mapping[str, Any], matrix: Mapping[str, Any]) -
         raise WorkloadError("packing op is present, so C2 must pin a supported packed fixture")
     if not packing.get("packed_fixture"):
         raise WorkloadError("supported packing requires packed_fixture")
-    for name in ("short_full_model_fixture", "long_full_model_fixture"):
+    for name in (
+        "short_full_model_fixture",
+        "long_full_model_fixture",
+        "representative_full_model_fixture",
+    ):
         fixture = fixtures[name]
-        if len(fixture["token_ids"]) != int(fixture["seq_len"]):
+        if "token_ids" in fixture and len(fixture["token_ids"]) != int(fixture["seq_len"]):
             raise WorkloadError(f"{name} token_ids length mismatch")
         if not fixture.get("candidate_case_ids"):
             raise WorkloadError(f"{name} must reference representative case IDs")
@@ -538,9 +549,7 @@ def _validate_backend_profiles(
         if name not in profiles:
             raise WorkloadError(f"backend_profiles missing required profile {name!r}")
     required_ops = [
-        e["op"]
-        for e in capabilities["required_chain_ops"]
-        if e["status"] == "required"
+        e["op"] for e in capabilities["required_chain_ops"] if e["status"] == "required"
     ]
     for name, profile in profiles.items():
         nodes = profile.get("required_nodes")
@@ -601,6 +610,8 @@ def _validate_representative_cases(cases: Sequence[Mapping[str, Any]]) -> None:
             "provenance_evidence",
             "algorithm_property",
             "architecture_identity",
+            "fixture_id",
+            "operator_spec",
         ):
             if key not in case:
                 raise WorkloadError(f"case {case.get('case_id')} missing {key!r}")
@@ -608,21 +619,21 @@ def _validate_representative_cases(cases: Sequence[Mapping[str, Any]]) -> None:
             raise WorkloadError(
                 f"case {case['case_id']} must pin architecture_identity=full_qwen3_8b_dense"
             )
-        if case["provenance_status"] != "registry_resolved_runtime_pending":
-            raise WorkloadError(
-                f"case {case['case_id']} must distinguish registry resolution from runtime"
-            )
+        if case["provenance_status"] != "runtime_evidence_required":
+            raise WorkloadError(f"case {case['case_id']} must require runtime candidate evidence")
         if case["actual_backend_id"] != case["expected_backend_id"]:
             raise WorkloadError(f"case {case['case_id']} actual backend mismatch")
         if case["actual_kernel_config_id"] != case["expected_kernel_config_id"]:
             raise WorkloadError(f"case {case['case_id']} actual kernel mismatch")
         evidence = case["provenance_evidence"]
-        if evidence.get("kind") != "operator_specs_registry_resolution":
-            raise WorkloadError(f"case {case['case_id']} lacks registry provenance")
+        if evidence.get("kind") != "runtime_execution_via_operator_specs":
+            raise WorkloadError(f"case {case['case_id']} lacks runtime provenance command")
         if evidence.get("resolved_path") != case["actual_kernel_config_id"]:
             raise WorkloadError(f"case {case['case_id']} evidence path mismatch")
         if not evidence.get("algorithm_source"):
             raise WorkloadError(f"case {case['case_id']} lacks algorithm source proof")
+        if not evidence.get("runtime_evidence_command"):
+            raise WorkloadError(f"case {case['case_id']} lacks runtime evidence command")
     for profile in _REQUIRED_PROFILES:
         profile_cases = [c for c in cases if profile in c.get("profile_ids", [])]
         for family in ("gemm", "attention", "logprob"):
@@ -634,11 +645,73 @@ def _validate_representative_cases(cases: Sequence[Mapping[str, Any]]) -> None:
         gemm_m = {int(c["shape"]["M"]) for c in profile_cases if c["family"] == "gemm"}
         if len(gemm_m) < 2:
             raise WorkloadError(f"profile {profile} GEMM cases require multiple M values")
-        attn_modes = {
-            c["shape"]["mode"] for c in profile_cases if c["family"] == "attention"
-        }
+        attn_modes = {c["shape"]["mode"] for c in profile_cases if c["family"] == "attention"}
         if attn_modes != {"prefill", "decode"}:
             raise WorkloadError(f"profile {profile} attention cases require prefill+decode")
+
+
+def _validate_fixture_case_bindings(
+    fixtures: Mapping[str, Any], cases: Sequence[Mapping[str, Any]]
+) -> None:
+    """Require every fixture→case edge to describe a shape produced by that fixture."""
+    fixture_names = (
+        "short_full_model_fixture",
+        "long_full_model_fixture",
+        "representative_full_model_fixture",
+    )
+    by_fixture_id = {fixtures[name]["fixture_id"]: fixtures[name] for name in fixture_names}
+    by_case_id = {case["case_id"]: case for case in cases}
+
+    for fixture_id, fixture in by_fixture_id.items():
+        for case_id in fixture["candidate_case_ids"]:
+            if case_id not in by_case_id:
+                raise WorkloadError(f"fixture {fixture_id} references unknown case {case_id!r}")
+            if by_case_id[case_id]["fixture_id"] != fixture_id:
+                raise WorkloadError(
+                    f"fixture {fixture_id} references case {case_id!r} bound to "
+                    f"{by_case_id[case_id]['fixture_id']!r}"
+                )
+
+    referenced = {
+        case_id for fixture in by_fixture_id.values() for case_id in fixture["candidate_case_ids"]
+    }
+    if referenced != set(by_case_id):
+        raise WorkloadError("every representative case must be referenced by its source fixture")
+
+    short = fixtures["short_full_model_fixture"]
+    long = fixtures["long_full_model_fixture"]
+    primary_total_tokens = sum(int(sample["seq_len"]) for sample in fixtures["samples"])
+    primary_max_seq = max(int(sample["seq_len"]) for sample in fixtures["samples"])
+    expected_shapes = {
+        "short_full_model_seq8": {
+            "gemm": {"M": int(short["seq_len"])},
+            "logprob": {"B": 1, "T": int(short["seq_len"]) - int(short["prompt_len"])},
+        },
+        "long_full_model_seq32": {
+            "attention": {"B": 1, "Sq": 1, "Skv": int(long["seq_len"]), "mode": "decode"}
+        },
+        "rep_full_model_seq16": {
+            "gemm": {"M": primary_total_tokens},
+            "attention": {
+                "B": len(fixtures["samples"]),
+                "Sq": primary_max_seq,
+                "Skv": primary_max_seq,
+                "mode": "prefill",
+            },
+        },
+    }
+    for case in cases:
+        required = expected_shapes[case["fixture_id"]][case["family"]]
+        mismatched = {
+            key: (case["shape"].get(key), value)
+            for key, value in required.items()
+            if case["shape"].get(key) != value
+        }
+        if mismatched:
+            raise WorkloadError(
+                f"case {case['case_id']} shape does not derive from fixture "
+                f"{case['fixture_id']}: {mismatched}"
+            )
 
 
 def build_logical_batch(
@@ -768,7 +841,7 @@ def restore_logical_order(
     if len(physical_values) != len(layout.restore_map):
         raise WorkloadError("physical_values length does not match restore map")
     out: dict[tuple[str, int], Any] = {}
-    for key, value in zip(layout.restore_map, physical_values):
+    for key, value in zip(layout.restore_map, physical_values, strict=True):
         if key in out:
             raise WorkloadError(f"duplicate logical key {key}")
         out[key] = value
@@ -810,16 +883,15 @@ def apply_padding(
         pad_count = target_len - sample.seq_len
         pad_tokens = (pad_id,) * pad_count
         pad_restore: tuple[None, ...] = (None,) * pad_count
-        logical_restore = tuple(
-            (sample.sample_id, pos) for pos in range(sample.seq_len)
-        )
+        logical_restore = tuple((sample.sample_id, pos) for pos in range(sample.seq_len))
         if pad_side == "right":
             ids = sample.token_ids + pad_tokens
             mask = (1,) * sample.seq_len + (0,) * pad_count
             rmap = logical_restore + pad_restore
-            loss_mask = tuple(
-                int(pos >= sample.prompt_len) for pos in range(sample.seq_len)
-            ) + (0,) * pad_count
+            loss_mask = (
+                tuple(int(pos >= sample.prompt_len) for pos in range(sample.seq_len))
+                + (0,) * pad_count
+            )
             position_ids = tuple(range(sample.seq_len)) + (0,) * pad_count
         else:
             ids = pad_tokens + sample.token_ids
@@ -856,10 +928,10 @@ def restore_logical_order_from_padded(
     if len(physical_values) != len(padded.restore_map):
         raise WorkloadError("physical_values batch size mismatch")
     out: dict[tuple[str, int], Any] = {}
-    for row_vals, row_map in zip(physical_values, padded.restore_map):
+    for row_vals, row_map in zip(physical_values, padded.restore_map, strict=True):
         if len(row_vals) != len(row_map):
             raise WorkloadError("physical_values seq length mismatch")
-        for val, key in zip(row_vals, row_map):
+        for val, key in zip(row_vals, row_map, strict=True):
             if key is None:
                 continue
             if key in out:
@@ -947,9 +1019,7 @@ def assert_no_undeclared_randomness(
     allowed = set(declared_rng_sources)
     bad = [s for s in encountered_rng_sources if s not in allowed]
     if bad:
-        raise WorkloadError(
-            f"undeclared stochastic source(s) {bad}; policy is hard_fail"
-        )
+        raise WorkloadError(f"undeclared stochastic source(s) {bad}; policy is hard_fail")
 
 
 def fixture_hash(
@@ -962,16 +1032,15 @@ def fixture_hash(
     m = manifest if manifest is not None else load_manifest()
     logical = batch if batch is not None else build_logical_batch(m)
     payload = _manifest_identity_payload(m.raw)
-    payload["selected_logical_batch"] = [
-        list(x) for x in logical.token_multiset(active_only=False)
-    ]
+    payload["selected_logical_batch"] = [list(x) for x in logical.token_multiset(active_only=False)]
     payload["extra"] = dict(extra) if extra else {}
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
 def _manifest_identity_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
-    return {k: raw[k] for k in _REQUIRED_TOP_LEVEL if k != "fixture_identity_sha256"}
+    # Hash every declared section so future manifest keys cannot escape identity.
+    return {k: v for k, v in raw.items() if k != "fixture_identity_sha256"}
 
 
 def manifest_identity_hash(raw: Mapping[str, Any]) -> str:
@@ -988,9 +1057,7 @@ def _sequence_digest(values: Any) -> str:
 
 def weight_snapshot_hash(shards: Sequence[Mapping[str, Any]]) -> str:
     """Hash canonical filename/SHA-256/size records for all weight shards."""
-    records = sorted(
-        (str(s["filename"]), str(s["sha256"]), int(s["size_bytes"])) for s in shards
-    )
+    records = sorted((str(s["filename"]), str(s["sha256"]), int(s["size_bytes"])) for s in shards)
     blob = "".join(f"{name}\t{digest}\t{size}\n" for name, digest, size in records)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -1041,6 +1108,7 @@ def reference_payload(
             "chunk_spans": [list(s) for s in chunk.chunk_spans],
         },
         "backend_profiles": list(m.backend_profiles.keys()),
+        "backend_actual_semantics": m.chain_semantics["backend_actual_semantics"],
         "case_ids": list(case_ids(m)),
         "profile_missing_required": {
             pid: profile_missing_required_nodes(m, pid) for pid in m.backend_profiles
@@ -1053,26 +1121,40 @@ def reference_payload(
                 [[int(t.is_active) for t in s.tokens()] for s in batch.samples]
             ),
             "padded_left_sha256": _sequence_digest(
-                [padded_left.physical_token_ids, padded_left.physical_attention_mask,
-                 padded_left.physical_loss_mask, padded_left.physical_position_ids]
+                [
+                    padded_left.physical_token_ids,
+                    padded_left.physical_attention_mask,
+                    padded_left.physical_loss_mask,
+                    padded_left.physical_position_ids,
+                ]
             ),
             "padded_right_sha256": _sequence_digest(
-                [padded_right.physical_token_ids, padded_right.physical_attention_mask,
-                 padded_right.physical_loss_mask, padded_right.physical_position_ids]
+                [
+                    padded_right.physical_token_ids,
+                    padded_right.physical_attention_mask,
+                    padded_right.physical_loss_mask,
+                    padded_right.physical_position_ids,
+                ]
             ),
             "chunked_sha256": _sequence_digest(
-                [chunked.physical_token_ids, chunked.physical_loss_mask,
-                 chunked.restore_map, chunked.segment_offsets, chunked.segment_lengths]
+                [
+                    chunked.physical_token_ids,
+                    chunked.physical_loss_mask,
+                    chunked.restore_map,
+                    chunked.segment_offsets,
+                    chunked.segment_lengths,
+                ]
             ),
             "packed_sha256": _sequence_digest(
-                [packed.physical_token_ids, packed.physical_loss_mask,
-                 packed.restore_map, packed.segment_offsets, packed.segment_lengths]
+                [
+                    packed.physical_token_ids,
+                    packed.physical_loss_mask,
+                    packed.restore_map,
+                    packed.segment_offsets,
+                    packed.segment_lengths,
+                ]
             ),
-            "short_fixture_sha256": _sequence_digest(
-                m.fixtures["short_full_model_fixture"]
-            ),
-            "long_fixture_sha256": _sequence_digest(
-                m.fixtures["long_full_model_fixture"]
-            ),
+            "short_fixture_sha256": _sequence_digest(m.fixtures["short_full_model_fixture"]),
+            "long_fixture_sha256": _sequence_digest(m.fixtures["long_full_model_fixture"]),
         },
     }

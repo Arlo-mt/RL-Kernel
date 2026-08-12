@@ -1,6 +1,7 @@
 # WS1 C2 (#268) Closeout Evidence
 
-**Issue:** #268 · **Parent:** #266 · **Workload:** `ws1-qwen3-8b-dense-primary-v3`  
+**Issue:** #268 · **Parent:** #266 · **Workload:** `ws1-qwen3-8b-dense-primary-v4`
+
 **Branch:** `feat/ws1-c2-canonical-workload-268`
 
 ## Deliverables
@@ -10,6 +11,7 @@
 | `rl_engine/testing/ws1_manifest.json` | SSOT workload identity / matrix / profiles / cases |
 | `rl_engine/testing/ws1_workload.py` | Load, validate, logical identity, pad/pack/chunk restore |
 | `scripts/ws1_reference.py` | One-command reference emission |
+| `scripts/ws1_candidate_evidence.py` | Executable CUDA/Triton candidate provenance |
 | `tests/test_ws1_workload.py` | CPU acceptance tests |
 | `docs/design/ws1-c2-268-workload-plan.md` | Landing plan |
 | `docs/design/ws1-c2-268-closeout-evidence.md` | This map |
@@ -27,14 +29,14 @@
 | 2×2 + perm + multi-chunk non-divisible + pad/varlen | **Pass** | primary matrix + varlen samples `[11,16,13,19]` |
 | clip_interval for clipfrac0 | **Pass** | `[0.8, 1.2]` aligned with C1 |
 | Dropout/sampling/RNG policy; undeclared hard-fail | **Pass** | `stochastic_policy` + helper test |
-| Short + representative fixtures hit declared candidates | **Pass\*** | fixture `candidate_case_ids` + registry resolution tests |
+| Short + representative fixtures hit declared candidates | **Pass** | fixture-derived shapes + runtime candidate evidence runner |
 | Stable case_id for C8/C10/C11 reference | **Pass** | `representative_cases[].case_id` |
-| expected + actual backend/kernel + algorithm property | **Pass\*** | registry-resolved actual; runtime observation owned by C8+ (declared in manifest) |
+| expected + actual backend/kernel + algorithm property | **Pass** | runner executes each case, records actual class path, compares it to expected, and checks outputs |
 | One command emits reference (workload ID, seed, dtype) | **Pass** | `scripts/ws1_reference.py` |
 | Packing / QK-Norm / required ops status | **Pass** | packing supported + packed fixture; qk_norm required |
 | Both profiles enumerate required nodes; no untracked missing | **Pass** | Triton gaps are `missing_required` (red, tracked) |
 
-\*C2 binds **registry-resolved** candidate paths. Live GPU dispatch observation is explicitly out of C2 (`provenance_boundary`) and owned by C3/C8/C10/C11.
+C2 executes all representative cases. Full-model dispatch provenance remains owned by C3/C8/C10/C11; this does not claim the C9/C10 full-model gate.
 
 ## Verification commands
 
@@ -42,15 +44,25 @@
 # From repo root with PYTHONPATH=repo root (or editable install)
 python -m pytest tests/test_ws1_workload.py -q
 python scripts/ws1_reference.py --dtype bf16 --cell-id BN/full --emit-json -
+python scripts/ws1_candidate_evidence.py --emit-json ws1-c2-runtime-evidence.json
 ```
 
-Expected: all C2 tests green; CLI prints `workload_id`, `seed`, `dtype`, `fixture_hash`, and `reference_outputs` digests.
+Expected: all C2 tests green; the reference CLI emits identity/digests; the candidate runner executes all CUDA/Triton cases and reports `passed: true` with runtime-observed actual paths.
+
+Validated on 2026-08-12:
+
+- NVIDIA GeForce RTX 3060 Laptop GPU, SM86, single GPU
+- PyTorch `2.8.0+cu128`, CUDA runtime `12.8`, Triton `3.4.0`, Python `3.13.3`
+- Representative runtime evidence: 10/10 CUDA + Triton cases passed
+- Focused review/workload/contract suite: 81 passed (including CUDA/Triton runtime evidence)
+- Full repository CUDA/Triton pytest: 1622 tests collected; exit code 0 (1501 passed, 121 hardware/CI skips)
+- `pre-commit run --all-files`: all 7 hooks passed
 
 ## Residual (explicitly not #268)
 
 | Item | Owner |
 | --- | --- |
-| Runtime observed actual backend on GPU | C3 / C8 / C10 / C11 |
+| Full-model runtime observed actual backend | C3 / C8 / C10 / C11 |
 | Triton `missing_required`: embedding, lm_head, logprob | later candidate work / Blocker; tracked red in C2 |
 | #150 numerical asserts / full-model e2e | C9 / C10 |
 | Full WS1 EXIT | #266 after C1–C11 |

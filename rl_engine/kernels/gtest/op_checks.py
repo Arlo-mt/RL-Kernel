@@ -9,9 +9,9 @@ from typing import Any
 
 import torch
 
+from rl_engine.kernels.gtest.tolerance import BackendProvenance, ContractResolveError
+from rl_engine.kernels.gtest.tolerance import _dtype_name as _normalize_dtype_name
 from rl_engine.kernels.gtest.tolerance import (
-    BackendProvenance,
-    ContractResolveError,
     load_contract,
     resolve_tolerance,
     validate_backend_provenance,
@@ -159,7 +159,9 @@ def _run_candidate(
                 f"{candidate.provenance.actual_backend!r}"
             )
         for case in cases:
-            if _dtype_name(case.dtype) != candidate.provenance.execution_dtype:
+            case_dtype = _normalize_dtype_name(case.dtype)
+            provenance_dtype = _normalize_dtype_name(candidate.provenance.execution_dtype)
+            if case_dtype != provenance_dtype:
                 raise ContractResolveError(
                     f"case {case.name!r} dtype {case.dtype} does not match "
                     f"provenance execution_dtype {candidate.provenance.execution_dtype!r}"
@@ -243,16 +245,8 @@ def _run_case_backward(
     ).outputs
     # Gradient thresholds come from the independent gradient_accuracy judgment
     # (#267); they must not silently inherit forward_accuracy rows.
-    atol, rtol = _resolve_tolerance(
-        contract,
-        op_class=case.op_class,
-        dtype=case.dtype,
-        arch_key=candidate.arch_key,
-        backend_profile=(candidate.provenance.backend_profile if candidate.provenance else None),
-        judgment="gradient_accuracy",
-    )
-    gradient_spec = (
-        resolve_tolerance(
+    if "judgments" in contract:
+        gradient_spec = resolve_tolerance(
             contract,
             judgment="gradient_accuracy",
             op_class=case.op_class,
@@ -262,9 +256,19 @@ def _run_case_backward(
                 candidate.provenance.backend_profile if candidate.provenance else None
             ),
         )
-        if "judgments" in contract
-        else None
-    )
+        atol, rtol = gradient_spec.atol, gradient_spec.rtol
+    else:
+        gradient_spec = None
+        atol, rtol = _resolve_tolerance(
+            contract,
+            op_class=case.op_class,
+            dtype=case.dtype,
+            arch_key=candidate.arch_key,
+            backend_profile=(
+                candidate.provenance.backend_profile if candidate.provenance else None
+            ),
+            judgment="gradient_accuracy",
+        )
     grad_checks = [
         _compare_output(
             candidate_grad,
@@ -307,16 +311,8 @@ def _compare_case_outputs(
             f"candidate {candidate.name!r} returned {len(candidate_outputs)} outputs, "
             f"gold returned {len(gold_outputs)}"
         )
-    atol, rtol = _resolve_tolerance(
-        contract,
-        op_class=case.op_class,
-        dtype=case.dtype,
-        arch_key=candidate.arch_key,
-        backend_profile=(candidate.provenance.backend_profile if candidate.provenance else None),
-        judgment="forward_accuracy",
-    )
-    forward_spec = (
-        resolve_tolerance(
+    if "judgments" in contract:
+        forward_spec = resolve_tolerance(
             contract,
             judgment="forward_accuracy",
             op_class=case.op_class,
@@ -326,9 +322,19 @@ def _compare_case_outputs(
                 candidate.provenance.backend_profile if candidate.provenance else None
             ),
         )
-        if "judgments" in contract
-        else None
-    )
+        atol, rtol = forward_spec.atol, forward_spec.rtol
+    else:
+        forward_spec = None
+        atol, rtol = _resolve_tolerance(
+            contract,
+            op_class=case.op_class,
+            dtype=case.dtype,
+            arch_key=candidate.arch_key,
+            backend_profile=(
+                candidate.provenance.backend_profile if candidate.provenance else None
+            ),
+            judgment="forward_accuracy",
+        )
     if candidate.provenance is not None:
         for candidate_output, gold_output in zip(candidate_outputs, gold_outputs, strict=True):
             candidate_dtype = _dtype_name(candidate_output.dtype)

@@ -221,6 +221,39 @@ def test_ws1_report_persists_roles_and_backend_provenance():
     assert "baseline" not in data["cases"][0]["outputs"][0]
 
 
+def test_ws1_report_accepts_triton_backend_provenance():
+    provenance = BackendProvenance(
+        backend_profile="triton_cuda_bf16",
+        requested_backend="triton",
+        actual_backend="triton",
+        execution_dtype="bfloat16",
+        accumulation_dtype="float32",
+        output_dtype="bfloat16",
+        reference_dtype="float32",
+        candidate_tf32_enabled=False,
+        reference_tf32_enabled=False,
+    )
+    report = run_operator_suite(
+        "logp",
+        candidates=[
+            CandidateSpec(
+                name="triton-logp",
+                backend="triton",
+                fn=NativeLogpOp(),
+                provenance=provenance,
+            )
+        ],
+        cases=[_logp_case("bf16", torch.bfloat16, seed=15)],
+    )
+    output = report.candidates[0].cases[0].outputs[0]
+    assert output.judgment == "forward_accuracy"
+    assert output.comparison_lhs_role == "bf16_candidate"
+    assert output.comparison_rhs_role == "fp32_reference"
+    data = report.to_dict()["candidates"][0]
+    assert data["backend_provenance"]["actual_backend"] == "triton"
+    assert "baseline" not in data["cases"][0]["outputs"][0]
+
+
 def test_ws1_report_rejects_backend_provenance_mismatch():
     provenance = BackendProvenance(
         backend_profile="cuda_bf16",
@@ -276,6 +309,29 @@ def test_ws1_report_checks_observed_output_dtype_against_provenance():
                 )
             ],
             cases=[_logp_case("bf16", torch.bfloat16, seed=14)],
+        )
+
+    wrong_gold_case = _logp_case("bf16", torch.bfloat16, seed=14)
+    wrong_gold_case = OperatorCase(
+        name=wrong_gold_case.name,
+        op_class=wrong_gold_case.op_class,
+        dtype=wrong_gold_case.dtype,
+        inputs=wrong_gold_case.inputs,
+        gold_fn=lambda **inputs: NativeLogpOp().forward(**inputs),
+        grad_input_names=wrong_gold_case.grad_input_names,
+    )
+    with pytest.raises(ContractResolveError, match="gold output dtype"):
+        run_operator_suite(
+            "logp",
+            candidates=[
+                CandidateSpec(
+                    name="wrong-gold-output",
+                    backend="cuda",
+                    fn=NativeLogpOp(),
+                    provenance=provenance,
+                )
+            ],
+            cases=[wrong_gold_case],
         )
 
 

@@ -18,12 +18,6 @@ import sys
 from pathlib import Path
 
 
-def _ensure_repo_on_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
-
 def _load_workload_module():
     """Load the pure-Python C2 module without importing torch-heavy package helpers."""
     module_path = Path(__file__).resolve().parents[1] / "rl_engine/testing/ws1_workload.py"
@@ -80,7 +74,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    _ensure_repo_on_path()
     workload = _load_workload_module()
     WorkloadError = workload.WorkloadError
 
@@ -93,12 +86,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"{manifest.workload_id!r}"
             )
         if args.seed is not None and int(args.seed) != manifest.seed:
-            raise WorkloadError(
-                f"--seed {args.seed} does not match manifest seed {manifest.seed}"
-            )
-        payload = workload.reference_payload(
-            manifest, cell_id=args.cell_id, dtype=args.dtype
-        )
+            raise WorkloadError(f"--seed {args.seed} does not match manifest seed {manifest.seed}")
+        payload = workload.reference_payload(manifest, cell_id=args.cell_id, dtype=args.dtype)
     except WorkloadError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
