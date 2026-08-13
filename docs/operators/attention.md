@@ -84,7 +84,6 @@ the inputs' device.
 Calling it (`__call__` -> `forward(...)`) computes in the input dtype; `forward_fp32(...)` is
 the explicit fp32 golden path (NativeAttentionOp only). The production `"attn"` op_type
 (SDPA-based `PYTORCH_ATTN`, FlashAttention, etc.) is a separate dispatch chain and is unaffected.
-
 ### WS2 CP-aware dispatch
 
 WS2 distributed callers use a separate contract-aware entry point,
@@ -112,6 +111,21 @@ call `NativeRoPEOp` internally and does not hide RoPE inside the CP merge. The
 position offsets passed to CP attention must describe the same absolute token
 positions used when RoPE was applied, so PR3 validates the post-RoPE Q/K boundary
 while PR7 can later validate production fused `RoPE+Attention` kernels.
+
+Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
+`disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
+boundaries, FP32 `(out, lse)` merge order, final downcast point, backend, and fallback reason.
+Runtime-selected `auto` plans are diagnostic only unless both training and rollout export and
+validate the same actual plan.
+
+The rank-aware drift benchmark can emit a CPU smoke artifact or a torchrun-friendly GPU report:
+
+```bash
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2 \
+  --cp-world-sizes 2 --kv-chunk-sizes none,1 --include-backward \
+  --output artifacts/ws2-cp-attention-drift.json
+```
 
 ## Accuracy
 
@@ -240,6 +254,10 @@ Hooks:
 - `forward(q, k, v, ...)` — main path (registry, #108 harness). Differentiable.
 - `forward_with_lse(q, k, v, ...)` — returns `(out, lse)` for LSE verification, debugging,
   and future KV-cache / training integration.
+- `backward_reference(q, k, v, dout, ...)` — runs the deterministic training backward
+  validation path and returns `dq`, `dk`, `dv`, `out`, `lse`, and provenance.
+- `compare_cp_attention_backward(q, k, v, dout, ...)` — compares CP=1 backward against
+  CP/chunked-prefill backward and emits whole-tensor plus per-logical-rank drift stats.
 
 ## Tolerance
 

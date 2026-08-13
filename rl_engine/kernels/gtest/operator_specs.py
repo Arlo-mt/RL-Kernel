@@ -63,6 +63,22 @@ OP_SPECS = {
         },
         grad_input_names=("q", "k", "v"),
     ),
+    "cp_attention": OperatorSpec(
+        name="cp_attention",
+        op_class="attention",
+        gold_path=(
+            "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+            "DeterministicCPAttentionReferenceOp"
+        ),
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": (
+                "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+                "DeterministicCPAttentionReferenceOp"
+            ),
+        },
+        grad_input_names=("q", "k", "v"),
+    ),
     "logp": OperatorSpec(
         name="logp",
         op_class="logprob",
@@ -88,6 +104,28 @@ OP_SPECS = {
         },
         grad_input_names=("hidden", "lm_head_weight"),
     ),
+    "embedding": OperatorSpec(
+        name="embedding",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp",
+        },
+        grad_input_names=("weight",),
+    ),
+    "lm_head": OperatorSpec(
+        name="lm_head",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp",
+        },
+        grad_input_names=("hidden", "weight"),
+    ),
     "det_gemm": OperatorSpec(
         name="det_gemm",
         op_class="reduction",
@@ -111,6 +149,30 @@ OP_SPECS = {
             "cuda-sm90": "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op",
         },
         grad_input_names=("x",),
+    ),
+    "silu": OperatorSpec(
+        name="silu",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp",
+            "triton": "rl_engine.kernels.ops.triton.activation.swiglu.TritonSiLUOp",
+            "cuda": "rl_engine.kernels.ops.cuda.activation.swiglu.SiLUCudaOp",
+        },
+        grad_input_names=("x",),
+    ),
+    "swiglu": OperatorSpec(
+        name="swiglu",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp",
+            "triton": "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp",
+            "cuda": "rl_engine.kernels.ops.cuda.activation.swiglu.SwiGLUCudaOp",
+        },
+        grad_input_names=("gate", "up"),
     ),
     "batch_invariant_logp": OperatorSpec(
         name="batch_invariant_logp",

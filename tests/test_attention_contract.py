@@ -22,6 +22,12 @@ from rl_engine.kernels.attention_contract import (
     RoPEFusionBoundary,
     RoPESpec,
     ShardingSpec,
+    SplitKVExecutionPlan,
+    SplitKVRuntimePlanSet,
+    SplitKVSpec,
+    build_split_kv_runtime_plan_set,
+    validate_split_kv_alignment,
+    validate_split_kv_plan_set_alignment,
 )
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
 
@@ -107,6 +113,8 @@ def _declared_cp_backend() -> AttentionBackendCapability:
         deterministic_cp_merge=True,
         supports_packed_varlen=True,
         supports_kv_cache=True,
+        supports_split_kv_fixed=True,
+        reports_actual_split_kv_plan=True,
         implementation_kind="deterministic",
     )
 
@@ -252,6 +260,124 @@ def test_non_contiguous_cp_blocks_have_explicit_global_and_local_offsets():
 def test_reduction_requires_fp32_accumulation():
     with pytest.raises(AttentionContractError, match="must be fp32"):
         ReductionSpec(acc_dtype="bf16")
+
+
+def test_split_kv_policy_is_a_first_class_strict_contract():
+    contract = _contract()
+    assert contract.to_dict()["split_kv"] == {
+        "mode": "disabled",
+        "fixed_split_size": None,
+        "strict_consistency": True,
+    }
+
+    fixed = replace(contract, split_kv=SplitKVSpec.fixed(128))
+    assert fixed.to_dict()["split_kv"]["mode"] == "fixed"
+    assert fixed.to_dict()["split_kv"]["fixed_split_size"] == 128
+
+    with pytest.raises(AttentionContractError, match="auto Split-KV"):
+        SplitKVSpec.auto(strict_consistency=True)
+
+
+def test_split_kv_execution_plan_records_actual_logical_schedule():
+    plan = SplitKVSpec.fixed(4).resolve(10, backend="training-reference")
+
+    assert plan.actual_split_count == 3
+    assert plan.to_dict()["actual_split_boundaries"] == [[0, 4], [4, 8], [8, 10]]
+    assert plan.to_dict()["split_kv_merge_order"] == "global_block_index"
+    assert plan.to_dict()["split_kv_accum_dtype"] == "fp32"
+    assert plan.to_dict()["split_kv_downcast_at"] == "final_write"
+
+
+def test_strict_split_kv_alignment_rejects_unknown_or_mismatched_actual_plan():
+    training = SplitKVSpec.fixed(4).resolve(10, backend="training")
+    rollout = SplitKVSpec.fixed(4).resolve(10, backend="rollout")
+    validate_split_kv_alignment(training, rollout)
+
+    unknown = SplitKVSpec.auto().resolve(10, backend="rollout")
+    with pytest.raises(AttentionContractError, match="actual runtime plans"):
+        validate_split_kv_alignment(training, unknown)
+
+    mismatched = SplitKVSpec.fixed(5).resolve(10, backend="rollout")
+    with pytest.raises(AttentionContractError, match="differ"):
+        validate_split_kv_alignment(training, mismatched)
+
+    with pytest.raises(AttentionContractError, match="contiguous"):
+        SplitKVExecutionPlan(
+            requested_mode="fixed",
+            requested_split_size=4,
+            actual_mode="fixed",
+            actual_split_size=4,
+            boundaries=((0, 4), (5, 10)),
+        )
+
+
+def test_complete_split_kv_plan_set_covers_batch_tp_cp_and_owner_coordinates():
+    plan_set = build_split_kv_runtime_plan_set(
+        (8, 10),
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=SplitKVSpec.fixed(2),
+        backend="training-reference",
+    )
+
+    assert len(plan_set.entries) == 16
+    assert plan_set.to_dict()["coverage"] == ("complete_batch_tp_cp_owner_cartesian_product")
+    assert {
+        tuple(entry["expected_kv_range"])
+        for entry in plan_set.to_dict()["entries"]
+        if entry["batch_index"] == 0
+    } == {(0, 4), (4, 8)}
+
+
+def test_split_kv_plan_set_alignment_rejects_missing_and_mismatched_rank_plans():
+    training = build_split_kv_runtime_plan_set(
+        (8,),
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=SplitKVSpec.fixed(2),
+        backend="training",
+    )
+    rollout = build_split_kv_runtime_plan_set(
+        (8,),
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=SplitKVSpec.fixed(2),
+        backend="rollout",
+    )
+    validate_split_kv_plan_set_alignment(training, rollout)
+
+    with pytest.raises(AttentionContractError, match="coordinate coverage is incomplete"):
+        SplitKVRuntimePlanSet(
+            batch_size=training.batch_size,
+            tp_world_size=training.tp_world_size,
+            cp_world_size=training.cp_world_size,
+            total_kv_tokens=training.total_kv_tokens,
+            entries=training.entries[:-1],
+        )
+
+    mismatched = build_split_kv_runtime_plan_set(
+        (8,),
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=SplitKVSpec.fixed(1),
+        backend="rollout",
+    )
+    with pytest.raises(AttentionContractError, match="plan differs"):
+        validate_split_kv_plan_set_alignment(training, mismatched)
+
+
+def test_backend_must_support_policy_and_actual_plan_provenance():
+    fixed = replace(_contract(), split_kv=SplitKVSpec.fixed(128))
+    capability = replace(
+        _declared_cp_backend(),
+        supports_split_kv_fixed=False,
+        reports_actual_split_kv_plan=False,
+    )
+
+    assert capability.incompatibilities(fixed)[-2:] == (
+        "Split-KV policy=fixed is unsupported",
+        "actual Split-KV execution-plan provenance is unsupported",
+    )
 
 
 def test_causal_attention_requires_explicit_offset():
@@ -460,6 +586,8 @@ def test_shared_prefix_pages_must_be_fully_populated():
 
 def test_current_ws1_backend_rejects_strict_cp_contract_without_fallback():
     registry = KernelRegistry()
+    platform = registry._platform()
+    registry._priority_map[platform]["ws2_attention"] = [OpBackend.PYTORCH_NATIVE_ATTENTION]
 
     with pytest.raises(RuntimeError) as exc_info:
         registry.get_attention_op(_contract())
@@ -473,7 +601,7 @@ def test_current_ws1_backend_rejects_strict_cp_contract_without_fallback():
 def test_undeclared_backend_capability_is_never_selected():
     registry = KernelRegistry()
     platform = registry._platform()
-    registry._priority_map[platform]["attention"] = [OpBackend.PYTORCH_ATTN]
+    registry._priority_map[platform]["ws2_attention"] = [OpBackend.PYTORCH_ATTN]
 
     with pytest.raises(RuntimeError, match="no AttentionBackendCapability declared"):
         registry.get_attention_op(_contract())
@@ -481,6 +609,8 @@ def test_undeclared_backend_capability_is_never_selected():
 
 def test_declared_compatible_backend_resolves_and_records_provenance():
     registry = KernelRegistry()
+    platform = registry._platform()
+    registry._priority_map[platform]["ws2_attention"] = [OpBackend.PYTORCH_NATIVE_ATTENTION]
     registry._attention_capabilities[OpBackend.PYTORCH_NATIVE_ATTENTION] = _declared_cp_backend()
 
     result = registry.get_attention_op(_contract(), requested_backend="deterministic")
@@ -497,6 +627,8 @@ def test_declared_compatible_backend_resolves_and_records_provenance():
 
 def test_requested_stable_backend_id_is_enforced():
     registry = KernelRegistry()
+    platform = registry._platform()
+    registry._priority_map[platform]["ws2_attention"] = [OpBackend.PYTORCH_NATIVE_ATTENTION]
     registry._attention_capabilities[OpBackend.PYTORCH_NATIVE_ATTENTION] = _declared_cp_backend()
 
     with pytest.raises(RuntimeError, match="does not match requested_backend=another-backend"):

@@ -63,6 +63,14 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
                                                  int64_t vocab_start_index);
 // RoPE (rotate-half) apply for SM90; cos/sin precomputed fp32, sin_sign = +1 fwd / -1 bwd.
 torch::Tensor rope_apply_sm90(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, double sin_sign);
+torch::Tensor embedding_sm90_forward(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor embedding_sm90_forward_fp32(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor lm_head_sm90_forward(torch::Tensor hidden,
+                                   torch::Tensor weight,
+                                   torch::optional<torch::Tensor> bias);
+torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
+                                        torch::Tensor weight,
+                                        torch::optional<torch::Tensor> bias);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -84,6 +92,15 @@ torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torc
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+// SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
+torch::Tensor silu_forward_cuda(torch::Tensor x);
+torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x);
+torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up);
+std::vector<torch::Tensor> swiglu_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up);
+
 // RMSNorm Declarations & Wrappers
 
 void rmsnorm_forward_cuda(
@@ -195,6 +212,26 @@ torch::Tensor rmsnorm_backward_dw(
   return dw;
 }
 
+// SiLU / SwiGLU wrappers (WS1 elementwise activations)
+torch::Tensor silu_forward(torch::Tensor x) {
+  return silu_forward_cuda(x);
+}
+
+torch::Tensor silu_backward(torch::Tensor dy, torch::Tensor x) {
+  return silu_backward_cuda(dy, x);
+}
+
+torch::Tensor swiglu_forward(torch::Tensor gate, torch::Tensor up) {
+  return swiglu_forward_cuda(gate, up);
+}
+
+std::vector<torch::Tensor> swiglu_backward(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up) {
+  return swiglu_backward_cuda(dy, gate, up);
+}
+
 // Deterministic standard-softmax attention (issue #147)
 std::vector<torch::Tensor> deterministic_attention_forward(
     torch::Tensor q,
@@ -291,9 +328,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
     m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
           "Build bf16 dlogits from bf16 logits and fp32 lse");
-
     // RoPE rotate-half apply, SM90 (forward and backward share the kernel via sin_sign)
     m.def("rope_apply_sm90", &rope_apply_sm90, "RoPE rotate-half apply (GPT-NeoX), SM90");
+    m.def("embedding_sm90_forward", &embedding_sm90_forward,
+          "Single-card SM90 batch-invariant embedding forward");
+    m.def("embedding_sm90_forward_fp32", &embedding_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant embedding forward with fp32 output");
+    m.def("lm_head_sm90_forward", &lm_head_sm90_forward,
+          "Single-card SM90 batch-invariant LM-head forward");
+    m.def("lm_head_sm90_forward_fp32", &lm_head_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant LM-head forward with fp32 output");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -322,6 +366,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
+
+    // registry SiLU / SwiGLU (elementwise activation)
+    m.def("silu_forward", &silu_forward, "Batch-invariant SiLU forward CUDA");
+    m.def("silu_backward", &silu_backward, "Batch-invariant SiLU backward CUDA");
+    m.def("swiglu_forward", &swiglu_forward, "Batch-invariant SwiGLU forward CUDA");
+    m.def("swiglu_backward", &swiglu_backward, "Batch-invariant SwiGLU backward CUDA");
 
     // Deterministic standard-softmax attention (issue #147)
     m.def(

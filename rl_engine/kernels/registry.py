@@ -8,6 +8,8 @@ import os
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Optional, Set, Type
 
+import torch
+
 from rl_engine.kernels.attention_contract import (
     AttentionBackendCapability,
     AttentionContract,
@@ -105,6 +107,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     CUDA_ROPE_SM90 = "rl_engine.kernels.ops.cuda.rotary_embedding.rope.RoPESM90Op"
     PYTORCH_NATIVE_SILU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSiLUOp"
     PYTORCH_NATIVE_SWIGLU = "rl_engine.kernels.ops.pytorch.activation.swiglu.NativeSwiGLUOp"
+    CUDA_SILU = "rl_engine.kernels.ops.cuda.activation.swiglu.SiLUCudaOp"
+    CUDA_SWIGLU = "rl_engine.kernels.ops.cuda.activation.swiglu.SwiGLUCudaOp"
+    TRITON_SILU = "rl_engine.kernels.ops.triton.activation.swiglu.TritonSiLUOp"
+    TRITON_SWIGLU = "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp"
 
     # WS1 pure-PyTorch ground-truth attention reference (hand-written fp32 softmax).
     # Distinct from PYTORCH_ATTN above, which is the production SDPA fallback.
@@ -126,6 +132,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_LM_HEAD = "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp"
     # WS1 pure-PyTorch ground-truth embedding ops
     PYTORCH_NATIVE_EMBEDDING = "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp"
+    CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
+    CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
 
 
 def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
@@ -265,6 +273,27 @@ class KernelRegistry:
                 supports_kv_cache=False,
                 implementation_kind="reference",
             ),
+            OpBackend.PYTORCH_CP_ATTENTION: AttentionBackendCapability(
+                backend_id="pytorch-deterministic-cp-attention-reference",
+                roles=common_roles,
+                modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+                dtypes=common_dtypes,
+                tp_world_sizes=(1, 2),
+                cp_world_sizes=(1, 2),
+                exports_attention_lse=True,
+                deterministic_cp_merge=True,
+                supports_packed_varlen=False,
+                supports_kv_cache=False,
+                # PR3 consumes attention-ready post-RoPE Q/K; RoPE execution
+                # and fused boundary validation remain in PR2/PR7 harnesses.
+                supports_rope_metadata=False,
+                supports_fused_rope_attention=False,
+                supports_split_kv_disabled=True,
+                supports_split_kv_fixed=True,
+                supports_split_kv_auto=False,
+                reports_actual_split_kv_plan=True,
+                implementation_kind="deterministic",
+            ),
         }
 
         self._priority_map = {
@@ -301,6 +330,11 @@ class KernelRegistry:
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
                 ],
                 "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
+                    OpBackend.CUDA_DETERMINISTIC_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "linear_logp": [
@@ -317,8 +351,17 @@ class KernelRegistry:
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
-                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
-                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "silu": [
+                    OpBackend.CUDA_SILU,
+                    OpBackend.TRITON_SILU,
+                    OpBackend.PYTORCH_NATIVE_SILU,
+                ],
+                "swiglu": [
+                    OpBackend.CUDA_SWIGLU,
+                    OpBackend.TRITON_SWIGLU,
+                    OpBackend.PYTORCH_NATIVE_SWIGLU,
+                ],
+                # Default dispatch logic for new operators
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rope": [
                     OpBackend.CUDA_ROPE_SM90,
@@ -341,6 +384,10 @@ class KernelRegistry:
                 ],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
@@ -356,8 +403,8 @@ class KernelRegistry:
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
-                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
-                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
@@ -365,6 +412,10 @@ class KernelRegistry:
                 "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
@@ -399,7 +450,11 @@ class KernelRegistry:
                 OpBackend.ROCM_FLASH_ATTN,
                 OpBackend.TRITON_GENERIC,
             ]
-        elif rocm_attn_backend:
+        elif rocm_attn_backend and rocm_attn_backend not in {
+            "native",
+            "pytorch",
+            "sdpa",
+        }:
             logger.warning(
                 "Unknown RL_KERNEL_ROCM_ATTN_BACKEND=%s; using default ROCm attention priority.",
                 rocm_attn_backend,
@@ -446,22 +501,26 @@ class KernelRegistry:
                     f"SM{cc}: fused linear-logp SM90 kernel not compiled into _C; "
                     "using generic linear-logp backend."
                 )
+            sm90_embedding_compiled = _EXT_AVAILABLE and hasattr(_C, "embedding_sm90_forward")
+            if sm90_embedding_compiled and cc_major == 9:
+                embedding_list = self._priority_map["cuda"]["embedding"]
+                if OpBackend.CUDA_SM90_EMBEDDING not in embedding_list:
+                    embedding_list.insert(0, OpBackend.CUDA_SM90_EMBEDDING)
+
+            sm90_lm_head_compiled = _EXT_AVAILABLE and hasattr(_C, "lm_head_sm90_forward")
+            if sm90_lm_head_compiled and cc_major == 9:
+                lm_head_list = self._priority_map["cuda"]["lm_head"]
+                if OpBackend.CUDA_SM90_LM_HEAD not in lm_head_list:
+                    lm_head_list.insert(0, OpBackend.CUDA_SM90_LM_HEAD)
         except Exception as exc:
             logger.warning(f"Failed to probe device capability: {exc}")
 
-    def get_op(self, op_type: str) -> Any:
-        """Select the best legacy operator based on hardware and priority."""
-
-        if device_ctx.is_rocm:
-            platform = "rocm"
-        elif device_ctx.device_type == "cuda":
-            platform = "cuda"
-        else:
-            platform = "cpu"
-        candidates = self._priority_map.get(platform, {}).get(
-            op_type,
-            [OpBackend.PYTORCH_NATIVE],
-        )
+    def get_op(self, op_type: str, device: torch.device | str | None = None) -> Any:
+        """Core distribution logic: Automatically select the best operator
+        based on hardware and priority.
+        """
+        platform = self._platform_for_device(device)
+        candidates = self._priority_map.get(platform, {}).get(op_type, [OpBackend.PYTORCH_NATIVE])
 
         for backend in candidates:
             if backend.name in self._instance_cache:
@@ -483,6 +542,21 @@ class KernelRegistry:
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
 
+    def _platform_for_device(self, device: torch.device | str | None) -> str:
+        if device is None:
+            if device_ctx.is_rocm:
+                return "rocm"
+            if device_ctx.device_type == "cuda":
+                return "cuda"
+            return "cpu"
+
+        resolved = torch.device(device)
+        if resolved.type == "cuda":
+            return "rocm" if torch.version.hip is not None else "cuda"
+        if resolved.type in self._priority_map:
+            return resolved.type
+        return "cpu"
+
     def get_attention_op(
         self,
         contract: AttentionContract,
@@ -503,8 +577,7 @@ class KernelRegistry:
         requested_backend = requested_backend.strip().lower()
 
         platform = self._platform()
-        op_type = "kv_cache_attention" if contract.mode is AttentionMode.DECODE else "attention"
-        candidates = self._priority_map.get(platform, {}).get(op_type, [])
+        candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])
         rejected: list[str] = []
 
         for backend in candidates:
