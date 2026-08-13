@@ -40,6 +40,15 @@ python -m pytest tests/test_tolerance_contract.py tests/test_op_checks.py \
 `max_abs_dlogp`, `approx_kl0`, and `clipfrac0` are the sole chain-level logprob
 aggregates; gradient pass/fail uses independent `gradient_*` verdicts.
 
+CUDA BF16 and Triton-on-CUDA BF16 gtest + C8 `--execute` run in
+`.github/workflows/ws1-gtest-gpu.yml` (RunPod). Local equivalent:
+
+```bash
+bash ci/run_ws1_gtest.sh
+```
+
+The C8 JSON is written to `ws1-c8-ci.json` and uploaded as a CI artifact.
+
 ## Documentation Build
 
 ```bash

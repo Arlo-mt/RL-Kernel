@@ -118,7 +118,10 @@ echo "[ci] Target Establish -> root@$SSH_IP:$SSH_PORT"
 
 SSH_OPTIONS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $SSH_PORT"
 
-if [ "${GPU_COUNT}" -gt 1 ]; then
+TEST_SUITE="${TEST_SUITE:-full}"
+if [ "$TEST_SUITE" = "ws1-gtest" ]; then
+  TEST_CMD='bash ci/run_ws1_gtest.sh'
+elif [ "${GPU_COUNT}" -gt 1 ]; then
   TEST_CMD='"$PY" -m torch.distributed.run --nproc_per_node='"${GPU_COUNT}"' -m pytest tests/ -v'
 else
   TEST_CMD='"$PY" -m pytest tests/ -v'
@@ -186,7 +189,7 @@ TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
 # --no-build-isolation: torch must be visible to setup.py, else the extension is silently skipped.
 # --no-deps: keep the pinned torch; do not let the editable install re-resolve it.
 "$PY" -m pip install --no-build-isolation --no-deps -e .
-"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest
+"$PY" -m pip install --no-cache-dir numpy tabulate accelerate "transformers==5.13.1" pytest triton
 nvidia-smi
 # Fail fast if _C did not build or cannot launch, instead of silently using native fallbacks.
 "$PY" scripts/ci_smoke.py
@@ -194,9 +197,16 @@ nvidia-smi
 export RL_KERNEL_REQUIRE_EXT=1
 '"${TEST_CMD}"
 
-echo "[ci] Launching remote test suite on GPU pod (Distributed Execution Mode: TP=${GPU_COUNT})..."
+echo "[ci] Launching remote test suite on GPU pod (Distributed Execution Mode: TP=${GPU_COUNT}, suite=${TEST_SUITE})..."
 ssh $SSH_OPTIONS root@"$SSH_IP" "bash -lc '$REMOTE_CMD'"
 TEST_EXIT=$?
+
+if [ "$TEST_SUITE" = "ws1-gtest" ]; then
+  echo "[ci] Fetching C8 execute artifact from the pod"
+  mkdir -p artifacts
+  scp $SSH_OPTIONS root@"$SSH_IP":/workspace/repo/ws1-c8-ci.json artifacts/ws1-c8-ci.json || \
+    echo "[ci] WARN: could not scp ws1-c8-ci.json"
+fi
 
 echo "[ci] Remote execution finished with exit code = $TEST_EXIT"
 exit $TEST_EXIT

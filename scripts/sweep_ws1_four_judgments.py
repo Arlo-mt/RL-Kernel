@@ -367,6 +367,11 @@ def main() -> None:
         help="Run C3/C4 on runnable cells (requires CUDA). Default is classify-only.",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--allow-pending-hopper",
+        action="store_true",
+        help="Do not fail when declared cuda-sm90 cells are pending_hopper (non-Hopper CI).",
+    )
     args = parser.parse_args()
 
     report = build_classified_matrix()
@@ -379,7 +384,7 @@ def main() -> None:
         _print_table(report)
     if any(cell.status == "red" for cell in report.cells):
         raise SystemExit(1)
-    if any(cell.status == "pending_hopper" for cell in report.cells):
+    if any(cell.status == "pending_hopper" for cell in report.cells) and not args.allow_pending_hopper:
         raise SystemExit(2)
 
 
