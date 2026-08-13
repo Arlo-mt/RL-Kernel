@@ -114,6 +114,8 @@ def test_constant_embedding_inputs_match_operator_contract():
     inputs = make_operator_inputs("embedding", args, torch.float32, torch.device("cpu"))
 
     assert torch.equal(inputs["token_ids"], torch.full((1, 2), 3, dtype=torch.long))
+    assert inputs["weight"].shape == (17, 128)
+    assert inputs["weight"].dtype is torch.float32
     assert torch.equal(inputs["weight"], torch.full((17, 128), 0.5))
     assert operator_shape_name("embedding", args) == "1x2x17x128"
 
@@ -122,6 +124,10 @@ def test_constant_lm_head_inputs_match_operator_contract():
     args = _args(input_mode="constant", constant_value=0.5)
     inputs = make_operator_inputs("lm_head", args, torch.float32, torch.device("cpu"))
 
+    assert inputs["hidden"].shape == (1, 2, 128)
+    assert inputs["weight"].shape == (17, 128)
+    assert inputs["hidden"].dtype is torch.float32
+    assert inputs["weight"].dtype is torch.float32
     assert torch.equal(inputs["hidden"], torch.full((1, 2, 128), 0.5))
     assert torch.equal(inputs["weight"], torch.full((17, 128), 0.51))
     assert inputs["bias"] is None
