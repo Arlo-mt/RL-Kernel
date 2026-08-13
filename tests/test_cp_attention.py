@@ -608,6 +608,34 @@ def test_invalid_gqa_and_mask_shapes_raise():
         )
 
 
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf"), True, "bad"])
+def test_invalid_scale_fails_before_attention_math(scale):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=24, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="scale must be a positive finite number"):
+        op.forward_fp32_with_lse(q, k, v, scale=scale)
+
+
+def test_qkv_dtype_and_floating_contract_fails_closed():
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=25, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="same dtype"):
+        op.forward_fp32_with_lse(q, k.to(torch.bfloat16), v)
+    with pytest.raises(ValueError, match="real floating-point"):
+        op.forward_fp32_with_lse(q.to(torch.long), k.to(torch.long), v.to(torch.long))
+
+
+@pytest.mark.parametrize("kwargs", [{"cp_world_size": True}, {"kv_chunk_size": True}])
+def test_boolean_parallelism_arguments_fail_closed(kwargs):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=26, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError):
+        op.forward_fp32_with_lse(q, k, v, **kwargs)
+
+
 def test_overlapping_partial_ranges_raise():
     out = torch.zeros(1, 1, 1, 1)
     lse = torch.zeros(1, 1, 1)
