@@ -4,15 +4,23 @@
 
 ## Execute result
 
-Checked-in matrix: `docs/design/ws1-c8-execute.json`
+Checked-in matrix: `docs/design/ws1-c8-execute.json` (`schema_version: ws1-c8-execute-v2`)
 
 ```bash
 python scripts/sweep_ws1_four_judgments.py --execute --json
 ```
 
-| Host | Device | Result |
-| --- | --- | --- |
-| 2026-08-13 | NVIDIA H20 (sm90), PyTorch 2.8.0+cu128 | `green=176`, `N/A=16` (`pack`), **red=0**, `pending_hopper=0`, process exit 0 |
+| Field | Value |
+| --- | --- |
+| Source commit | `5c33dcdd1c201f6e8bb8b0a4247d1cf9e9502b35` |
+| Branch | `feat/ws1-c1-c5-c8-gtest` |
+| GPU | NVIDIA H20, CC 9.0 |
+| Driver | 580.82.07 |
+| CUDA / PyTorch / Triton | 12.8 / 2.8.0+cu128 / 3.4.0 |
+| Workload | `ws1-qwen3-8b-dense-primary-v6` (`ws1-c2-v7`) |
+| Result | `green=176`, `N/A=16` (`pack`), **red=0**, exit 0 |
+
+The execute JSON was produced on that source commit. The follow-up commit that adds the JSON is evidence-only.
 
 Both `cuda_bf16` and `triton_cuda_bf16` run the same C1 contract and C2 logical workload. Invariance cells are the C3/C4 bitwise gates (`atol=0`, `rtol=0`). Accuracy cells are the C2 `case_id` runner with BF16 candidate vs FP32 reference.
 
@@ -39,6 +47,7 @@ Invariance cells record the C3/C4 observed `actual_backend_id` and
 | Applicable rows run BF16 + FP32 reference | Pass |
 | Short + representative full-model tiers on C2 `case_id`s | Pass |
 | expected/actual backend + kernel path recorded by the case runner | Pass |
+| Invariance cells record observed actual backend + kernel | Pass |
 | Every cell green/red/N/A | Pass (execute artifact; classify-only still paints unrun cells red) |
 | Applicable + required four judgments green | Pass |
 | Batch/Chunk invariance is the C1 bitwise gate | Pass |
