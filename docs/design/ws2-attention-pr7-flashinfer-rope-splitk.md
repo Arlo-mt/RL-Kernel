@@ -76,6 +76,10 @@ FlashInferQwen3PagedAttentionOp.forward(...)
     validate page bounds
     validate block_table/global_token_positions logical order
     validate key_position_ids
+    reject duplicate pages and non-canonical inactive metadata
+  bind metadata q/k RoPE state to the fused-RoPE config
+  validate cache_position == query_position_ids and trailing query positions
+  validate prefix-cache fingerprint against K/V content and RoPE identity
   materialize_flashinfer_paged_kv_cache(...)
   flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper
     or flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper
@@ -124,8 +128,11 @@ In this PR, `CUDAAGRSAttentionCPCommunication.all_gather_partial_states(...)`
 and `CUDAAGRSAttentionCPCommunication.reduce_scatter_merged_state(...)` are
 fail-closed placeholders and raise `AttentionCPCommunicationUnavailable`.
 Likewise, `FlashInferPagedAttentionConfig(require_cp_comm=True)` raises before
-execution.  This prevents the FlashInfer local paged-attention candidate from
-being mistaken for a complete CP communication implementation.
+execution. FlashInfer currently evaluates the complete logical KV cache; that
+final state is not an owner-local CP partial state and must not be merged again.
+The standalone P2P NCCL reference remains executable for transport validation.
+The fused path can enable CP only after it computes owner-local KV partial
+states and the self-owned CUDA AG/RS operators are implemented.
 
 Ordering is part of the interface:
 
@@ -162,10 +169,18 @@ rotary_dim        = head_dim
 layout            = Qwen3 rotate-half / non-interleaved
 ```
 
-The adapter rejects post-RoPE Q/K for this path.  That avoids silently rotating
-the same tensor twice.  If a later rollout path stores post-RoPE K and rotates
-only Q in a fused decode kernel, it must be represented as a separate
-materialization/capability.
+The adapter rejects post-RoPE Q/K in both the config and the actual runtime
+metadata. It also requires `cache_position == query_position_ids` and trailing
+contiguous query positions, because this adapter currently relies on the
+wrapper's implicit RoPE positions. That avoids silent double rotation and
+position drift. If a later rollout path stores post-RoPE K or supports arbitrary
+query positions, it must be represented as a separate capability with explicit
+position tensors.
+
+Prefix-cache identity binds logical K/V content, storage dtypes, cached-K RoPE
+state, theta, rotary dim, cast boundary, and output dtype. Equivalent physical
+page placement produces the same logical identity; stale content or a changed
+RoPE configuration fails before execution.
 
 ## Split-KV Policy
 
@@ -177,6 +192,13 @@ backend defaults:
 | `disabled` | `disable_split_kv=True` | strict candidate |
 | `fixed:<N>` | `fixed_split_size=N`, `disable_split_kv=False` | candidate; must pass drift sweep |
 | `auto` | `disable_split_kv=False` | rejected when batch invariance is required |
+
+RL-Kernel's fixed size is measured in logical KV tokens. FlashInfer 0.6 names
+`fixed_split_size` in physical pages, so PR7 accepts a fixed token size only
+when it is divisible by `page_size`, passes `fixed_split_size / page_size` to
+the backend, and converts page boundaries back to logical token boundaries in
+the report. Runtime callbacks must declare `split_size_unit="pages"` and
+`boundary_unit="pages"`; otherwise strict provenance fails closed.
 
 The shared WS2 contract now treats Split-KV as a first-class semantic field. PR7 still
 must export the backend's actual token boundaries; a requested FlashInfer knob alone is
@@ -207,6 +229,11 @@ The validation script reports:
 batch_invariant_sweep.method = single_row_vs_same_row_inside_batch
 batch_invariant_sweep.out_max_abs
 batch_invariant_sweep.lse_max_abs
+page_layout_invariant_sweep.out.max_abs
+page_layout_invariant_sweep.lse.max_abs
+drift.out.{max_abs,mean_abs,p95_abs,p99_abs}
+drift.lse.{max_abs,mean_abs,p95_abs,p99_abs}
+drift.dlogp.{max_abs,mean_abs,p95_abs,p99_abs}
 ```
 
 FlashInfer is not declared batch-invariant by default.  It becomes an accepted
@@ -289,6 +316,7 @@ python scripts/ws2_pr7_flashinfer_attention_check.py \
   --device cuda \
   --mode decode \
   --split-kv-policy disabled \
+  --output artifacts/pr7-decode-disabled.json \
   --json
 
 python scripts/ws2_pr7_flashinfer_attention_check.py \
@@ -298,18 +326,22 @@ python scripts/ws2_pr7_flashinfer_attention_check.py \
   --query-len 16 \
   --split-kv-policy fixed \
   --fixed-split-size 4 \
+  --output artifacts/pr7-prefill-fixed.json \
   --json
 ```
 
 The CUDA report must include:
 
 ```text
-out_max_abs
-lse_max_abs
-batch_invariant_sweep.out_max_abs
-batch_invariant_sweep.lse_max_abs
+passed / errors
+drift.out / drift.lse / drift.dlogp
+batch_invariant_sweep
+page_layout_invariant_sweep
 rope_fusion_boundary
 split_kv_policy
+actual_split_kv_plans
+actual_split_kv_plan_set
+arithmetic_semantics_verified
 actual_backend
 fallback / fallback_reason
 ```
@@ -340,9 +372,22 @@ Strict FlashInfer validation also requires runtime callbacks for both:
 Requested knobs, maximum split counts, or labels such as
 `flashinfer_internal` are not accepted as proof.
 
+The repository pins the PR7 lane to `flashinfer-python>=0.6.0,<0.7`; older
+versions do not expose both `fixed_split_size` and `disable_split_kv` plan
+knobs. Upstream 0.6 wrappers still do not expose RL-Kernel's three strict
+provenance callbacks, so an unpatched stock wrapper is expected to fail closed.
+Passing strict acceptance requires a small wrapper/adapter that reads the actual
+plan information returned by FlashInfer and reports it through the documented
+callbacks; the requested plan arguments alone are deliberately insufficient.
+
 Run the two-GPU transport check with:
 
 ```bash
 torchrun --standalone --nproc-per-node=2 \
   scripts/ws2_p2p_nccl_attention_reference_check.py
 ```
+
+The validation CLI materializes the TP-local Qwen3-8B shard. For the default
+`TP=2` target this is `Hq=16`, `Hkv=4`, `D=128`; `32/8` are global model head
+counts and are rejected as a mislabeled local execution. Any non-finite drift
+statistic also fails strict acceptance.

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import types
+from dataclasses import replace
+import json
 
 import pytest
 import torch
@@ -26,10 +28,13 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     FlashInferSplitKVPolicy,
     FlashInferUnavailable,
     build_flashinfer_paged_kv_plan,
+    flashinfer_prefix_cache_fingerprint,
     materialize_flashinfer_paged_kv_cache,
 )
 from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.testing.attention_comparison import DecodeKVCacheMetadata
+
+from scripts import ws2_pr7_flashinfer_attention_check as check_script
 
 
 class _FakeFlashInferWrapper:
@@ -64,14 +69,14 @@ class _FakeFlashInferWrapper:
         plans = []
         for seq_len in seq_lens:
             if disabled:
-                boundaries = [(0, seq_len)]
+                boundaries = [(0, (seq_len + 1) // 2)]
                 mode = "disabled"
                 actual_size = None
             else:
                 assert split_size is not None
                 boundaries = [
-                    (start, min(start + split_size, seq_len))
-                    for start in range(0, seq_len, split_size)
+                    (start, min(start + split_size, (seq_len + 1) // 2))
+                    for start in range(0, (seq_len + 1) // 2, split_size)
                 ]
                 mode = "fixed"
                 actual_size = split_size
@@ -79,6 +84,8 @@ class _FakeFlashInferWrapper:
                 {
                     "mode": mode,
                     "split_size": actual_size,
+                    "split_size_unit": "pages",
+                    "boundary_unit": "pages",
                     "boundaries": boundaries,
                     "fallback": False,
                     "fallback_reason": None,
@@ -100,20 +107,26 @@ class _FakeFlashInferWrapper:
         split_size = self.plan_kwargs.get("fixed_split_size")
         entries = []
         for batch_index, total in enumerate(seq_lens):
-            owner_ranges = ((0, total // 2), (total // 2, total))
+            owner_ranges = ((0, total - 2), (total - 2, total))
             for tp_rank in range(2):
                 for cp_rank in range(2):
                     for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
                         if disabled:
                             mode = "disabled"
                             actual_size = None
-                            boundaries = [(owner_start, owner_end)]
+                            boundaries = [(0, (owner_end - owner_start + 1) // 2)]
                         else:
                             mode = "fixed"
                             actual_size = split_size
                             boundaries = [
-                                (start, min(start + split_size, owner_end))
-                                for start in range(owner_start, owner_end, split_size)
+                                (
+                                    (start - owner_start) // 2,
+                                    min(
+                                        (start - owner_start) // 2 + split_size,
+                                        (owner_end - owner_start + 1) // 2,
+                                    ),
+                                )
+                                for start in range(owner_start, owner_end, split_size * 2)
                             ]
                         entries.append(
                             {
@@ -124,6 +137,8 @@ class _FakeFlashInferWrapper:
                                 "expected_kv_range": [owner_start, owner_end],
                                 "mode": mode,
                                 "split_size": actual_size,
+                                "split_size_unit": "pages",
+                                "boundary_unit": "pages",
                                 "boundaries": boundaries,
                                 "merge_order": "global_block_index",
                                 "accum_dtype": "fp32",
@@ -157,12 +172,17 @@ def _metadata(*, batch: int = 2, query_len: int = 1) -> DecodeKVCacheMetadata:
     page_size = 2
     cache_capacity = 6
     positions = torch.arange(cache_capacity, dtype=torch.long).repeat(batch, 1)
+    query_positions = torch.arange(
+        cache_capacity - query_len,
+        cache_capacity,
+        dtype=torch.long,
+    ).repeat(batch, 1)
     return DecodeKVCacheMetadata(
-        cache_position=torch.full((batch, query_len), cache_capacity - 1, dtype=torch.long),
+        cache_position=query_positions.clone(),
         kv_seq_lens=torch.full((batch,), cache_capacity, dtype=torch.long),
         block_table=torch.tensor([[0, 1, 2]] * batch, dtype=torch.long),
         global_token_positions=positions,
-        query_position_ids=torch.full((batch, query_len), cache_capacity - 1, dtype=torch.long),
+        query_position_ids=query_positions.clone(),
         key_position_ids=positions.clone(),
         page_size=page_size,
         q_rope_state="pre_rope",
@@ -355,11 +375,11 @@ def test_flashinfer_pr7_prefill_adapter_passes_qwen3_rope_and_splitk_policy():
     assert plan["rope_scale"] == 1.0
     assert plan["q_data_type"] == q.dtype
     assert plan["kv_data_type"] == q.dtype
-    assert plan["fixed_split_size"] == 4
+    assert plan["fixed_split_size"] == 2
     assert plan["disable_split_kv"] is False
 
 
-def test_flashinfer_pr7_p2p_cp_path_merges_fp32_before_final_downcast():
+def test_flashinfer_pr7_rejects_full_kv_output_as_cp_partial_state():
     q, k, v = _qkv(query_len=1)
     metadata = _metadata(query_len=1)
     plan = _p2p_plan()
@@ -370,15 +390,14 @@ def test_flashinfer_pr7_p2p_cp_path_merges_fp32_before_final_downcast():
         require_cp_comm=True,
         cp_communication=_FakeCPCommunication(),
     )
-    result = FlashInferQwen3PagedAttentionOp(
-        flashinfer_module=_fake_flashinfer()
-    )(q, k, v, metadata, config=config)
-
-    wrapper = _FakeFlashInferWrapper.instances[-1]
-    assert wrapper.plan_kwargs["o_data_type"] is torch.float32
-    assert result.out.dtype == q.dtype
-    assert result.lse.dtype == torch.float32
-    assert result.provenance["cp_comm_backend"] == "p2p_nccl_reference"
+    with pytest.raises(ValueError, match="complete logical KV cache"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            metadata,
+            config=config,
+        )
 
 
 def test_flashinfer_pr7_decode_adapter_can_disable_splitk_for_strict_candidate():
@@ -726,7 +745,7 @@ def test_flashinfer_pr7_rejects_required_cp_comm_until_cuda_ag_rs_ops_exist():
     metadata = _metadata(query_len=1)
     op = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())
 
-    with pytest.raises(ValueError, match="p2p_nccl_reference"):
+    with pytest.raises(ValueError, match="complete logical KV cache"):
         op(
             q,
             k,
@@ -768,6 +787,150 @@ def test_flashinfer_pr7_rejects_post_rope_inputs_for_rope_llama_fusion():
                 workspace_size_bytes=1024,
                 rope=FlashInferRoPEFusionConfig(q_rope_state="post_rope"),
             ),
+        )
+
+
+def test_flashinfer_pr7_rejects_metadata_rope_state_mismatch():
+    q, k, v = _qkv(query_len=1)
+    metadata = _metadata(query_len=1)
+    metadata = DecodeKVCacheMetadata(
+        **{**metadata.__dict__, "k_cache_rope_state": "post_rope"}
+    )
+
+    with pytest.raises(ValueError, match="metadata.k_cache_rope_state"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            metadata,
+            config=FlashInferPagedAttentionConfig(
+                mode="decode",
+                workspace_size_bytes=1024,
+            ),
+        )
+
+
+def test_flashinfer_pr7_rejects_query_position_identity_mismatch():
+    q, k, v = _qkv(query_len=1)
+    metadata = _metadata(query_len=1)
+    metadata = DecodeKVCacheMetadata(
+        **{
+            **metadata.__dict__,
+            "query_position_ids": torch.zeros_like(metadata.query_position_ids),
+        }
+    )
+
+    with pytest.raises(ValueError, match="must match exactly"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            metadata,
+            config=FlashInferPagedAttentionConfig(
+                mode="decode",
+                workspace_size_bytes=1024,
+            ),
+        )
+
+
+def test_flashinfer_pr7_rejects_nontrailing_query_positions():
+    q, k, v = _qkv(query_len=1)
+    metadata = _metadata(query_len=1)
+    metadata = DecodeKVCacheMetadata(
+        **{
+            **metadata.__dict__,
+            "cache_position": torch.full_like(metadata.cache_position, 4),
+            "query_position_ids": torch.full_like(metadata.query_position_ids, 4),
+        }
+    )
+
+    with pytest.raises(ValueError, match="trailing contiguous positions"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            metadata,
+            config=FlashInferPagedAttentionConfig(
+                mode="decode",
+                workspace_size_bytes=1024,
+            ),
+        )
+
+
+def test_flashinfer_pr7_prefix_cache_fingerprint_binds_rope_identity():
+    q, k, v = _qkv(batch=1, query_len=1)
+    metadata = _metadata(batch=1, query_len=1)
+    config = FlashInferPagedAttentionConfig(mode="decode", workspace_size_bytes=1024)
+    fingerprint = flashinfer_prefix_cache_fingerprint(
+        q,
+        k,
+        v,
+        metadata,
+        config,
+        prefix_length=4,
+    )
+    cached = DecodeKVCacheMetadata(
+        **{
+            **metadata.__dict__,
+            "prefix_cache_enabled": True,
+            "prefix_cache_key": "prefix-0",
+            "prefix_length": 4,
+            "prefix_cache_fingerprint": fingerprint,
+        }
+    )
+
+    FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+        q,
+        k,
+        v,
+        cached,
+        config=config,
+    )
+    drifted = replace(
+        config,
+        rope=replace(config.rope, rope_theta=10_000.0),
+    )
+    with pytest.raises(ValueError, match="rope_theta"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            cached,
+            config=drifted,
+        )
+
+
+def test_flashinfer_pr7_rejects_stale_prefix_cache_content():
+    q, k, v = _qkv(batch=1, query_len=1)
+    metadata = _metadata(batch=1, query_len=1)
+    config = FlashInferPagedAttentionConfig(mode="decode", workspace_size_bytes=1024)
+    fingerprint = flashinfer_prefix_cache_fingerprint(
+        q,
+        k,
+        v,
+        metadata,
+        config,
+        prefix_length=4,
+    )
+    cached = DecodeKVCacheMetadata(
+        **{
+            **metadata.__dict__,
+            "prefix_cache_enabled": True,
+            "prefix_cache_key": "prefix-0",
+            "prefix_length": 4,
+            "prefix_cache_fingerprint": fingerprint,
+        }
+    )
+    stale_k = k.clone()
+    stale_k[0, 0, 0, 0] += 1.0
+
+    with pytest.raises(ValueError, match="prefix_cache_fingerprint"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            stale_k,
+            v,
+            cached,
+            config=config,
         )
 
 
@@ -1054,3 +1217,81 @@ def test_flashinfer_pr7_plan_rejects_position_metadata_mismatch():
             cache_capacity=k.size(2),
             device=q.device,
         )
+
+
+def test_pr7_check_dry_run_writes_non_eligible_report(tmp_path):
+    output = tmp_path / "pr7-dry-run.json"
+
+    assert check_script.main(["--dry-run", "--output", str(output)]) == 0
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "dry_run"
+    assert report["passed"] is False
+    assert report["acceptance_eligible"] is False
+
+
+def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
+    args = check_script._parse_args([])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "pos_encoding_mode": "ROPE_LLAMA",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+            "actual_split_kv_plans": [{"actual_split_boundaries": [[0, 4]]}],
+            "actual_split_kv_plan_set": {
+                "coverage": "complete_batch_tp_cp_owner_cartesian_product"
+            },
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": False},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    assert check_script._acceptance_errors(report, args) == [
+        "batch_invariant_sweep failed"
+    ]
+
+
+def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
+    args = check_script._parse_args([])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 32, "kv_heads": 8, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "pos_encoding_mode": "ROPE_LLAMA",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+            "actual_split_kv_plans": [{"actual_split_boundaries": [[0, 4]]}],
+            "actual_split_kv_plan_set": {
+                "coverage": "complete_batch_tp_cp_owner_cartesian_product"
+            },
+        },
+        "drift": {
+            "out": {"max_abs": float("nan")},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    errors = check_script._acceptance_errors(report, args)
+    assert any("finite and non-negative" in error for error in errors)
+    assert any("TP-local head shard" in error for error in errors)
+
+
+def test_pr7_check_rejects_nonlocal_qwen3_head_arguments():
+    with pytest.raises(SystemExit):
+        check_script._parse_args(["--q-heads", "32", "--kv-heads", "8"])

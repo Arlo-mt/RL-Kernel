@@ -214,7 +214,7 @@ setup(
     ext_modules=get_extensions(),
     cmdclass=get_cmdclass(),
     extras_require={
-        "cuda": ["flashinfer"],
+        "cuda": ["flashinfer-python>=0.6.0,<0.7"],
         "rocm": ["aiter"],
         "vllm": ["vllm>=0.6.0"],
     },

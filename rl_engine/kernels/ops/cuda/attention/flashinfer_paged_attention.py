@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -24,15 +25,8 @@ import torch
 
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPCommunication,
-    AttentionCPMergedState,
-    AttentionCPPartialState,
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
-    sort_attention_cp_partial_states,
-)
-from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
-    AttentionPartialState,
-    merge_attention_partial_states,
 )
 from rl_engine.kernels.attention_contract import (
     AttentionContractError,
@@ -143,24 +137,12 @@ class FlashInferPagedAttentionConfig:
             )
         self.cp_comm_plan.validate()
         if self.require_cp_comm:
-            if self.cp_comm_plan.backend != "p2p_nccl_reference":
-                raise ValueError(
-                    "executable CP communication currently requires p2p_nccl_reference"
-                )
-            if self.cp_comm_plan.status != "implemented":
-                raise ValueError("executable CP communication requires status='implemented'")
-            if self.cp_communication is None:
-                raise ValueError("require_cp_comm=True requires a CP communication implementation")
-            local_blocks = tuple(
-                block
-                for block in self.cp_comm_plan.expected_blocks
-                if block.owner_cp_rank == self.cp_comm_plan.parallel.cp_rank
+            raise ValueError(
+                "FlashInfer currently evaluates the complete logical KV cache, so its output "
+                "cannot be labeled as one CP-owner partial state or merged again. Use the "
+                "standalone P2P NCCL reference until owner-local FlashInfer execution and "
+                "self-owned CUDA AG/RS are implemented."
             )
-            if len(local_blocks) != 1:
-                raise ValueError(
-                    "FlashInfer outer CP communication requires exactly one manifest block "
-                    "per CP owner; backend-local Split-KV remains inside that state"
-                )
         elif self.cp_comm_plan.status != "interface_only":
             raise ValueError(
                 "implemented CP communication plans require require_cp_comm=True"
@@ -251,6 +233,11 @@ def build_flashinfer_paged_kv_plan(
             if local_page < 0 or local_page >= physical_page_count:
                 raise ValueError("block_table contains an out-of-range physical page")
             paged_kv_indices.append(batch_index * physical_page_count + local_page)
+        active_pages = metadata.block_table[batch_index, :block_count]
+        if torch.unique(active_pages).numel() != block_count:
+            raise ValueError("active block_table entries must not contain duplicate pages")
+        if bool((metadata.block_table[batch_index, block_count:] != -1).any()):
+            raise ValueError("unused block_table entries must be -1")
         _validate_metadata_logical_positions(
             metadata,
             batch_index=batch_index,
@@ -363,6 +350,8 @@ class FlashInferQwen3PagedAttentionOp:
             cache_capacity=k_cache.size(2),
             device=q.device,
         )
+        _validate_flashinfer_rope_metadata(metadata, cfg, q)
+        _validate_flashinfer_prefix_cache(q, k_cache, v_cache, metadata, cfg)
         q_flat = q.transpose(1, 2).reshape(batch_size * query_len, q_heads, head_dim).contiguous()
         k_pages, v_pages = materialize_flashinfer_paged_kv_cache(
             k_cache,
@@ -401,8 +390,6 @@ class FlashInferQwen3PagedAttentionOp:
             query_len=query_len,
             q_heads=q_heads,
         )
-        if cfg.require_cp_comm:
-            out, lse = self._communicate_cp_partial(out, lse, cfg)
         provenance = {
             "attention_backend": "flashinfer",
             "requested_backend": "flashinfer_qwen3_rope_paged_attention",
@@ -439,39 +426,6 @@ class FlashInferQwen3PagedAttentionOp:
             lse=lse,
             provenance=provenance,
         )
-
-    @staticmethod
-    def _communicate_cp_partial(
-        out: torch.Tensor,
-        lse: torch.Tensor,
-        cfg: FlashInferPagedAttentionConfig,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        communication = cfg.cp_communication
-        assert communication is not None
-        local_blocks = tuple(
-            block
-            for block in cfg.cp_comm_plan.expected_blocks
-            if block.owner_cp_rank == cfg.cp_comm_plan.parallel.cp_rank
-        )
-        local = AttentionCPPartialState(out=out, lse=lse, block=local_blocks[0])
-        gathered = communication.all_gather_partial_states((local,), cfg.cp_comm_plan)
-        ordered = sort_attention_cp_partial_states(gathered, plan=cfg.cp_comm_plan)
-        merged = merge_attention_partial_states(
-            [
-                AttentionPartialState(
-                    out=state.out,
-                    lse=state.lse,
-                    block_start=state.block.kv_block_start,
-                    block_end=state.block.kv_block_end,
-                )
-                for state in ordered
-            ]
-        )
-        local_merged = communication.reduce_scatter_merged_state(
-            AttentionCPMergedState(out=merged.out, lse=merged.lse),
-            cfg.cp_comm_plan,
-        )
-        return local_merged.out, local_merged.lse
 
     def _load_flashinfer(self) -> Any:
         if self._flashinfer_module is not None:
@@ -547,17 +501,21 @@ class FlashInferQwen3PagedAttentionOp:
         if scale is not None:
             plan_kwargs["softmax_scale"] = float(scale)
             plan_kwargs["sm_scale"] = float(scale)
-        plan_kwargs.update(_flashinfer_split_kv_plan_kwargs(cfg.split_kv))
+        plan_kwargs.update(
+            _flashinfer_split_kv_plan_kwargs(
+                cfg.split_kv,
+                page_size=plan.page_size,
+            )
+        )
         applied = _call_with_supported_kwargs(wrapper.plan, plan_kwargs, return_applied=True)
         assert isinstance(applied, dict)
-        required_knob = (
-            "fixed_split_size"
-            if cfg.split_kv.mode is SplitKVMode.FIXED
-            else "disable_split_kv"
-        )
-        if cfg.split_kv.mode is not SplitKVMode.AUTO and required_knob not in applied:
+        if cfg.split_kv.mode is SplitKVMode.FIXED and "fixed_split_size" not in applied:
             raise FlashInferUnavailable(
-                f"FlashInfer plan() did not accept required Split-KV knob {required_knob!r}"
+                "FlashInfer plan() did not accept required Split-KV knob 'fixed_split_size'"
+            )
+        if cfg.split_kv.mode is SplitKVMode.DISABLED and "disable_split_kv" not in applied:
+            raise FlashInferUnavailable(
+                "FlashInfer plan() did not accept required Split-KV knob 'disable_split_kv'"
             )
         return applied
 
@@ -613,9 +571,20 @@ class FlashInferQwen3PagedAttentionOp:
                     requested_mode=cfg.split_kv.mode,
                     requested_split_size=cfg.split_kv.fixed_split_size,
                     actual_mode=raw.get("mode"),
-                    actual_split_size=raw.get("split_size"),
-                    boundaries=tuple(
-                        tuple(boundary) for boundary in raw.get("boundaries", ())
+                    actual_split_size=(
+                        None
+                        if raw.get("split_size") is None
+                        else _flashinfer_split_size_tokens(
+                            raw.get("split_size"),
+                            page_size=plan.page_size,
+                            unit=raw.get("split_size_unit"),
+                        )
+                    ),
+                    boundaries=_normalize_flashinfer_split_boundaries(
+                        raw.get("boundaries", ()),
+                        page_size=plan.page_size,
+                        seq_len=int(seq_len),
+                        unit=raw.get("boundary_unit"),
                     ),
                     backend="flashinfer",
                     source="runtime_callback",
@@ -673,9 +642,24 @@ class FlashInferQwen3PagedAttentionOp:
                         requested_mode=cfg.split_kv.mode,
                         requested_split_size=cfg.split_kv.fixed_split_size,
                         actual_mode=entry["mode"],
-                        actual_split_size=entry["split_size"],
-                        boundaries=tuple(
-                            tuple(boundary) for boundary in entry["boundaries"]
+                        actual_split_size=(
+                            None
+                            if entry["split_size"] is None
+                            else _flashinfer_split_size_tokens(
+                                entry["split_size"],
+                                page_size=plan.page_size,
+                                unit=entry.get("split_size_unit"),
+                            )
+                        ),
+                        boundaries=_normalize_flashinfer_split_boundaries(
+                            entry["boundaries"],
+                            page_size=plan.page_size,
+                            seq_len=int(
+                                entry["expected_kv_range"][1]
+                                - entry["expected_kv_range"][0]
+                            ),
+                            unit=entry.get("boundary_unit"),
+                            offset=int(entry["expected_kv_range"][0]),
                         ),
                         merge_order=entry["merge_order"],
                         acc_dtype=entry["accum_dtype"],
@@ -876,10 +860,9 @@ def _validate_metadata_logical_positions(
             physical_slots.append(local_page * page_size + page_offset)
     slot_index = torch.tensor(physical_slots, device=device, dtype=torch.long)
     actual = global_token_positions[batch_index, slot_index]
-    position_offset = int(actual[0].item())
     expected = torch.arange(
-        position_offset,
-        position_offset + seq_len,
+        0,
+        seq_len,
         device=device,
         dtype=global_token_positions.dtype,
     )
@@ -892,6 +875,161 @@ def _validate_metadata_logical_positions(
         key_positions = metadata.key_position_ids[batch_index, slot_index]
         if not torch.equal(key_positions, expected.to(dtype=key_positions.dtype)):
             raise ValueError("key_position_ids must match cached global token positions")
+    active_slot_mask = torch.zeros(
+        global_token_positions.size(1),
+        device=device,
+        dtype=torch.bool,
+    )
+    active_slot_mask[slot_index] = True
+    if bool((global_token_positions[batch_index, ~active_slot_mask] != -1).any()):
+        raise ValueError("unused global_token_positions entries must be -1")
+    if hasattr(metadata, "key_position_ids") and bool(
+        (metadata.key_position_ids[batch_index, ~active_slot_mask] != -1).any()
+    ):
+        raise ValueError("unused key_position_ids entries must be -1")
+
+
+def _validate_flashinfer_rope_metadata(
+    metadata: Any,
+    cfg: FlashInferPagedAttentionConfig,
+    q: torch.Tensor,
+) -> None:
+    """Bind the configured fused-RoPE boundary to the actual cache metadata."""
+
+    for name, expected in (
+        ("q_rope_state", cfg.rope.q_rope_state),
+        ("k_cache_rope_state", cfg.rope.k_cache_rope_state),
+    ):
+        actual = getattr(metadata, name, None)
+        if actual != expected:
+            raise ValueError(
+                f"metadata.{name}={actual!r} does not match the FlashInfer fused-RoPE "
+                f"contract {expected!r}"
+            )
+    cache_position = getattr(metadata, "cache_position", None)
+    query_position_ids = getattr(metadata, "query_position_ids", None)
+    if not isinstance(cache_position, torch.Tensor) or not isinstance(
+        query_position_ids, torch.Tensor
+    ):
+        raise ValueError("cache_position and query_position_ids are required tensors")
+    if cache_position.device != q.device or query_position_ids.device != q.device:
+        raise ValueError("query position metadata must be on the query device")
+    if cache_position.dtype not in {torch.int32, torch.int64, torch.long} or (
+        query_position_ids.dtype not in {torch.int32, torch.int64, torch.long}
+    ):
+        raise ValueError("query position metadata must contain integers")
+    if cache_position.shape != (q.size(0), q.size(2)):
+        raise ValueError("cache_position must have shape [B, Sq]")
+    if query_position_ids.shape != cache_position.shape:
+        raise ValueError("query_position_ids must have shape [B, Sq]")
+    if not torch.equal(cache_position, query_position_ids):
+        raise ValueError("cache_position and query_position_ids must match exactly")
+    kv_seq_lens = getattr(metadata, "kv_seq_lens", None)
+    if not isinstance(kv_seq_lens, torch.Tensor) or kv_seq_lens.shape != (q.size(0),):
+        raise ValueError("kv_seq_lens must have shape [B]")
+    if bool((cache_position < 0).any()) or bool(
+        (cache_position >= kv_seq_lens[:, None]).any()
+    ):
+        raise ValueError("cache_position must identify tokens present in each KV sequence")
+    if q.size(2) > 1 and bool((cache_position[:, 1:] <= cache_position[:, :-1]).any()):
+        raise ValueError("few-query cache_position values must be strictly increasing")
+    expected_query_positions = torch.stack(
+        [
+            torch.arange(
+                int(seq_len.item()) - q.size(2),
+                int(seq_len.item()),
+                device=q.device,
+                dtype=cache_position.dtype,
+            )
+            for seq_len in kv_seq_lens
+        ]
+    )
+    if not torch.equal(cache_position, expected_query_positions):
+        raise ValueError(
+            "FlashInfer implicit RoPE positions require queries to be the trailing "
+            "contiguous positions of each KV sequence"
+        )
+
+
+def flashinfer_prefix_cache_fingerprint(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    metadata: Any,
+    cfg: FlashInferPagedAttentionConfig,
+    *,
+    prefix_length: int,
+) -> str:
+    """Hash the logical prefix and the fused-RoPE materialization identity."""
+
+    prefix_length = _positive_int(prefix_length, "prefix_length")
+    if bool((metadata.kv_seq_lens < prefix_length).any()):
+        raise ValueError("prefix_length must not exceed any kv_seq_lens entry")
+    digest = hashlib.sha256()
+    rotary_dim = q.size(-1) if cfg.rope.rotary_dim is None else cfg.rope.rotary_dim
+    digest.update(
+        (
+            f"k_rope_state={metadata.k_cache_rope_state};"
+            f"rope_theta={float(cfg.rope.rope_theta):.17g};"
+            f"rotary_dim={rotary_dim};"
+            "rope_cast_at=after_rope;"
+            f"k_rope_output_dtype={k_cache.dtype}\n"
+        ).encode()
+    )
+    digest.update(f"k_dtype={k_cache.dtype};v_dtype={v_cache.dtype}\n".encode())
+    page_size = int(metadata.page_size)
+    for batch_index in range(q.size(0)):
+        logical_index = torch.arange(prefix_length, device=q.device, dtype=torch.long)
+        pages = metadata.block_table[batch_index].long()
+        slots = pages[logical_index // page_size] * page_size + logical_index % page_size
+        for tensor in (
+            metadata.global_token_positions[batch_index, slots],
+            metadata.key_position_ids[batch_index, slots],
+            k_cache[batch_index, :, slots, :],
+            v_cache[batch_index, :, slots, :],
+        ):
+            digest.update(str(tuple(tensor.shape)).encode())
+            digest.update(str(tensor.dtype).encode())
+            digest.update(
+                tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+            )
+    return digest.hexdigest()
+
+
+def _validate_flashinfer_prefix_cache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    metadata: Any,
+    cfg: FlashInferPagedAttentionConfig,
+) -> None:
+    enabled = bool(getattr(metadata, "prefix_cache_enabled", False))
+    key = getattr(metadata, "prefix_cache_key", None)
+    length = getattr(metadata, "prefix_length", 0)
+    fingerprint = getattr(metadata, "prefix_cache_fingerprint", None)
+    if not enabled:
+        if key is not None or length != 0 or fingerprint is not None:
+            raise ValueError(
+                "prefix cache key/fingerprint must be None and prefix_length must be 0 "
+                "when prefix cache is disabled"
+            )
+        return
+    if not isinstance(key, str) or not key:
+        raise ValueError("prefix_cache_key is required when prefix cache is enabled")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError("prefix_cache_fingerprint is required when prefix cache is enabled")
+    actual = flashinfer_prefix_cache_fingerprint(
+        q,
+        k_cache,
+        v_cache,
+        metadata,
+        cfg,
+        prefix_length=length,
+    )
+    if actual != fingerprint:
+        raise ValueError(
+            "prefix_cache_fingerprint does not match logical prefix content or fused-RoPE identity"
+        )
 
 
 def _validate_qkv_cache(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
@@ -970,16 +1108,58 @@ def _call_with_supported_kwargs(
     return supported if return_applied else result
 
 
-def _flashinfer_split_kv_plan_kwargs(spec: SplitKVSpec) -> dict[str, Any]:
+def _flashinfer_split_kv_plan_kwargs(
+    spec: SplitKVSpec,
+    *,
+    page_size: int,
+) -> dict[str, Any]:
     if spec.mode is SplitKVMode.DISABLED:
         return {"disable_split_kv": True}
     if spec.mode is SplitKVMode.FIXED:
         assert spec.fixed_split_size is not None
+        if spec.fixed_split_size % page_size != 0:
+            raise FlashInferUnavailable(
+                "FlashInfer fixed Split-K size is expressed in pages; the WS2 token "
+                "split size must be divisible by page_size"
+            )
         return {
-            "fixed_split_size": int(spec.fixed_split_size),
+            # FlashInfer names this in pages, while the WS2 contract is tokens.
+            "fixed_split_size": int(spec.fixed_split_size) // page_size,
             "disable_split_kv": False,
         }
     return {"disable_split_kv": False}
+
+
+def _flashinfer_split_size_tokens(value: Any, *, page_size: int, unit: Any) -> int:
+    if unit != "pages":
+        raise FlashInferUnavailable(
+            "FlashInfer fixed Split-K provenance must declare split_size_unit='pages'"
+        )
+    return _positive_int(int(value), "split_size") * page_size
+
+
+def _normalize_flashinfer_split_boundaries(
+    boundaries: Any,
+    *,
+    page_size: int,
+    seq_len: int,
+    unit: Any,
+    offset: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    if unit != "pages":
+        raise FlashInferUnavailable(
+            "FlashInfer Split-K boundaries must declare boundary_unit='pages'"
+        )
+    normalized = []
+    for boundary in boundaries:
+        start_page, end_page = boundary
+        normalized.append(
+            (
+                offset + int(start_page) * page_size,
+                offset + min(int(end_page) * page_size, seq_len),
+            )
+        )
+    return tuple(normalized)
 
 
 def _split_kv_provenance(
@@ -1026,5 +1206,6 @@ __all__ = [
     "FlashInferUnavailable",
     "build_flashinfer_paged_kv_plan",
     "flashinfer_qwen3_paged_attention_available",
+    "flashinfer_prefix_cache_fingerprint",
     "materialize_flashinfer_paged_kv_cache",
 ]

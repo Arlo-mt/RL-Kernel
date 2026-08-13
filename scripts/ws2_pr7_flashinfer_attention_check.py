@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -42,8 +43,8 @@ from rl_engine.testing.attention_comparison import (  # noqa: E402
 )
 
 
-def main() -> int:
-    args = _parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     device = torch.device("cuda" if args.device == "cuda" else "cpu")
     inputs = _make_inputs(args, device)
     config = _make_config(args)
@@ -58,7 +59,7 @@ def main() -> int:
     report: dict[str, Any] = {
         "status": "dry_run" if args.dry_run else "executed",
         "pr": "PR7",
-        "target": "Qwen3-8B TP=2 CP=2 BF16 attention candidate",
+        "target": "Qwen3-8B TP-local FlashInfer candidate; CP transport validated separately",
         "mode": config.mode,
         "device": str(device),
         "shape": {
@@ -93,9 +94,17 @@ def main() -> int:
             "attention-domain LSE export drift",
             "CP=2 TP=2 custom CUDA AG/RS communication interface wiring; real ops are future work",
         ],
+        "thresholds": {
+            "out_max_abs": args.out_atol,
+            "lse_max_abs": args.lse_atol,
+            "dlogp_max_abs": args.dlogp_atol,
+        },
     }
     if args.dry_run:
-        _emit(report, json_output=args.json)
+        report["passed"] = False
+        report["acceptance_eligible"] = False
+        report["errors"] = ["dry-run does not execute the FlashInfer candidate"]
+        _emit(report, json_output=args.json, output=args.output)
         return 0
 
     if device.type != "cuda":
@@ -117,12 +126,19 @@ def main() -> int:
         ),
     )
     reference = run_decode_full_prefill_reference(reference_inputs)
-    out_diff = (candidate.out.float() - reference.out.float()).abs()
-    lse_diff = (candidate.lse.float() - reference.lse.float()).abs()
+    out_stats = _drift_stats(candidate.out, reference.out)
+    lse_stats = _drift_stats(candidate.lse, reference.lse)
+    dlogp_stats = _selected_logprob_drift(
+        candidate.out,
+        reference.out,
+        seed=args.seed + 101,
+        vocab_size=args.vocab_size,
+    )
     report["candidate_provenance"] = candidate.provenance
     report["drift"] = {
-        "out_max_abs": float(out_diff.max().item()),
-        "lse_max_abs": float(lse_diff.max().item()),
+        "out": out_stats,
+        "lse": lse_stats,
+        "dlogp": dlogp_stats,
     }
     if config.require_batch_invariant:
         report["batch_invariant_sweep"] = _run_batch_invariance_sweep(
@@ -131,24 +147,41 @@ def main() -> int:
             candidate,
             config,
         )
-    _emit(report, json_output=args.json)
-    return 0
+    report["page_layout_invariant_sweep"] = _run_page_layout_invariance_sweep(
+        op,
+        inputs,
+        candidate,
+        config,
+    )
+    errors = _acceptance_errors(report, args)
+    report["errors"] = errors
+    report["passed"] = not errors
+    report["acceptance_eligible"] = not errors
+    report["status"] = "passed" if not errors else "failed"
+    _emit(report, json_output=args.json, output=args.output)
+    return 0 if not errors else 1
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["prefill", "decode"], default="decode")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--output", type=Path, help="write the JSON report to this path")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--query-len", type=int, default=1)
     parser.add_argument("--kv-seq-len", type=int, default=16)
     parser.add_argument("--page-size", type=int, default=4)
-    parser.add_argument("--q-heads", type=int, default=32)
-    parser.add_argument("--kv-heads", type=int, default=8)
+    parser.add_argument("--q-heads", type=int, default=16)
+    parser.add_argument("--kv-heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument("--seed", type=int, default=2357)
+    parser.add_argument("--vocab-size", type=int, default=257)
+    parser.add_argument("--out-atol", type=float, default=2.0e-4)
+    parser.add_argument("--lse-atol", type=float, default=2.0e-4)
+    parser.add_argument("--dlogp-atol", type=float, default=1.0e-4)
     parser.add_argument("--tp-world-size", type=int, default=2)
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--cp-world-size", type=int, default=2)
@@ -170,7 +203,24 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    for name in ("out_atol", "lse_atol", "dlogp_atol"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.vocab_size < 2:
+        parser.error("--vocab-size must be >= 2")
+    if 32 % args.tp_world_size != 0 or 8 % args.tp_world_size != 0:
+        parser.error("--tp-world-size must divide Qwen3-8B's 32 query and 8 KV heads")
+    expected_q_heads = 32 // args.tp_world_size
+    expected_kv_heads = 8 // args.tp_world_size
+    if args.q_heads != expected_q_heads or args.kv_heads != expected_kv_heads:
+        parser.error(
+            "--q-heads/--kv-heads must describe the TP-local Qwen3-8B shard: "
+            f"expected {expected_q_heads}/{expected_kv_heads} for TP={args.tp_world_size}"
+        )
+    if args.head_dim != 128:
+        parser.error("--head-dim must be 128 for the Qwen3-8B acceptance target")
+    return args
 
 
 def _make_config(args: argparse.Namespace) -> FlashInferPagedAttentionConfig:
@@ -214,7 +264,7 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
         raise SystemExit("--kv-seq-len must be divisible by --page-size for this scaffold")
     if args.mode == "decode" and args.query_len != 1:
         raise SystemExit("--mode decode requires --query-len 1")
-    generator = torch.Generator(device=device).manual_seed(2357)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
     q = torch.randn(
         args.batch_size,
         args.q_heads,
@@ -312,7 +362,192 @@ def _run_batch_invariance_sweep(
         "out_max_abs": max_out,
         "lse_max_abs": max_lse,
         "rows": rows,
+        "passed": max_out == 0.0 and max_lse == 0.0,
     }
+
+
+def _run_page_layout_invariance_sweep(
+    op: FlashInferQwen3PagedAttentionOp,
+    inputs: DecodeAttentionInputs,
+    base_result: Any,
+    config: FlashInferPagedAttentionConfig,
+) -> dict[str, Any]:
+    page_size = inputs.metadata.page_size
+    page_count = inputs.k_cache.size(2) // page_size
+    if page_count < 2:
+        return {
+            "method": "logical_page_table_permutation",
+            "status": "not_applicable",
+            "passed": True,
+            "reason": "fewer than two physical pages",
+        }
+    permutation = torch.arange(
+        page_count - 1,
+        -1,
+        -1,
+        device=inputs.k_cache.device,
+        dtype=torch.long,
+    )
+    inverse = torch.empty_like(permutation)
+    inverse[permutation] = torch.arange(page_count, device=permutation.device)
+
+    def permute_cache(cache: torch.Tensor) -> torch.Tensor:
+        pages = cache.reshape(
+            cache.size(0),
+            cache.size(1),
+            page_count,
+            page_size,
+            cache.size(3),
+        )
+        return pages[:, :, permutation].reshape_as(cache).contiguous()
+
+    block_table = inverse[inputs.metadata.block_table.long()]
+    positions = inputs.metadata.global_token_positions.reshape(
+        inputs.q.size(0), page_count, page_size
+    )[:, permutation].reshape_as(inputs.metadata.global_token_positions)
+    key_positions = inputs.metadata.key_position_ids.reshape(
+        inputs.q.size(0), page_count, page_size
+    )[:, permutation].reshape_as(inputs.metadata.key_position_ids)
+    permuted = DecodeAttentionInputs(
+        q=inputs.q,
+        k_cache=permute_cache(inputs.k_cache),
+        v_cache=permute_cache(inputs.v_cache),
+        metadata=replace(
+            inputs.metadata,
+            block_table=block_table,
+            global_token_positions=positions,
+            key_position_ids=key_positions,
+        ),
+        scale=inputs.scale,
+        output_dtype=inputs.output_dtype,
+        rope_theta=inputs.rope_theta,
+        rope_rotary_dim=inputs.rope_rotary_dim,
+        rope_cast_at=inputs.rope_cast_at,
+        q_rope_output_dtype=inputs.q_rope_output_dtype,
+        k_cache_rope_output_dtype=inputs.k_cache_rope_output_dtype,
+    )
+    candidate = op(
+        permuted.q,
+        permuted.k_cache,
+        permuted.v_cache,
+        permuted.metadata,
+        config=config,
+    )
+    out = _drift_stats(candidate.out, base_result.out)
+    lse = _drift_stats(candidate.lse, base_result.lse)
+    return {
+        "method": "logical_page_table_permutation",
+        "permutation": permutation.detach().cpu().tolist(),
+        "out": out,
+        "lse": lse,
+        "passed": out["max_abs"] == 0.0 and lse["max_abs"] == 0.0,
+    }
+
+
+def _drift_stats(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, Any]:
+    if candidate.shape != reference.shape:
+        raise ValueError("candidate and reference tensors must have matching shapes")
+    candidate_fp32 = candidate.float()
+    reference_fp32 = reference.float()
+    raw = (candidate_fp32 - reference_fp32).abs()
+    diff = torch.where(candidate_fp32 == reference_fp32, torch.zeros_like(raw), raw).reshape(-1)
+    if diff.numel() == 0:
+        return {
+            "max_abs": 0.0,
+            "mean_abs": 0.0,
+            "p95_abs": 0.0,
+            "p99_abs": 0.0,
+            "active_count": 0,
+        }
+    return {
+        "max_abs": float(diff.max().item()),
+        "mean_abs": float(diff.mean().item()),
+        "p95_abs": float(torch.quantile(diff, 0.95).item()),
+        "p99_abs": float(torch.quantile(diff, 0.99).item()),
+        "active_count": int(diff.numel()),
+    }
+
+
+def _selected_logprob_drift(
+    candidate_out: torch.Tensor,
+    reference_out: torch.Tensor,
+    *,
+    seed: int,
+    vocab_size: int,
+) -> dict[str, Any]:
+    batch, heads, seq_len, head_dim = candidate_out.shape
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    weight = torch.randn(
+        vocab_size,
+        heads * head_dim,
+        generator=generator,
+        dtype=torch.float32,
+    ).to(candidate_out.device)
+    target_ids = torch.arange(
+        batch * seq_len,
+        device=candidate_out.device,
+        dtype=torch.long,
+    ).reshape(batch, seq_len) % vocab_size
+
+    def selected(out: torch.Tensor) -> torch.Tensor:
+        hidden = out.float().transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
+        logits = torch.matmul(hidden, weight.transpose(0, 1))
+        return torch.log_softmax(logits, dim=-1).gather(
+            -1, target_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+    return _drift_stats(selected(candidate_out), selected(reference_out))
+
+
+def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    errors = []
+    drift = report["drift"]
+    for name, threshold in (
+        ("out", args.out_atol),
+        ("lse", args.lse_atol),
+        ("dlogp", args.dlogp_atol),
+    ):
+        value = drift.get(name, {}).get("max_abs")
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
+            errors.append(f"{name} max_abs must be finite and non-negative")
+        elif value > threshold:
+            errors.append(
+                f"{name} max_abs={value} exceeds {threshold}"
+            )
+    provenance = report.get("candidate_provenance", {})
+    if not str(report.get("device", "")).startswith("cuda"):
+        errors.append("strict PR7 acceptance requires a CUDA execution")
+    shape = report.get("shape", {})
+    expected_shape = {
+        "q_heads": 32 // args.tp_world_size,
+        "kv_heads": 8 // args.tp_world_size,
+        "head_dim": 128,
+    }
+    if not isinstance(shape, dict) or any(
+        shape.get(key) != expected for key, expected in expected_shape.items()
+    ):
+        errors.append("runtime shape is not the Qwen3-8B TP-local head shard")
+    if provenance.get("attention_mode") != args.mode:
+        errors.append("runtime attention mode differs from the requested mode")
+    if provenance.get("fallback") is not False:
+        errors.append("FlashInfer execution used or omitted fallback provenance")
+    if provenance.get("pos_encoding_mode") != "ROPE_LLAMA":
+        errors.append("FlashInfer runtime did not use ROPE_LLAMA")
+    if provenance.get("rope_theta") != 1_000_000.0 or provenance.get("rotary_dim") != 128:
+        errors.append("FlashInfer runtime RoPE identity does not match Qwen3-8B")
+    if provenance.get("arithmetic_semantics_verified") is not True:
+        errors.append("runtime arithmetic semantics were not verified")
+    if not provenance.get("actual_split_kv_plans"):
+        errors.append("actual Split-KV runtime plans are missing")
+    plan_set = provenance.get("actual_split_kv_plan_set")
+    if not isinstance(plan_set, dict) or plan_set.get("coverage") != (
+        "complete_batch_tp_cp_owner_cartesian_product"
+    ):
+        errors.append("complete batch/TP/CP/owner Split-KV plan set is missing")
+    for sweep_name in ("batch_invariant_sweep", "page_layout_invariant_sweep"):
+        if report.get(sweep_name, {}).get("passed") is not True:
+            errors.append(f"{sweep_name} failed")
+    return errors
 
 
 def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> DecodeAttentionInputs:
@@ -347,7 +582,18 @@ def _select_batch_row(inputs: DecodeAttentionInputs, batch_index: int) -> Decode
     )
 
 
-def _emit(report: dict[str, Any], *, json_output: bool) -> None:
+def _emit(
+    report: dict[str, Any],
+    *,
+    json_output: bool,
+    output: Path | None,
+) -> None:
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
