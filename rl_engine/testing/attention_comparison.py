@@ -21,11 +21,7 @@ from typing import Any, Literal
 
 import torch
 
-from rl_engine.kernels.attention_contract import (
-    SplitKVExecutionPlan,
-    SplitKVMode,
-    SplitKVSpec,
-)
+from rl_engine.kernels.attention_contract import SplitKVExecutionPlan, SplitKVMode, SplitKVSpec
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 from rl_engine.testing.reference_ops import selected_logprobs_reference
 
@@ -378,9 +374,7 @@ def _run_decode_kv_replay(
             order: list[int] = []
             visible_count = int((logical_positions <= query_position).sum().item())
             split_bounds = _decode_split_bounds(visible_count, split_kv)
-            for block_index, (block_start, block_end) in enumerate(
-                split_bounds
-            ):
+            for block_index, (block_start, block_end) in enumerate(split_bounds):
                 block_positions = logical_positions[block_start:block_end]
                 visible = block_positions <= query_position
                 if not bool(visible.any()):

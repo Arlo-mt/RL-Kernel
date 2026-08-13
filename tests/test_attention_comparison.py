@@ -14,10 +14,10 @@ from typing import Literal
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.gtest import run_operator_suite
 from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator_case
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
-from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.testing.attention_comparison import (
     AttentionComparisonInputs,
     DecodeAttentionInputs,
@@ -491,9 +491,11 @@ def test_decode_append_matches_full_prefill_suffix():
     assert drift.provenance["decode_semantics"] == "past_kv_plus_new_kv_append"
     assert drift.provenance["past_kv_lengths"] == [4]
     assert drift.provenance["new_kv_length"] == 2
-    assert drift.provenance["actual_split_kv_plans"][0][1][
-        "actual_split_boundaries"
-    ] == [[0, 2], [2, 4], [4, 6]]
+    assert drift.provenance["actual_split_kv_plans"][0][1]["actual_split_boundaries"] == [
+        [0, 2],
+        [2, 4],
+        [4, 6],
+    ]
 
 
 def test_decode_replay_supports_nonzero_global_position_offset():
