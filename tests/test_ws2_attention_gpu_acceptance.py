@@ -207,6 +207,7 @@ def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
             "rank": rank,
             "world_size": 2,
             "passed": True,
+            "global_failure_count": 0,
             "transport": "p2p_nccl_reference",
             "device": f"cuda:{rank}",
             "dtype": "bf16",
@@ -250,6 +251,7 @@ def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence()
                 "rank": rank,
                 "world_size": 2,
                 "passed": True,
+                "global_failure_count": 0,
                 "transport": "p2p_nccl_reference",
                 "device": f"cuda:{rank}",
                 "dtype": "bf16",
@@ -269,6 +271,59 @@ def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence()
     assert any("final output dtype" in error for error in errors)
     assert any("gathered block order/coverage" in error for error in errors)
     assert any("final_out_max_abs" in error for error in errors)
+
+
+def test_p2p_validation_rejects_forged_manifest_and_rank_query_mapping():
+    def row(rank, query_range):
+        return {
+            "rank": rank,
+            "world_size": 2,
+            "global_failure_count": 0,
+            "passed": True,
+            "transport": "p2p_nccl_reference",
+            "device": f"cuda:{rank}",
+            "dtype": "bf16",
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "final_output_dtype": "bfloat16",
+            "query_range": query_range,
+            "expected_block_manifest": [
+                {
+                    "global_block_index": 0,
+                    "kv_block_start": 0,
+                    "kv_block_end": 4,
+                    "owner_cp_rank": 0,
+                    "owner_tp_rank": 0,
+                },
+                {
+                    "global_block_index": 1,
+                    "kv_block_start": 5,
+                    "kv_block_end": 8,
+                    "owner_cp_rank": 3,
+                    "owner_tp_rank": 0,
+                },
+            ],
+            "gathered_block_indices": [0, 1],
+            "out_max_abs": 0.0,
+            "lse_max_abs": 0.0,
+            "final_out_max_abs": 0.0,
+            "atol": 2.0e-4,
+            "final_write_atol": 2.0e-2,
+        }
+
+    report = {
+        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
+        "backend": "nccl",
+        "world_size": 2,
+        "global_failure_count": 0,
+        "ranks": [row(0, [8, 16]), row(1, [0, 8])],
+    }
+
+    errors = validate_p2p_report(report)
+    assert any("gap-free KV coverage" in error for error in errors)
+    assert any("outside the TP-local CP=2 group" in error for error in errors)
+    assert any("both CP ranks" in error for error in errors)
+    assert any("query ownership ranges" in error for error in errors)
 
 
 def test_pr5_validation_rejects_forged_plan_set_coverage(tmp_path):

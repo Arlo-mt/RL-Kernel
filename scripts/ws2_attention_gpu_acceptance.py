@@ -445,8 +445,8 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         errors.append("P2P report must contain exactly two rank reports")
         return errors
     seen_ranks: set[int] = set()
-    expected_query_ranges: list[list[int]] = []
-    gathered_manifests: list[list[int]] = []
+    query_ranges_by_rank: dict[int, list[int]] = {}
+    gathered_manifests: list[list[Mapping[str, Any]]] = []
     for index, row in enumerate(ranks):
         if not isinstance(row, dict):
             errors.append(f"P2P rank {index} report is invalid")
@@ -456,6 +456,8 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             errors.append(f"P2P row {index} lacks an integer rank")
         else:
             seen_ranks.add(rank)
+            if row.get("global_failure_count") != 0:
+                errors.append(f"P2P rank {index} observed global rank failures")
         if row.get("passed") is not True:
             errors.append(f"P2P rank {index} did not pass")
         if row.get("world_size") != 2:
@@ -478,16 +480,12 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         ):
             errors.append(f"P2P rank {index} query ownership is invalid")
         else:
-            expected_query_ranges.append(query_range)
+            if isinstance(rank, int):
+                query_ranges_by_rank[rank] = query_range
         gathered_indices = row.get("gathered_block_indices")
         block_manifest = row.get("expected_block_manifest")
-        manifest_indices = (
-            [block.get("global_block_index") for block in block_manifest]
-            if isinstance(block_manifest, list)
-            and block_manifest
-            and all(isinstance(block, dict) for block in block_manifest)
-            else None
-        )
+        manifest_errors, manifest_indices = _validate_p2p_block_manifest(block_manifest)
+        errors.extend(f"P2P rank {index}: {error}" for error in manifest_errors)
         if not (
             isinstance(gathered_indices, list)
             and gathered_indices
@@ -496,7 +494,8 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         ):
             errors.append(f"P2P rank {index} gathered block order/coverage is invalid")
         else:
-            gathered_manifests.append(gathered_indices)
+            assert isinstance(block_manifest, list)
+            gathered_manifests.append(block_manifest)
         for name in ("out_max_abs", "lse_max_abs"):
             errors.extend(_scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}"))
         errors.extend(
@@ -508,14 +507,58 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         )
     if seen_ranks != {0, 1}:
         errors.append("P2P report must cover ranks 0 and 1 exactly")
-    if sorted(expected_query_ranges) != expected_query_ranges or any(
-        left[1] != right[0]
-        for left, right in zip(expected_query_ranges, expected_query_ranges[1:])
+    ordered_query_ranges = [query_ranges_by_rank.get(rank) for rank in range(2)]
+    if (
+        any(bounds is None for bounds in ordered_query_ranges)
+        or ordered_query_ranges[0][0] != 0
+        or ordered_query_ranges[0][1] != ordered_query_ranges[1][0]
+        or ordered_query_ranges[1][1] <= ordered_query_ranges[1][0]
     ):
         errors.append("P2P query ownership ranges are not canonical and contiguous")
     if len(gathered_manifests) == 2 and gathered_manifests[0] != gathered_manifests[1]:
         errors.append("P2P ranks gathered different logical block manifests")
     return errors
+
+
+def _validate_p2p_block_manifest(manifest: Any) -> tuple[list[str], list[int] | None]:
+    if not isinstance(manifest, list) or not manifest:
+        return ["expected block manifest is missing"], None
+    required = {
+        "global_block_index",
+        "kv_block_start",
+        "kv_block_end",
+        "owner_cp_rank",
+        "owner_tp_rank",
+    }
+    errors: list[str] = []
+    indices: list[int] = []
+    cursor = 0
+    owners: set[int] = set()
+    for index, block in enumerate(manifest):
+        if not isinstance(block, dict) or not required.issubset(block):
+            errors.append(f"manifest block {index} is missing required metadata")
+            continue
+        values = {name: block[name] for name in required}
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in values.values()):
+            errors.append(f"manifest block {index} metadata must contain integers")
+            continue
+        global_index = values["global_block_index"]
+        start = values["kv_block_start"]
+        end = values["kv_block_end"]
+        owner_cp_rank = values["owner_cp_rank"]
+        owner_tp_rank = values["owner_tp_rank"]
+        indices.append(global_index)
+        owners.add(owner_cp_rank)
+        if global_index != index:
+            errors.append(f"manifest block {index} has a non-canonical global index")
+        if start != cursor or end <= start:
+            errors.append(f"manifest block {index} does not preserve gap-free KV coverage")
+        cursor = end
+        if owner_cp_rank not in {0, 1} or owner_tp_rank != 0:
+            errors.append(f"manifest block {index} owner is outside the TP-local CP=2 group")
+    if owners != {0, 1}:
+        errors.append("manifest does not assign KV blocks to both CP ranks")
+    return errors, indices
 
 
 def _threshold_errors(stats: Any, threshold: float, label: str) -> list[str]:
