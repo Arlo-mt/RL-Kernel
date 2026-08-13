@@ -195,13 +195,9 @@ class AttentionCPCommunicationPlan:
             if self.status != "implemented":
                 raise ValueError("P2P NCCL reference plans must use status='implemented'")
             if not self.expected_blocks or self.expected_kv_token_range is None:
-                raise ValueError(
-                    "P2P NCCL reference requires a complete expected block manifest"
-                )
+                raise ValueError("P2P NCCL reference requires a complete expected block manifest")
             if not self.query_token_ranges:
-                raise ValueError(
-                    "P2P NCCL reference requires one query range per CP rank"
-                )
+                raise ValueError("P2P NCCL reference requires one query range per CP rank")
 
     def provenance(self) -> dict[str, object]:
         self.validate()
@@ -215,16 +211,10 @@ class AttentionCPCommunicationPlan:
             "cp_comm_return_lse": self.return_lse,
             "cp_comm_contract": "partial_out_lse_global_block_index",
             "cp_comm_expected_kv_token_range": (
-                None
-                if self.expected_kv_token_range is None
-                else list(self.expected_kv_token_range)
+                None if self.expected_kv_token_range is None else list(self.expected_kv_token_range)
             ),
-            "cp_comm_expected_blocks": [
-                block.provenance() for block in self.expected_blocks
-            ],
-            "cp_comm_query_token_ranges": [
-                list(bounds) for bounds in self.query_token_ranges
-            ],
+            "cp_comm_expected_blocks": [block.provenance() for block in self.expected_blocks],
+            "cp_comm_query_token_ranges": [list(bounds) for bounds in self.query_token_ranges],
             "cp_comm_merge_root_cp_rank": int(self.merge_root_cp_rank),
             **self.parallel.provenance(),
         }
@@ -321,9 +311,7 @@ class P2PNCCLAttentionCPCommunication:
             )
         received: list[AttentionCPPartialState] = []
         operations: list[Any] = []
-        receive_tensors: list[
-            tuple[AttentionCPBlockMetadata, torch.Tensor, torch.Tensor]
-        ] = []
+        receive_tensors: list[tuple[AttentionCPBlockMetadata, torch.Tensor, torch.Tensor]] = []
 
         for peer_cp_rank in range(plan.parallel.cp_world_size):
             if peer_cp_rank == plan.parallel.cp_rank:
@@ -387,9 +375,7 @@ class P2PNCCLAttentionCPCommunication:
         ranges = plan.query_token_ranges
         full_query_tokens = ranges[-1][1]
         if merged_state.out.size(2) != full_query_tokens:
-            raise ValueError(
-                "merged state query length does not match query_token_ranges coverage"
-            )
+            raise ValueError("merged state query length does not match query_token_ranges coverage")
 
         rank = plan.parallel.cp_rank
         root = plan.merge_root_cp_rank
@@ -507,12 +493,11 @@ class P2PNCCLAttentionCPCommunication:
             request.wait()
 
     def _require_cuda(self, *tensors: torch.Tensor) -> None:
-        if self._validate_cuda_tensors and any(
-            tensor.device.type != "cuda" for tensor in tensors
-        ):
+        if self._validate_cuda_tensors and any(tensor.device.type != "cuda" for tensor in tensors):
             raise AttentionCPCommunicationUnavailable(
                 "P2P NCCL communication requires CUDA tensors"
             )
+
 
 def sort_attention_cp_partial_states(
     states: tuple[AttentionCPPartialState, ...],
@@ -536,18 +521,14 @@ def sort_attention_cp_partial_states(
             "values [0, block_count)"
         )
     if not plan.expected_blocks and ordered[0].block.kv_block_start != 0:
-        raise ValueError(
-            "partial states without a manifest must start at KV token 0"
-        )
+        raise ValueError("partial states without a manifest must start at KV token 0")
     if plan.expected_kv_token_range is not None:
         expected_start, expected_end = plan.expected_kv_token_range
         if (
             ordered[0].block.kv_block_start != expected_start
             or ordered[-1].block.kv_block_end != expected_end
         ):
-            raise ValueError(
-                "partial states do not cover the declared expected KV token range"
-            )
+            raise ValueError("partial states do not cover the declared expected KV token range")
     _validate_partial_state_set(ordered, plan)
     return ordered
 
@@ -561,9 +542,7 @@ def _validate_expected_block_manifest(plan: AttentionCPCommunicationPlan) -> Non
     for block in blocks:
         block.validate(plan.parallel)
         if block.owner_tp_rank != plan.parallel.tp_rank:
-            raise ValueError(
-                "expected block owner_tp_rank must match the plan TP shard"
-            )
+            raise ValueError("expected block owner_tp_rank must match the plan TP shard")
     ordered = tuple(sorted(blocks, key=lambda block: block.global_block_index))
     indices = tuple(block.global_block_index for block in ordered)
     if len(set(indices)) != len(indices):
@@ -609,9 +588,7 @@ def _validate_query_token_ranges(plan: AttentionCPCommunicationPlan) -> None:
         try:
             start, end = bounds
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "query token ranges must contain (start, end) pairs"
-            ) from exc
+            raise ValueError("query token ranges must contain (start, end) pairs") from exc
         if (
             isinstance(start, bool)
             or isinstance(end, bool)
@@ -620,9 +597,7 @@ def _validate_query_token_ranges(plan: AttentionCPCommunicationPlan) -> None:
         ):
             raise ValueError("query token ranges must contain (start, end) pairs")
         if start != previous_end or end < start:
-            raise ValueError(
-                "query token ranges must be non-negative, contiguous, and start at 0"
-            )
+            raise ValueError("query token ranges must be non-negative, contiguous, and start at 0")
         previous_end = end
     if previous_end == 0:
         raise ValueError("query token ranges must cover at least one query token")
@@ -642,8 +617,7 @@ def _validate_local_partial_states(
         if state.block.owner_tp_rank != plan.parallel.tp_rank:
             raise ValueError("local partial state has the wrong TP owner")
     actual = tuple(
-        state.block
-        for state in sorted(states, key=lambda item: item.block.global_block_index)
+        state.block for state in sorted(states, key=lambda item: item.block.global_block_index)
     )
     if actual != expected:
         raise ValueError("local partial states do not exactly match the rank manifest")
@@ -678,9 +652,7 @@ def _validate_partial_state_set(
         previous_end = state.block.kv_block_end
     if plan.expected_blocks:
         actual = tuple(state.block for state in states)
-        expected = tuple(
-            sorted(plan.expected_blocks, key=lambda block: block.global_block_index)
-        )
+        expected = tuple(sorted(plan.expected_blocks, key=lambda block: block.global_block_index))
         if actual != expected:
             raise ValueError(
                 "gathered partial states do not exactly match the complete block manifest"
@@ -704,12 +676,7 @@ def _positive_int(value: int, name: str) -> None:
 
 
 def _rank_in_world(rank: int, world_size: int, name: str) -> None:
-    if (
-        isinstance(rank, bool)
-        or not isinstance(rank, int)
-        or rank < 0
-        or rank >= world_size
-    ):
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0 or rank >= world_size:
         raise ValueError(f"{name} must be in [0, world_size)")
 
 

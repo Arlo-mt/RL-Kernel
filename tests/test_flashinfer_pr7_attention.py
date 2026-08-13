@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import types
 from dataclasses import replace
-import json
 
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
@@ -25,17 +26,14 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
     FlashInferRoPEFusionConfig,
-    FlashInferSplitKVPolicy,
     FlashInferUnavailable,
     build_flashinfer_paged_kv_plan,
     flashinfer_prefix_cache_fingerprint,
     materialize_flashinfer_paged_kv_cache,
 )
-from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.testing.attention_comparison import DecodeKVCacheMetadata
-
-from scripts import ws2_pr7_flashinfer_attention_check as check_script
 from scripts import ws2_p2p_nccl_attention_reference_check as p2p_check_script
+from scripts import ws2_pr7_flashinfer_attention_check as check_script
 
 
 class _FakeFlashInferWrapper:
@@ -294,9 +292,7 @@ class _FakeCPCommunication:
     def all_gather_partial_states(self, local_states, plan):
         local = local_states[0]
         remote_block = next(
-            block
-            for block in plan.expected_blocks
-            if block.owner_cp_rank != plan.parallel.cp_rank
+            block for block in plan.expected_blocks if block.owner_cp_rank != plan.parallel.cp_rank
         )
         remote = AttentionCPPartialState(
             out=torch.ones_like(local.out),
@@ -453,9 +449,6 @@ def test_flashinfer_pr7_strict_fixed_mode_requires_actual_runtime_split_plan():
         decode=types.SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=_NoRuntimePlanWrapper),
     )
 
-
-
-
     q, k, v = _qkv(query_len=1)
 
     with pytest.raises(FlashInferUnavailable, match="actual-plan provenance"):
@@ -493,9 +486,7 @@ def test_flashinfer_pr7_disabled_plan_is_exact_when_disable_knob_is_accepted():
         ),
     )
 
-    assert result.provenance["actual_split_kv_plans"][0][
-        "actual_split_boundaries"
-    ] == [[0, 6]]
+    assert result.provenance["actual_split_kv_plans"][0]["actual_split_boundaries"] == [[0, 6]]
     assert result.provenance["actual_split_kv_plans"][0]["split_kv_backend"] == (
         "flashinfer_disabled_verified"
     )
@@ -568,12 +559,8 @@ def test_flashinfer_pr7_strict_mode_requires_complete_runtime_plan_set():
         get_actual_split_kv_plan_set = None
 
     fake = types.SimpleNamespace(
-        prefill=types.SimpleNamespace(
-            BatchPrefillWithPagedKVCacheWrapper=_NoRuntimePlanSetWrapper
-        ),
-        decode=types.SimpleNamespace(
-            BatchDecodeWithPagedKVCacheWrapper=_NoRuntimePlanSetWrapper
-        ),
+        prefill=types.SimpleNamespace(BatchPrefillWithPagedKVCacheWrapper=_NoRuntimePlanSetWrapper),
+        decode=types.SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=_NoRuntimePlanSetWrapper),
     )
     q, k, v = _qkv(query_len=1)
 
@@ -661,12 +648,8 @@ def test_flashinfer_pr7_rejects_non_fp32_runtime_accumulation():
             }
 
     fake = types.SimpleNamespace(
-        prefill=types.SimpleNamespace(
-            BatchPrefillWithPagedKVCacheWrapper=_WrongArithmeticWrapper
-        ),
-        decode=types.SimpleNamespace(
-            BatchDecodeWithPagedKVCacheWrapper=_WrongArithmeticWrapper
-        ),
+        prefill=types.SimpleNamespace(BatchPrefillWithPagedKVCacheWrapper=_WrongArithmeticWrapper),
+        decode=types.SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=_WrongArithmeticWrapper),
     )
     q, k, v = _qkv(query_len=1)
 
@@ -690,12 +673,8 @@ def test_flashinfer_pr7_rejects_runtime_output_dtype_boundary_mismatch():
             return out.double(), lse
 
     fake = types.SimpleNamespace(
-        prefill=types.SimpleNamespace(
-            BatchPrefillWithPagedKVCacheWrapper=_WrongOutputDTypeWrapper
-        ),
-        decode=types.SimpleNamespace(
-            BatchDecodeWithPagedKVCacheWrapper=_WrongOutputDTypeWrapper
-        ),
+        prefill=types.SimpleNamespace(BatchPrefillWithPagedKVCacheWrapper=_WrongOutputDTypeWrapper),
+        decode=types.SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=_WrongOutputDTypeWrapper),
     )
     q, k, v = _qkv(query_len=1)
 
@@ -719,12 +698,8 @@ def test_flashinfer_pr7_rejects_non_fp32_runtime_lse():
             return out, lse.to(torch.bfloat16)
 
     fake = types.SimpleNamespace(
-        prefill=types.SimpleNamespace(
-            BatchPrefillWithPagedKVCacheWrapper=_WrongLSEDTypeWrapper
-        ),
-        decode=types.SimpleNamespace(
-            BatchDecodeWithPagedKVCacheWrapper=_WrongLSEDTypeWrapper
-        ),
+        prefill=types.SimpleNamespace(BatchPrefillWithPagedKVCacheWrapper=_WrongLSEDTypeWrapper),
+        decode=types.SimpleNamespace(BatchDecodeWithPagedKVCacheWrapper=_WrongLSEDTypeWrapper),
     )
     q, k, v = _qkv(query_len=1)
 
@@ -794,9 +769,7 @@ def test_flashinfer_pr7_rejects_post_rope_inputs_for_rope_llama_fusion():
 def test_flashinfer_pr7_rejects_metadata_rope_state_mismatch():
     q, k, v = _qkv(query_len=1)
     metadata = _metadata(query_len=1)
-    metadata = DecodeKVCacheMetadata(
-        **{**metadata.__dict__, "k_cache_rope_state": "post_rope"}
-    )
+    metadata = DecodeKVCacheMetadata(**{**metadata.__dict__, "k_cache_rope_state": "post_rope"})
 
     with pytest.raises(ValueError, match="metadata.k_cache_rope_state"):
         FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
@@ -1257,9 +1230,7 @@ def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
         "page_layout_invariant_sweep": {"passed": True},
     }
 
-    assert check_script._acceptance_errors(report, args) == [
-        "batch_invariant_sweep failed"
-    ]
+    assert check_script._acceptance_errors(report, args) == ["batch_invariant_sweep failed"]
 
 
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():

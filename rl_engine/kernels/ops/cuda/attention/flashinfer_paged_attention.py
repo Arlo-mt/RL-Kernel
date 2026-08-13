@@ -15,28 +15,28 @@ choices that affect rollout/training alignment:
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
 
-from rl_engine.kernels.ops.cuda.attention.cp_comm import (
-    AttentionCPCommunication,
-    AttentionCPCommunicationPlan,
-    AttentionParallelSpec,
-)
 from rl_engine.kernels.attention_contract import (
     AttentionContractError,
     SplitKVExecutionPlan,
     SplitKVMode,
-    SplitKVSpec,
     SplitKVRuntimeCoordinate,
     SplitKVRuntimePlanEntry,
     SplitKVRuntimePlanSet,
+    SplitKVSpec,
     validate_split_kv_alignment,
+)
+from rl_engine.kernels.ops.cuda.attention.cp_comm import (
+    AttentionCPCommunication,
+    AttentionCPCommunicationPlan,
+    AttentionParallelSpec,
 )
 
 RoPEState = Literal["pre_rope", "post_rope"]
@@ -144,9 +144,7 @@ class FlashInferPagedAttentionConfig:
                 "self-owned CUDA AG/RS are implemented."
             )
         elif self.cp_comm_plan.status != "interface_only":
-            raise ValueError(
-                "implemented CP communication plans require require_cp_comm=True"
-            )
+            raise ValueError("implemented CP communication plans require require_cp_comm=True")
         if not isinstance(self.require_verified_arithmetic, bool):
             raise ValueError("require_verified_arithmetic must be a bool")
 
@@ -625,9 +623,7 @@ class FlashInferQwen3PagedAttentionOp:
             return None
         raw = getter()
         if not isinstance(raw, dict):
-            raise FlashInferUnavailable(
-                "get_actual_split_kv_plan_set() must return a dict"
-            )
+            raise FlashInferUnavailable("get_actual_split_kv_plan_set() must return a dict")
         try:
             entries = tuple(
                 SplitKVRuntimePlanEntry(
@@ -655,8 +651,7 @@ class FlashInferQwen3PagedAttentionOp:
                             entry["boundaries"],
                             page_size=plan.page_size,
                             seq_len=int(
-                                entry["expected_kv_range"][1]
-                                - entry["expected_kv_range"][0]
+                                entry["expected_kv_range"][1] - entry["expected_kv_range"][0]
                             ),
                             unit=entry.get("boundary_unit"),
                             offset=int(entry["expected_kv_range"][0]),
@@ -749,17 +744,13 @@ class FlashInferQwen3PagedAttentionOp:
             }
         raw = getter()
         if not isinstance(raw, dict):
-            raise FlashInferUnavailable(
-                "get_attention_arithmetic_provenance() must return a dict"
-            )
+            raise FlashInferUnavailable("get_attention_arithmetic_provenance() must return a dict")
         required = {
             "accum_dtype": "fp32",
             "downcast_at": "final_write",
             "lse_dtype": "fp32",
         }
-        mismatches = [
-            key for key, expected in required.items() if raw.get(key) != expected
-        ]
+        mismatches = [key for key, expected in required.items() if raw.get(key) != expected]
         source = raw.get("source")
         if not isinstance(source, str) or not source.strip():
             mismatches.append("source")
@@ -804,9 +795,7 @@ class FlashInferQwen3PagedAttentionOp:
         if not isinstance(out_flat, torch.Tensor) or not isinstance(lse_flat, torch.Tensor):
             raise FlashInferUnavailable("FlashInfer output and LSE must be tensors")
         if out_flat.device != q.device or lse_flat.device != q.device:
-            raise FlashInferUnavailable(
-                "FlashInfer output and LSE must remain on the query device"
-            )
+            raise FlashInferUnavailable("FlashInfer output and LSE must remain on the query device")
         expected_out_dtype = torch.float32 if require_fp32_output else q.dtype
         if out_flat.dtype != expected_out_dtype:
             raise FlashInferUnavailable(
@@ -927,9 +916,7 @@ def _validate_flashinfer_rope_metadata(
     kv_seq_lens = getattr(metadata, "kv_seq_lens", None)
     if not isinstance(kv_seq_lens, torch.Tensor) or kv_seq_lens.shape != (q.size(0),):
         raise ValueError("kv_seq_lens must have shape [B]")
-    if bool((cache_position < 0).any()) or bool(
-        (cache_position >= kv_seq_lens[:, None]).any()
-    ):
+    if bool((cache_position < 0).any()) or bool((cache_position >= kv_seq_lens[:, None]).any()):
         raise ValueError("cache_position must identify tokens present in each KV sequence")
     if q.size(2) > 1 and bool((cache_position[:, 1:] <= cache_position[:, :-1]).any()):
         raise ValueError("few-query cache_position values must be strictly increasing")
@@ -990,9 +977,7 @@ def flashinfer_prefix_cache_fingerprint(
         ):
             digest.update(str(tuple(tensor.shape)).encode())
             digest.update(str(tensor.dtype).encode())
-            digest.update(
-                tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
-            )
+            digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
     return digest.hexdigest()
 
 

@@ -848,11 +848,7 @@ def _decode_rope_rotary_dim(inputs: DecodeAttentionInputs) -> int:
 
 
 def _decode_attention_scale(inputs: DecodeAttentionInputs) -> float:
-    return (
-        1.0 / math.sqrt(inputs.q.size(-1))
-        if inputs.scale is None
-        else float(inputs.scale)
-    )
+    return 1.0 / math.sqrt(inputs.q.size(-1)) if inputs.scale is None else float(inputs.scale)
 
 
 def _rope_output_dtype(inputs: AttentionComparisonInputs) -> torch.dtype:

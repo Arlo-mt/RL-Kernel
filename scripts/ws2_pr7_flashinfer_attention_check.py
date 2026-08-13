@@ -483,18 +483,19 @@ def _selected_logprob_drift(
         generator=generator,
         dtype=torch.float32,
     ).to(candidate_out.device)
-    target_ids = torch.arange(
-        batch * seq_len,
-        device=candidate_out.device,
-        dtype=torch.long,
-    ).reshape(batch, seq_len) % vocab_size
+    target_ids = (
+        torch.arange(
+            batch * seq_len,
+            device=candidate_out.device,
+            dtype=torch.long,
+        ).reshape(batch, seq_len)
+        % vocab_size
+    )
 
     def selected(out: torch.Tensor) -> torch.Tensor:
         hidden = out.float().transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
         logits = torch.matmul(hidden, weight.transpose(0, 1))
-        return torch.log_softmax(logits, dim=-1).gather(
-            -1, target_ids.unsqueeze(-1)
-        ).squeeze(-1)
+        return torch.log_softmax(logits, dim=-1).gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
 
     return _drift_stats(selected(candidate_out), selected(reference_out))
 
@@ -511,9 +512,7 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
         if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
             errors.append(f"{name} max_abs must be finite and non-negative")
         elif value > threshold:
-            errors.append(
-                f"{name} max_abs={value} exceeds {threshold}"
-            )
+            errors.append(f"{name} max_abs={value} exceeds {threshold}")
     provenance = report.get("candidate_provenance", {})
     if not str(report.get("device", "")).startswith("cuda"):
         errors.append("strict PR7 acceptance requires a CUDA execution")
