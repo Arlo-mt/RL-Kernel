@@ -16,6 +16,7 @@ import torch
 
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionSavedForwardState,
     DeterministicCPAttentionReferenceOp,
     compare_cp_attention_backward,
     merge_attention_partial_states,
@@ -447,6 +448,183 @@ def test_backward_report_cp2_chunked_prefill_matches_cp1_reference():
     ]
 
 
+def test_saved_forward_backward_matches_independent_dense_autograd():
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(2, 5, 7, seed=31, heads=4, kv_heads=2, dim=8)
+    mask = torch.tensor(
+        [[True, True, True, True, True, True, False], [True] * 7],
+        dtype=torch.bool,
+    )
+    query_offsets = torch.tensor([11, 23], dtype=torch.long)
+    key_offsets = torch.tensor([9, 21], dtype=torch.long)
+    dout = torch.randn(q.shape, generator=torch.Generator().manual_seed(32))
+
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        causal=True,
+        scale=0.37,
+        key_padding_mask=mask,
+        query_position_offsets=query_offsets,
+        key_position_offsets=key_offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    result = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        causal=True,
+        scale=0.37,
+        key_padding_mask=mask,
+        query_position_offsets=query_offsets,
+        key_position_offsets=key_offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+        saved_forward_state=state,
+    )
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    k_expanded = k_ref.repeat_interleave(2, dim=1)
+    v_expanded = v_ref.repeat_interleave(2, dim=1)
+    scores = torch.matmul(q_ref, k_expanded.transpose(-1, -2)) * 0.37
+    q_pos = query_offsets[:, None] + torch.arange(q.size(2))
+    k_pos = key_offsets[:, None] + torch.arange(k.size(2))
+    scores = scores.masked_fill(
+        (k_pos[:, None, :] > q_pos[:, :, None])[:, None, :, :],
+        float("-inf"),
+    )
+    scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+    out_ref = torch.matmul(torch.softmax(scores, dim=-1), v_expanded)
+    out_ref.backward(dout)
+
+    assert isinstance(result.saved_forward_state, AttentionSavedForwardState)
+    assert result.saved_forward_state is state
+    assert result.provenance["saved_forward_state_source"] == "caller"
+    torch.testing.assert_close(result.out, out_ref, atol=_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dq, q_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dk, k_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+    torch.testing.assert_close(result.gradients.dv, v_ref.grad, atol=_GRAD_ATOL, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "message"),
+    [("q", "q_fingerprint"), ("k", "k_fingerprint"), ("v", "v_fingerprint")],
+)
+def test_saved_forward_state_rejects_stale_qkv(tensor_name, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=33, heads=4, kv_heads=2, dim=8)
+    state = op.save_forward_state(q, k, v, cp_world_size=2, kv_chunk_size=2)
+    inputs = {"q": q.clone(), "k": k.clone(), "v": v.clone()}
+    inputs[tensor_name].flatten()[0] += 1.0
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            torch.ones_like(q),
+            cp_world_size=2,
+            kv_chunk_size=2,
+            saved_forward_state=state,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "message"),
+    [
+        ("out", "out_fingerprint"),
+        ("lse", "lse_fingerprint"),
+        ("key_padding_mask", "key_padding_mask_fingerprint"),
+        ("query_position_offsets", "query_position_offsets_fingerprint"),
+        ("key_position_offsets", "key_position_offsets_fingerprint"),
+    ],
+)
+def test_saved_forward_state_rejects_mutated_saved_tensors(tensor_name, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=34, heads=4, kv_heads=2, dim=8)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    offsets = torch.tensor([7], dtype=torch.long)
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        key_padding_mask=mask,
+        query_position_offsets=offsets,
+        key_position_offsets=offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    tensor = getattr(state, tensor_name)
+    if tensor.dtype == torch.bool:
+        tensor.flatten()[0].logical_not_()
+    else:
+        tensor.flatten()[0].add_(1)
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            key_padding_mask=mask,
+            query_position_offsets=offsets,
+            key_position_offsets=offsets,
+            cp_world_size=2,
+            kv_chunk_size=2,
+            saved_forward_state=state,
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"causal": False}, "causal"),
+        ({"scale": 0.5}, "scale"),
+        ({"cp_world_size": 1}, "cp_world_size"),
+        ({"kv_chunk_size": None}, "kv_chunk_size"),
+        ({"query_position_offsets": torch.tensor([8])}, "query_position_offsets"),
+        ({"key_position_offsets": torch.tensor([8])}, "key_position_offsets"),
+    ],
+)
+def test_saved_forward_state_rejects_execution_metadata_mismatch(override, message):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=35, heads=4, kv_heads=2, dim=8)
+    offsets = torch.tensor([7], dtype=torch.long)
+    state = op.save_forward_state(
+        q,
+        k,
+        v,
+        query_position_offsets=offsets,
+        key_position_offsets=offsets,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+    kwargs = {
+        "causal": True,
+        "scale": None,
+        "query_position_offsets": offsets,
+        "key_position_offsets": offsets,
+        "cp_world_size": 2,
+        "kv_chunk_size": 2,
+    }
+    kwargs.update(override)
+
+    with pytest.raises(ValueError, match=message):
+        op.backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            saved_forward_state=state,
+            **kwargs,
+        )
+
+
 def test_split_kv_plan_never_crosses_cp_owner_boundaries():
     plans = split_kv_execution_plan_provenance(
         10,
@@ -550,6 +728,15 @@ def test_backward_report_validates_dout_shape_and_dtype():
             cp_world_size=2,
         )
 
+    with pytest.raises(ValueError, match="dout must have the same dtype"):
+        op.backward_reference(
+            q.to(torch.bfloat16),
+            k.to(torch.bfloat16),
+            v.to(torch.bfloat16),
+            torch.ones_like(q),
+            cp_world_size=2,
+        )
+
 
 def test_inputs_are_not_mutated():
     op = DeterministicCPAttentionReferenceOp()
@@ -606,6 +793,51 @@ def test_invalid_gqa_and_mask_shapes_raise():
             v,
             key_position_offsets=torch.ones(1, dtype=torch.float32),
         )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf"), True, "bad"])
+def test_invalid_scale_fails_before_attention_math(scale):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=24, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="scale must be a positive finite number"):
+        op.forward_fp32_with_lse(q, k, v, scale=scale)
+
+
+def test_qkv_dtype_and_floating_contract_fails_closed():
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=25, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="same dtype"):
+        op.forward_fp32_with_lse(q, k.to(torch.bfloat16), v)
+    with pytest.raises(ValueError, match="real floating-point"):
+        op.forward_fp32_with_lse(q.to(torch.long), k.to(torch.long), v.to(torch.long))
+
+
+@pytest.mark.parametrize("kwargs", [{"cp_world_size": True}, {"kv_chunk_size": True}])
+def test_boolean_parallelism_arguments_fail_closed(kwargs):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=26, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError):
+        op.forward_fp32_with_lse(q, k, v, **kwargs)
+
+
+@pytest.mark.parametrize("output_dtype", [torch.long, torch.complex64, "fp32"])
+def test_nonfloating_output_dtype_fails_closed(output_dtype):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=27, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="output_dtype must be a real floating-point"):
+        op.forward_with_lse(q, k, v, output_dtype=output_dtype)
+
+
+def test_partial_states_must_remain_fp32_and_colocated():
+    out = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    lse = torch.zeros(1, 1, 1, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="must remain FP32"):
+        AttentionPartialState(out=out, lse=lse, block_start=0, block_end=1)
 
 
 def test_overlapping_partial_ranges_raise():

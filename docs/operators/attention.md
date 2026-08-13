@@ -221,8 +221,12 @@ Hooks:
 - `forward(q, k, v, ...)` — main path (registry, #108 harness). Differentiable.
 - `forward_with_lse(q, k, v, ...)` — returns `(out, lse)` for LSE verification, debugging,
   and future KV-cache / training integration.
-- `backward_reference(q, k, v, dout, ...)` — runs the deterministic training backward
-  validation path and returns `dq`, `dk`, `dv`, `out`, `lse`, and provenance.
+- `save_forward_state(q, k, v, ...)` captures FP32 `out/lse`, masks, position metadata,
+  topology, Split-KV boundaries, and content fingerprints for the exact forward invocation.
+- `backward_reference(q, k, v, dout, ..., saved_forward_state=state)` consumes that saved
+  state in canonical global KV-block order. It fails closed if Q/K/V, saved tensors, masks,
+  offsets, topology, or Split-KV metadata changed, and returns `dq`, `dk`, `dv`, `out`, `lse`,
+  and provenance.
 - `compare_cp_attention_backward(q, k, v, dout, ...)` — compares CP=1 backward against
   CP/chunked-prefill backward and emits whole-tensor plus per-logical-rank drift stats.
 

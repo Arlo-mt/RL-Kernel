@@ -10,6 +10,7 @@ against a small, inspectable implementation.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -46,6 +47,10 @@ class AttentionPartialState:
             raise ValueError("partial attention out must have shape [B, Hq, Sq, D]")
         if self.lse.shape != self.out.shape[:3]:
             raise ValueError("partial attention lse must have shape [B, Hq, Sq]")
+        if self.out.device != self.lse.device:
+            raise ValueError("partial attention out/lse must be on the same device")
+        if self.out.dtype is not torch.float32 or self.lse.dtype is not torch.float32:
+            raise ValueError("partial attention out/lse must remain FP32 before merge")
         if self.block_start < 0:
             raise ValueError("block_start must be non-negative")
         if self.block_end < self.block_start:
@@ -62,6 +67,45 @@ class AttentionBackwardGradients:
 
 
 @dataclass(frozen=True)
+class AttentionSavedForwardState:
+    """Exact FP32 forward state consumed by the PR8 backward reference."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    causal: bool
+    scale: float
+    key_padding_mask: Optional[torch.Tensor]
+    query_position_offsets: torch.Tensor
+    key_position_offsets: torch.Tensor
+    cp_world_size: int
+    kv_chunk_size: Optional[int]
+    query_bounds: tuple[tuple[int, int], ...]
+    kv_block_bounds: tuple[tuple[int, int], ...]
+    q_shape: tuple[int, ...]
+    k_shape: tuple[int, ...]
+    v_shape: tuple[int, ...]
+    q_dtype: torch.dtype
+    k_dtype: torch.dtype
+    v_dtype: torch.dtype
+    q_fingerprint: str
+    k_fingerprint: str
+    v_fingerprint: str
+    out_fingerprint: str
+    lse_fingerprint: str
+    key_padding_mask_fingerprint: Optional[str]
+    query_position_offsets_fingerprint: str
+    key_position_offsets_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if self.out.dtype is not torch.float32 or self.lse.dtype is not torch.float32:
+            raise ValueError("saved attention out/lse must be FP32")
+        if self.out.ndim != 4 or self.lse.shape != self.out.shape[:3]:
+            raise ValueError("saved attention out/lse shapes are invalid")
+        if not math.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError("saved attention scale must be positive and finite")
+
+
+@dataclass(frozen=True)
 class AttentionBackwardPathResult:
     """One materialized CP attention backward path."""
 
@@ -69,6 +113,7 @@ class AttentionBackwardPathResult:
     out: torch.Tensor
     lse: torch.Tensor
     gradients: AttentionBackwardGradients
+    saved_forward_state: AttentionSavedForwardState
     provenance: dict[str, object]
 
 
@@ -330,6 +375,8 @@ class DeterministicCPAttentionReferenceOp:
         ``output_dtype`` defaults to the input dtype.
         """
 
+        resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
+        _validate_output_dtype(resolved_output_dtype)
         out, lse = self._forward_impl(
             q,
             k,
@@ -342,7 +389,7 @@ class DeterministicCPAttentionReferenceOp:
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
         )
-        out = out.to(q.dtype if output_dtype is None else output_dtype)
+        out = out.to(resolved_output_dtype)
         return out, lse
 
     def forward_fp32_with_lse(
@@ -391,6 +438,7 @@ class DeterministicCPAttentionReferenceOp:
         kv_chunk_size: Optional[int] = None,
         output_dtype: Optional[torch.dtype] = torch.float32,
         name: Optional[str] = None,
+        saved_forward_state: Optional[AttentionSavedForwardState] = None,
     ) -> AttentionBackwardPathResult:
         """Run the deterministic training-side backward validation path.
 
@@ -406,15 +454,16 @@ class DeterministicCPAttentionReferenceOp:
             raise ValueError("dout must have shape [B, Hq, Sq, D], matching q")
         if not torch.is_floating_point(dout) or torch.is_complex(dout):
             raise ValueError("dout must be a real floating-point tensor")
-        q_leaf = q.detach().clone().requires_grad_(True)
-        k_leaf = k.detach().clone().requires_grad_(True)
-        v_leaf = v.detach().clone().requires_grad_(True)
-
+        if dout.device != q.device:
+            raise ValueError("dout must be on the same device as q, k, and v")
+        if dout.dtype != q.dtype:
+            raise ValueError("dout must have the same dtype as q")
         resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
-        out, lse = self.forward_with_lse(
-            q_leaf,
-            k_leaf,
-            v_leaf,
+        _validate_output_dtype(resolved_output_dtype)
+        state = saved_forward_state or self.save_forward_state(
+            q,
+            k,
+            v,
             causal=causal,
             scale=scale,
             key_padding_mask=key_padding_mask,
@@ -422,11 +471,23 @@ class DeterministicCPAttentionReferenceOp:
             key_position_offsets=key_position_offsets,
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
-            output_dtype=resolved_output_dtype,
         )
-        torch.autograd.backward(out, dout.to(device=out.device, dtype=out.dtype))
-        if q_leaf.grad is None or k_leaf.grad is None or v_leaf.grad is None:
-            raise RuntimeError("CP attention backward did not produce dq/dk/dv")
+        _validate_saved_forward_state(
+            state,
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+        )
+        gradients = _backward_from_saved_state(q, k, v, dout, state)
+        out = state.out.to(resolved_output_dtype)
+        lse = state.lse
 
         return AttentionBackwardPathResult(
             name=name
@@ -434,10 +495,11 @@ class DeterministicCPAttentionReferenceOp:
             out=out.detach(),
             lse=lse.detach(),
             gradients=AttentionBackwardGradients(
-                dq=q_leaf.grad.detach(),
-                dk=k_leaf.grad.detach(),
-                dv=v_leaf.grad.detach(),
+                dq=gradients.dq,
+                dk=gradients.dk,
+                dv=gradients.dv,
             ),
+            saved_forward_state=state,
             provenance={
                 "attention_mode": "prefill" if kv_chunk_size is None else "chunked_prefill",
                 "gradient_mode": "training_backward",
@@ -472,9 +534,87 @@ class DeterministicCPAttentionReferenceOp:
                 "k_dtype": str(k.dtype).replace("torch.", ""),
                 "v_dtype": str(v.dtype).replace("torch.", ""),
                 "dout_dtype": str(dout.dtype).replace("torch.", ""),
+                "saved_forward_state_source": (
+                    "caller" if saved_forward_state is not None else "captured_reference"
+                ),
+                "backward_algorithm": "saved_out_lse_block_order_reference",
                 "te_backward_oracle": "not_used",
                 "decode_backward": "not_supported",
             },
+        )
+
+    def save_forward_state(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: Optional[float] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        query_position_offsets: Optional[torch.Tensor] = None,
+        key_position_offsets: Optional[torch.Tensor] = None,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> AttentionSavedForwardState:
+        """Capture the exact state a production training backward must consume."""
+
+        out, lse = self.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+        )
+        batch, _, sq, dim = q.shape
+        query_offsets = _normalize_position_offsets(
+            query_position_offsets,
+            batch,
+            q.device,
+            default=k.size(2) - sq,
+            name="query_position_offsets",
+        )
+        key_offsets = _normalize_position_offsets(
+            key_position_offsets,
+            batch,
+            q.device,
+            default=0,
+            name="key_position_offsets",
+        )
+        mask = None if key_padding_mask is None else key_padding_mask.detach().clone()
+        return AttentionSavedForwardState(
+            out=out.detach().clone(),
+            lse=lse.detach().clone(),
+            causal=causal,
+            scale=float(scale if scale is not None else 1.0 / math.sqrt(dim)),
+            key_padding_mask=mask,
+            query_position_offsets=query_offsets.detach().clone(),
+            key_position_offsets=key_offsets.detach().clone(),
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            query_bounds=tuple(_split_bounds(sq, cp_world_size)),
+            kv_block_bounds=tuple(_kv_block_bounds(k.size(2), cp_world_size, kv_chunk_size)),
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            v_shape=tuple(v.shape),
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            q_fingerprint=_tensor_fingerprint(q),
+            k_fingerprint=_tensor_fingerprint(k),
+            v_fingerprint=_tensor_fingerprint(v),
+            out_fingerprint=_tensor_fingerprint(out),
+            lse_fingerprint=_tensor_fingerprint(lse),
+            key_padding_mask_fingerprint=(
+                None if mask is None else _tensor_fingerprint(mask)
+            ),
+            query_position_offsets_fingerprint=_tensor_fingerprint(query_offsets),
+            key_position_offsets_fingerprint=_tensor_fingerprint(key_offsets),
         )
 
     def local_partial_state(
@@ -503,6 +643,7 @@ class DeterministicCPAttentionReferenceOp:
         """
 
         _validate_qkv(q, k, v)
+        _validate_scale(scale)
         if q_start < 0 or k_start < 0:
             raise ValueError("q_start and k_start must be non-negative")
         if total_kv_len < k_start + k.size(2):
@@ -598,9 +739,14 @@ class DeterministicCPAttentionReferenceOp:
         kv_chunk_size: Optional[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _validate_qkv(q, k, v)
-        if cp_world_size < 1:
+        _validate_scale(scale)
+        if isinstance(cp_world_size, bool) or not isinstance(cp_world_size, int) or cp_world_size < 1:
             raise ValueError("cp_world_size must be >= 1")
-        if kv_chunk_size is not None and kv_chunk_size < 1:
+        if kv_chunk_size is not None and (
+            isinstance(kv_chunk_size, bool)
+            or not isinstance(kv_chunk_size, int)
+            or kv_chunk_size < 1
+        ):
             raise ValueError("kv_chunk_size must be >= 1 when provided")
 
         batch, hq, sq, dim = q.shape
@@ -739,6 +885,224 @@ def compare_cp_attention_backward(
     )
 
 
+def _backward_from_saved_state(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    state: AttentionSavedForwardState,
+) -> AttentionBackwardGradients:
+    """Apply standard-softmax backward in canonical global KV-block order."""
+
+    batch, hq, _, dim = q.shape
+    hkv = k.size(1)
+    group_size = hq // hkv
+    with NativeAttentionOp._strict_fp32_math(q.device.type):
+        qf = q.float()
+        kf = k.float()
+        vf = v.float()
+        doutf = dout.float()
+        k_expanded = kf.repeat_interleave(group_size, dim=1)
+        v_expanded = vf.repeat_interleave(group_size, dim=1)
+        dq = torch.zeros_like(qf)
+        dk_expanded = torch.zeros(
+            batch,
+            hq,
+            k.size(2),
+            dim,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        dv_expanded = torch.zeros_like(dk_expanded)
+
+        for q_start, q_end in state.query_bounds:
+            if q_start == q_end:
+                continue
+            q_block = qf[:, :, q_start:q_end, :]
+            dout_block = doutf[:, :, q_start:q_end, :]
+            out_block = state.out[:, :, q_start:q_end, :]
+            lse_block = state.lse[:, :, q_start:q_end]
+            dq_block = torch.zeros_like(q_block)
+            for k_start, k_end in state.kv_block_bounds:
+                if k_start == k_end:
+                    continue
+                k_block = k_expanded[:, :, k_start:k_end, :]
+                v_block = v_expanded[:, :, k_start:k_end, :]
+                scores = torch.matmul(q_block, k_block.transpose(-1, -2)) * state.scale
+                if state.causal:
+                    query_base = state.query_position_offsets[:, None] + q_start
+                    key_base = state.key_position_offsets[:, None] + k_start
+                    q_pos = torch.arange(
+                        q_end - q_start,
+                        device=q.device,
+                        dtype=torch.long,
+                    ) + query_base
+                    k_pos = torch.arange(
+                        k_end - k_start,
+                        device=q.device,
+                        dtype=torch.long,
+                    ) + key_base
+                    scores = scores.masked_fill(
+                        (k_pos[:, None, :] > q_pos[:, :, None])[:, None, :, :],
+                        float("-inf"),
+                    )
+                if state.key_padding_mask is not None:
+                    scores = scores.masked_fill(
+                        ~state.key_padding_mask[:, None, None, k_start:k_end],
+                        float("-inf"),
+                    )
+                probability = torch.exp(scores - lse_block.unsqueeze(-1))
+                probability = torch.where(
+                    torch.isfinite(lse_block).unsqueeze(-1),
+                    probability,
+                    torch.zeros_like(probability),
+                )
+                dv_expanded[:, :, k_start:k_end, :] += torch.matmul(
+                    probability.transpose(-1, -2),
+                    dout_block,
+                )
+                dp = torch.matmul(dout_block, v_block.transpose(-1, -2))
+                # The global softmax dot term is dout dot the saved global output.
+                ds = probability * (
+                    dp - (dout_block * out_block).sum(dim=-1, keepdim=True)
+                )
+                dq_block += torch.matmul(ds, k_block) * state.scale
+                dk_expanded[:, :, k_start:k_end, :] += (
+                    torch.matmul(ds.transpose(-1, -2), q_block) * state.scale
+                )
+            dq[:, :, q_start:q_end, :] = dq_block
+
+        dk = dk_expanded.reshape(
+            batch,
+            hkv,
+            group_size,
+            k.size(2),
+            dim,
+        ).sum(dim=2)
+        dv = dv_expanded.reshape(
+            batch,
+            hkv,
+            group_size,
+            v.size(2),
+            dim,
+        ).sum(dim=2)
+    return AttentionBackwardGradients(
+        dq=dq.to(q.dtype),
+        dk=dk.to(k.dtype),
+        dv=dv.to(v.dtype),
+    )
+
+
+def _validate_saved_forward_state(
+    state: AttentionSavedForwardState,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool,
+    scale: Optional[float],
+    key_padding_mask: Optional[torch.Tensor],
+    query_position_offsets: Optional[torch.Tensor],
+    key_position_offsets: Optional[torch.Tensor],
+    cp_world_size: int,
+    kv_chunk_size: Optional[int],
+) -> None:
+    if not isinstance(state, AttentionSavedForwardState):
+        raise ValueError("saved_forward_state must be an AttentionSavedForwardState")
+    expected_scale = float(scale if scale is not None else 1.0 / math.sqrt(q.size(-1)))
+    expected_query_offsets = _normalize_position_offsets(
+        query_position_offsets,
+        q.size(0),
+        q.device,
+        default=k.size(2) - q.size(2),
+        name="query_position_offsets",
+    )
+    expected_key_offsets = _normalize_position_offsets(
+        key_position_offsets,
+        q.size(0),
+        q.device,
+        default=0,
+        name="key_position_offsets",
+    )
+    checks = {
+        "out_shape": (tuple(state.out.shape), tuple(q.shape)),
+        "lse_shape": (tuple(state.lse.shape), tuple(q.shape[:3])),
+        "out_device": (state.out.device, q.device),
+        "lse_device": (state.lse.device, q.device),
+        "q_shape": (state.q_shape, tuple(q.shape)),
+        "k_shape": (state.k_shape, tuple(k.shape)),
+        "v_shape": (state.v_shape, tuple(v.shape)),
+        "q_dtype": (state.q_dtype, q.dtype),
+        "k_dtype": (state.k_dtype, k.dtype),
+        "v_dtype": (state.v_dtype, v.dtype),
+        "causal": (state.causal, causal),
+        "scale": (state.scale, expected_scale),
+        "cp_world_size": (state.cp_world_size, cp_world_size),
+        "kv_chunk_size": (state.kv_chunk_size, kv_chunk_size),
+        "query_bounds": (state.query_bounds, tuple(_split_bounds(q.size(2), cp_world_size))),
+        "kv_block_bounds": (
+            state.kv_block_bounds,
+            tuple(_kv_block_bounds(k.size(2), cp_world_size, kv_chunk_size)),
+        ),
+        "q_fingerprint": (state.q_fingerprint, _tensor_fingerprint(q)),
+        "k_fingerprint": (state.k_fingerprint, _tensor_fingerprint(k)),
+        "v_fingerprint": (state.v_fingerprint, _tensor_fingerprint(v)),
+        "out_fingerprint": (state.out_fingerprint, _tensor_fingerprint(state.out)),
+        "lse_fingerprint": (state.lse_fingerprint, _tensor_fingerprint(state.lse)),
+        "query_position_offsets_fingerprint": (
+            state.query_position_offsets_fingerprint,
+            _tensor_fingerprint(state.query_position_offsets),
+        ),
+        "key_position_offsets_fingerprint": (
+            state.key_position_offsets_fingerprint,
+            _tensor_fingerprint(state.key_position_offsets),
+        ),
+        "query_position_offsets_device": (
+            state.query_position_offsets.device,
+            q.device,
+        ),
+        "key_position_offsets_device": (
+            state.key_position_offsets.device,
+            q.device,
+        ),
+    }
+    mismatches = [name for name, (actual, expected) in checks.items() if actual != expected]
+    if not torch.equal(state.query_position_offsets, expected_query_offsets):
+        mismatches.append("query_position_offsets")
+    if not torch.equal(state.key_position_offsets, expected_key_offsets):
+        mismatches.append("key_position_offsets")
+    masks_match = (
+        state.key_padding_mask is None
+        and key_padding_mask is None
+        or state.key_padding_mask is not None
+        and key_padding_mask is not None
+        and torch.equal(state.key_padding_mask, key_padding_mask)
+    )
+    if not masks_match:
+        mismatches.append("key_padding_mask")
+    actual_mask_fingerprint = (
+        None
+        if state.key_padding_mask is None
+        else _tensor_fingerprint(state.key_padding_mask)
+    )
+    if state.key_padding_mask_fingerprint != actual_mask_fingerprint:
+        mismatches.append("key_padding_mask_fingerprint")
+    if mismatches:
+        raise ValueError(
+            "saved_forward_state does not match the backward invocation: "
+            + ", ".join(mismatches)
+        )
+
+
+def _tensor_fingerprint(tensor: torch.Tensor) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(tuple(tensor.shape)).encode())
+    digest.update(str(tensor.dtype).encode())
+    digest.update(str(tensor.device).encode())
+    digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _compare_backward_path(
     candidate: AttentionBackwardPathResult,
     reference: AttentionBackwardPathResult,
@@ -850,8 +1214,35 @@ def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise ValueError("k and v must have the same shape")
     if q.size(0) != k.size(0) or q.size(3) != k.size(3):
         raise ValueError("q, k, and v must share batch size and head dim")
+    if q.size(1) < 1 or k.size(1) < 1 or q.size(3) < 1:
+        raise ValueError("q, k, and v must have positive head counts and head dim")
+    if not all(torch.is_floating_point(tensor) for tensor in (q, k, v)) or any(
+        torch.is_complex(tensor) for tensor in (q, k, v)
+    ):
+        raise ValueError("q, k, and v must be real floating-point tensors")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("q, k, and v must be on the same device")
     if q.size(1) % k.size(1) != 0:
         raise ValueError(f"Hq={q.size(1)} not divisible by Hkv={k.size(1)} (GQA group)")
+
+
+def _validate_scale(scale: Optional[float]) -> None:
+    if scale is None:
+        return
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError("scale must be a positive finite number")
+    if not math.isfinite(float(scale)) or float(scale) <= 0:
+        raise ValueError("scale must be a positive finite number")
+
+
+def _validate_output_dtype(output_dtype: torch.dtype) -> None:
+    if not isinstance(output_dtype, torch.dtype):
+        raise ValueError("output_dtype must be a real floating-point torch dtype")
+    probe = torch.empty((), dtype=output_dtype)
+    if not torch.is_floating_point(probe) or torch.is_complex(probe):
+        raise ValueError("output_dtype must be a real floating-point torch dtype")
 
 
 def _zero_dependency(*tensors: torch.Tensor) -> torch.Tensor:
@@ -1025,6 +1416,7 @@ __all__ = [
     "AttentionBackwardPathResult",
     "AttentionBackwardRankDrift",
     "AttentionPartialState",
+    "AttentionSavedForwardState",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
     "DeterministicCPAttentionReferenceOp",
