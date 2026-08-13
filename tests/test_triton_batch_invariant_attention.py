@@ -391,9 +391,7 @@ def test_triton_attention_partial_pad_backward_matches_native_vjp():
     op = TritonBatchInvariantAttentionOp()
     native = NativeAttentionOp()
 
-    out, dq, dk, dv = _run_backward(
-        op, q, k, v, dy, causal=True, key_padding_mask=mask
-    )
+    out, dq, dk, dv = _run_backward(op, q, k, v, dy, causal=True, key_padding_mask=mask)
     ref_out, ref_dq, ref_dk, ref_dv = _run_backward(
         native, q, k, v, dy, causal=True, key_padding_mask=mask
     )
