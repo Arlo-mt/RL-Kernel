@@ -318,10 +318,17 @@ def _git_identity() -> dict[str, Any]:
         )
         return proc.stdout.strip() if proc.returncode == 0 else ""
 
+    porcelain = _run("status", "--porcelain")
+    ignored_suffixes = ("ws1-c8-ci.json", "ws1-c8-execute.json")
+    dirty_lines = [
+        line
+        for line in porcelain.splitlines()
+        if line.strip() and not any(line.endswith(suffix) for suffix in ignored_suffixes)
+    ]
     return {
         "commit": _run("rev-parse", "HEAD"),
         "branch": _run("rev-parse", "--abbrev-ref", "HEAD"),
-        "dirty": bool(_run("status", "--porcelain")),
+        "dirty": bool(dirty_lines),
     }
 
 

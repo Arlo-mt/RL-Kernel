@@ -47,7 +47,9 @@ CUDA BF16 and Triton-on-CUDA BF16 gtest + C8 `--execute` run in
 bash ci/run_ws1_gtest.sh
 ```
 
-The C8 JSON is written to `ws1-c8-ci.json` and uploaded as a CI artifact.
+The C8 JSON is written outside the repo (`${TMPDIR:-/tmp}/ws1-c8-ci.json` unless
+`WS1_C8_JSON` is set) so the recorded git provenance is not dirtied by the
+artifact itself. The GitHub workflow uploads that file as a CI artifact.
 
 ## Documentation Build
 

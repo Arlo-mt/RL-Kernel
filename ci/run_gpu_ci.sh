@@ -195,6 +195,7 @@ nvidia-smi
 "$PY" scripts/ci_smoke.py
 # Enforce _C in the pytest suite too (test_extension_smoke.py skips unless this is set).
 export RL_KERNEL_REQUIRE_EXT=1
+export WS1_C8_JSON=/tmp/ws1-c8-ci.json
 '"${TEST_CMD}"
 
 echo "[ci] Launching remote test suite on GPU pod (Distributed Execution Mode: TP=${GPU_COUNT}, suite=${TEST_SUITE})..."
@@ -202,10 +203,14 @@ ssh $SSH_OPTIONS root@"$SSH_IP" "bash -lc '$REMOTE_CMD'"
 TEST_EXIT=$?
 
 if [ "$TEST_SUITE" = "ws1-gtest" ]; then
+  if [ "$TEST_EXIT" -ne 0 ]; then
+    echo "[ci] Remote WS1 gtest failed with exit code = $TEST_EXIT"
+    exit "$TEST_EXIT"
+  fi
   echo "[ci] Fetching C8 execute artifact from the pod"
   mkdir -p artifacts
-  scp $SSH_OPTIONS root@"$SSH_IP":/workspace/repo/ws1-c8-ci.json artifacts/ws1-c8-ci.json || \
-    echo "[ci] WARN: could not scp ws1-c8-ci.json"
+  scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c8-ci.json artifacts/ws1-c8-ci.json
+  test -s artifacts/ws1-c8-ci.json
 fi
 
 echo "[ci] Remote execution finished with exit code = $TEST_EXIT"

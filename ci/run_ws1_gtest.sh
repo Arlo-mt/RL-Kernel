@@ -10,7 +10,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PY="${PY:-python3}"
-OUT="${WS1_C8_JSON:-$ROOT/ws1-c8-ci.json}"
+# Keep the artifact outside the repo so `_git_identity()` is not dirtied by
+# the file we are in the process of writing.
+OUT="${WS1_C8_JSON:-${TMPDIR:-/tmp}/ws1-c8-ci.json}"
 export RL_KERNEL_REQUIRE_EXT="${RL_KERNEL_REQUIRE_EXT:-1}"
 
 echo "[ws1-gtest] interpreter=$PY out=$OUT"

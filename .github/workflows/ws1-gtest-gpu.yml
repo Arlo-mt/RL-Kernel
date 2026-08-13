@@ -2,11 +2,14 @@
 # WS1 single-op gtest + C8 four-judgment GPU gate (CUDA BF16 and Triton-on-CUDA BF16).
 # Uses the same RunPod orchestrator as gpu-ci.yml. Fails closed on C8 red cells
 # and on C3/C4 silent fallback. Hopper must have zero pending_hopper.
+#
+# Security: do not use pull_request_target. Fork PRs never see RunPod secrets.
+# Same-repo PRs, pushes to main, and maintainer workflow_dispatch are allowed.
 
 name: WS1-gtest-GPU
 
 on:
-  pull_request_target:
+  pull_request:
     branches: [ main ]
     paths:
       - "rl_engine/kernels/gtest/**"
@@ -43,6 +46,7 @@ permissions:
 
 jobs:
   ws1-gtest:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -52,10 +56,10 @@ jobs:
           - { gpu_id: "NVIDIA RTX A4000", target_sm: "8.6", name: "sm86-cuda-triton" }
           - { gpu_id: "NVIDIA H100 80GB HBM3", target_sm: "9.0", force_sm90: "1", name: "sm90-c8-execute" }
     steps:
-      - name: Checkout orchestrator from the base/default branch
+      - name: Checkout the commit under test
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install runpodctl
         run: |
@@ -90,4 +94,4 @@ jobs:
         with:
           name: ws1-c8-execute-${{ matrix.name }}
           path: artifacts/ws1-c8-ci.json
-          if-no-files-found: warn
+          if-no-files-found: error
