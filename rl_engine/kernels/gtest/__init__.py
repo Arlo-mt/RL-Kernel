@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+from .elementwise_inventory import inventory_items, unresolved_needs_fix
 from .forward_invariance import (
     AccuracyReport,
     ConfigSpec,
@@ -12,6 +13,8 @@ from .forward_invariance import (
     assert_forward_batch_invariant,
     build_config_matrix,
 )
+from .four_judgment_matrix import build_classified_matrix
+from .gradient_adapters import make_forward_runner, required_forward_adapters
 from .gradient_invariance import (
     GradientInvarianceReport,
     GradientObservation,
@@ -49,6 +52,11 @@ __all__ = [
     "assert_forward_batch_invariant",
     "assert_gradient_batch_invariant",
     "build_config_matrix",
+    "build_classified_matrix",
+    "inventory_items",
+    "make_forward_runner",
+    "required_forward_adapters",
+    "unresolved_needs_fix",
     "run_operator_suite",
     "BackendProvenance",
     "ContractError",

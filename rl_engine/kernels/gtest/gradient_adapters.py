@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 import torch
 
-from rl_engine.kernels.gtest.forward_invariance import ConfigSpec
+from rl_engine.kernels.gtest.forward_invariance import ConfigSpec, RuntimeObservation
 from rl_engine.kernels.gtest.gradient_invariance import (
     GradientObservation,
     GradientTensorSpec,
@@ -162,6 +162,7 @@ GRADIENT_ADAPTERS: dict[str, GradientAdapterSpec] = {
         requirement="required",
         source_files=(
             "rl_engine/kernels/ops/cuda/linear/embedding.py",
+            "rl_engine/kernels/ops/triton/linear/embedding.py",
             "csrc/cuda/embedding_lm_head_sm90.cu",
         ),
     ),
@@ -174,6 +175,7 @@ GRADIENT_ADAPTERS: dict[str, GradientAdapterSpec] = {
         requirement="required",
         source_files=(
             "rl_engine/kernels/ops/cuda/linear/lm_head.py",
+            "rl_engine/kernels/ops/triton/linear/lm_head.py",
             "csrc/cuda/embedding_lm_head_sm90.cu",
         ),
     ),
@@ -186,6 +188,7 @@ GRADIENT_ADAPTERS: dict[str, GradientAdapterSpec] = {
         requirement="required",
         source_files=(
             "rl_engine/kernels/ops/cuda/loss/logp.py",
+            "rl_engine/kernels/ops/triton/loss/logp.py",
             "csrc/fused_logp_kernel.cu",
             "csrc/deterministic_logp_kernel.cu",
         ),
@@ -293,6 +296,12 @@ def required_gradient_adapters() -> tuple[GradientAdapterSpec, ...]:
         for spec in GRADIENT_ADAPTERS.values()
         if spec.requirement in ("required", "layout_supported")
     )
+
+
+def required_forward_adapters() -> tuple[GradientAdapterSpec, ...]:
+    """Same enumerable WS1 ops as C4; C3 reuses the registry, not a second list."""
+
+    return required_gradient_adapters()
 
 
 @dataclass(frozen=True)
@@ -541,6 +550,63 @@ def make_gradient_runner(
     return run
 
 
+def make_forward_runner(
+    op_name: str,
+    operator: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    reference: bool,
+    hidden: int = 64,
+    vocab_size: int = 256,
+    n_heads: int = 4,
+    n_kv_heads: int = 1,
+    head_dim: int = 16,
+    backend_family: str | None = None,
+    kernel_id: str | None = None,
+) -> Callable[..., Any]:
+    """Build a C2-config runner that returns per-token forward outputs.
+
+    Token maps are keyed by C2 ``(sample_id, token_position)`` so C3 can compare
+    vector-valued ops (RMSNorm, GEMM, attention, …) without assuming logprob
+    scalars. Inputs follow the same physical layout as ``make_gradient_runner``.
+    """
+
+    adapter = get_adapter(op_name)
+    if adapter.requirement == "absent_not_required":
+        raise RuntimeError(f"adapter {op_name!r} is not declared supported+differentiable")
+
+    def run(config: ConfigSpec, **kwargs: Any) -> dict[str, Any] | RuntimeObservation:
+        del kwargs
+        exec_dtype = torch.float32 if reference else dtype
+        outputs = _run_forward(
+            adapter,
+            operator,
+            config,
+            device=device,
+            dtype=exec_dtype,
+            hidden=hidden,
+            vocab_size=vocab_size,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+        )
+        if reference:
+            return outputs
+        if backend_family is None or kernel_id is None:
+            raise RuntimeError("candidate telemetry must declare backend_family and kernel_id")
+        sample = next(iter(outputs.values()))
+        return RuntimeObservation(
+            output=outputs,
+            actual_backend=backend_family,
+            kernel_id=kernel_id,
+            output_dtype=normalize_dtype_name(sample.dtype),
+            device=str(device),
+        )
+
+    return run
+
+
 def _row_parameters(
     op_name: str,
     *,
@@ -694,6 +760,9 @@ def _run_row_stream(
     param_totals: dict[str, torch.Tensor | None] = {
         spec.name: None for spec in specs if spec.kind == "parameter"
     }
+    param_contributions: dict[str, dict[tuple[str, int], torch.Tensor]] = {
+        spec.name: {} for spec in specs if spec.kind == "parameter"
+    }
 
     for start, length in plan.call_spans:
         keys = plan.row_keys[start : start + length]
@@ -728,14 +797,31 @@ def _run_row_stream(
             grad_outputs=upstream,
             allow_unused=True,
         )
+        contribution_fn = getattr(operator, "parameter_vjp_contributions_fp32", None)
+        contributions = (
+            contribution_fn(**prepared, grad_output=upstream)
+            if callable(contribution_fn)
+            else None
+        )
         for spec, grad in zip(specs, grads, strict=True):
             if grad is None:
                 raise RuntimeError(
                     f"{adapter.op_name} produced no gradient for {spec.source_input!r}"
                 )
             if spec.kind == "parameter":
-                total = param_totals[spec.name]
-                param_totals[spec.name] = grad.float() if total is None else total + grad.float()
+                if contributions is not None:
+                    per_row = contributions[spec.source_input]
+                    if per_row.shape[0] != len(keys):
+                        raise RuntimeError(
+                            f"{adapter.op_name} {spec.name} VJP returned "
+                            f"{per_row.shape[0]} rows, expected {len(keys)}"
+                        )
+                    for key, row in zip(keys, per_row, strict=True):
+                        if key is not None:
+                            param_contributions[spec.name][key] = row
+                else:
+                    total = param_totals[spec.name]
+                    param_totals[spec.name] = grad.float() if total is None else total + grad.float()
             else:
                 rows = _to_rows(adapter.op_name, grad, length)
                 for index in range(length):
@@ -744,7 +830,13 @@ def _run_row_stream(
     result: dict[str, Any] = {}
     for spec in specs:
         if spec.kind == "parameter":
+            keyed = param_contributions[spec.name]
             total = param_totals[spec.name]
+            if keyed:
+                ordered = [keyed[key] for key in sorted(keyed)]
+                total = torch.zeros_like(ordered[0], dtype=torch.float32)
+                for contribution in ordered:
+                    total = total + contribution.float()
             if total is None:
                 raise RuntimeError(f"{adapter.op_name} produced no {spec.name}")
             result[spec.name] = total
@@ -755,6 +847,8 @@ def _run_row_stream(
             result[spec.name] = _assemble_token_grad(
                 [row for row in filled if row is not None], plan
             )
+    if any(param_contributions.values()):
+        result["__parameter_contributions__"] = param_contributions
     return result
 
 
@@ -883,6 +977,172 @@ def _run_pack(
             if key is not None
         }
     }
+
+
+def _token_output_map(
+    rows: Sequence[torch.Tensor],
+    keys: Sequence[tuple[str, int] | None],
+) -> dict[tuple[str, int], torch.Tensor]:
+    result: dict[tuple[str, int], torch.Tensor] = {}
+    for key, row in zip(keys, rows, strict=True):
+        if key is not None:
+            result[key] = row
+    return result
+
+
+def _run_row_stream_forward(
+    adapter: GradientAdapterSpec,
+    operator: Any,
+    config: ConfigSpec,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    hidden: int,
+    vocab_size: int,
+    n_heads: int,
+    head_dim: int,
+) -> dict[tuple[str, int], torch.Tensor]:
+    """Forward-only counterpart of ``_run_row_stream``."""
+
+    plan = _physical_plan(config)
+    tokens = _token_lookup(config)
+    params = _row_parameters(
+        adapter.op_name, device=device, dtype=dtype, hidden=hidden, vocab_size=vocab_size
+    )
+    out_rows: list[torch.Tensor | None] = [None] * len(plan.row_keys)
+    for start, length in plan.call_spans:
+        keys = plan.row_keys[start : start + length]
+        inputs = _row_inputs(
+            adapter.op_name,
+            keys,
+            tokens,
+            params,
+            device=device,
+            dtype=dtype,
+            hidden=hidden,
+            vocab_size=vocab_size,
+            n_heads=n_heads,
+            head_dim=head_dim,
+        )
+        raw = _first_output(_call_operator(operator, inputs))
+        rows = _to_rows(adapter.op_name, raw, length)
+        for index in range(length):
+            out_rows[start + index] = rows[index]
+    filled = [row for row in out_rows if row is not None]
+    if len(filled) != len(plan.row_keys):
+        raise RuntimeError(f"{adapter.op_name} left physical rows unfilled")
+    return _token_output_map(filled, plan.row_keys)
+
+
+def _run_attention_forward(
+    operator: Any,
+    config: ConfigSpec,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> dict[tuple[str, int], torch.Tensor]:
+    plan = _physical_plan(config)
+    grid, batch, length = _grid_keys(config, plan)
+
+    def _grid_tensor(heads: int, offset: int) -> torch.Tensor:
+        rows = _stack_rows(
+            grid, (batch * length,), (heads, head_dim), device=device, dtype=dtype, offset=offset
+        )
+        return rows.reshape(batch, length, heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+    key_padding_mask = torch.tensor(
+        [key is not None for key in grid], device=device, dtype=torch.bool
+    ).reshape(batch, length)
+    output = _first_output(
+        _call_operator(
+            operator,
+            {
+                "q": _grid_tensor(n_heads, 0),
+                "k": _grid_tensor(n_kv_heads, 1),
+                "v": _grid_tensor(n_kv_heads, 2),
+                "causal": True,
+                "key_padding_mask": key_padding_mask,
+            },
+        )
+    )
+    physical = output.permute(0, 2, 1, 3).contiguous()
+    return {
+        key: physical[index // length, index % length]
+        for index, key in enumerate(grid)
+        if key is not None
+    }
+
+
+def _run_pack_forward(
+    operator: Any,
+    config: ConfigSpec,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    hidden: int,
+) -> dict[tuple[str, int], torch.Tensor]:
+    plan = _physical_plan(config)
+    grid, batch, length = _grid_keys(config, plan)
+    x = _stack_rows(grid, (batch * length,), (hidden,), device=device, dtype=dtype).reshape(
+        batch, length, hidden
+    )
+    mask = torch.tensor([key is not None for key in grid], device=device, dtype=torch.bool).reshape(
+        batch, length
+    )
+    packed = _first_output(_call_operator(operator, {"x": x, "mask": mask}))
+    packed_keys = [key for key in grid if key is not None]
+    if packed.shape[0] != len(packed_keys):
+        raise ValueError(
+            f"pack produced {packed.shape[0]} rows, expected {len(packed_keys)} active keys"
+        )
+    return {key: packed[index] for index, key in enumerate(packed_keys)}
+
+
+def _run_forward(
+    adapter: GradientAdapterSpec,
+    operator: Any,
+    config: ConfigSpec,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    hidden: int,
+    vocab_size: int,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> dict[tuple[str, int], torch.Tensor]:
+    if adapter.op_name == "attention":
+        return _run_attention_forward(
+            operator,
+            config,
+            device=device,
+            dtype=dtype,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+        )
+    if adapter.op_name == "pack":
+        return _run_pack_forward(
+            operator,
+            config,
+            device=device,
+            dtype=dtype,
+            hidden=hidden,
+        )
+    return _run_row_stream_forward(
+        adapter,
+        operator,
+        config,
+        device=device,
+        dtype=dtype,
+        hidden=hidden,
+        vocab_size=vocab_size,
+        n_heads=n_heads,
+        head_dim=head_dim,
+    )
 
 
 def _run_adapter(
@@ -1065,7 +1325,9 @@ __all__ = [
     "listed_source_paths",
     "load_adapter_gold",
     "load_adapter_operator",
+    "make_forward_runner",
     "make_gradient_runner",
+    "required_forward_adapters",
     "required_gradient_adapters",
     "resolve_profile_candidate",
 ]

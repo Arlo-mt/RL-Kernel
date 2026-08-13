@@ -221,6 +221,9 @@ def _collect_logical_grads(
             logical[spec.name] = torch.as_tensor(value)
         else:
             logical[spec.name] = _coerce_token_grad(value, config)
+    contributions = grads.get("__parameter_contributions__")
+    if contributions is not None:
+        logical["__parameter_contributions__"] = contributions
     return logical, observation
 
 
@@ -553,10 +556,24 @@ def assert_gradient_batch_invariant(
                 )
             details = []
             for spec in parameter_specs:
-                ordered = [
-                    sample_grads[sample_id][spec.name] for sample_id in plan.aggregation_order
+                contribution_maps = [
+                    sample_grads[sample_id].get("__parameter_contributions__", {}).get(spec.name)
+                    for sample_id in plan.aggregation_order
                 ]
-                aggregated = _sum_parameter_grads(ordered)
+                if all(value is not None for value in contribution_maps):
+                    merged = {
+                        key: value
+                        for contribution_map in contribution_maps
+                        for key, value in contribution_map.items()
+                    }
+                    ordered_rows = [merged[key] for key in sorted(merged)]
+                    aggregated = _sum_parameter_grads(ordered_rows)
+                else:
+                    ordered = [
+                        sample_grads[sample_id][spec.name]
+                        for sample_id in plan.aggregation_order
+                    ]
+                    aggregated = _sum_parameter_grads(ordered)
                 details.append(
                     _compare_parameter_grad(
                         canonical_grads[spec.name],

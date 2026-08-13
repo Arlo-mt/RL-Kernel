@@ -68,9 +68,35 @@ def _standard_attn_fwd_kernel(
         other=0.0,
     ).to(tl.float32)
 
+    # Padding must not change which reduction lane owns a logical KV token.
+    # With physical columns, left padding shifts every valid value to another
+    # lane and changes the floating-point reduction tree even though the mask
+    # is semantically correct.  Find the first valid physical column and run
+    # both softmax passes in logical-column order.  C2 fixtures require one
+    # contiguous valid interval (left or right padding), so this also preserves
+    # the causal position of every restored logical token.
+    valid_start = 0
+    if HAS_KEY_PADDING_MASK:
+        valid_start = S_KV
+        for start_n in range(0, S_KV, BLOCK_N):
+            probe_cols = start_n + tl.arange(0, BLOCK_N)
+            probe_in_bounds = probe_cols < S_KV
+            probe_keep = tl.load(
+                mask_ptr + batch * S_KV + probe_cols,
+                mask=probe_in_bounds,
+                other=0,
+            )
+            block_first = tl.min(
+                tl.where(probe_in_bounds & (probe_keep != 0), probe_cols, S_KV),
+                axis=0,
+            )
+            valid_start = tl.minimum(valid_start, block_first)
+    logical_row = row - valid_start
+
     max_score = -float("inf")
     for start_n in range(0, S_KV, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
+        logical_cols = start_n + tl.arange(0, BLOCK_N)
+        cols = valid_start + logical_cols
         col_mask = cols < S_KV
         k = tl.load(
             k_ptr
@@ -85,7 +111,7 @@ def _standard_attn_fwd_kernel(
         scores = tl.where(col_mask, scores, -float("inf"))
 
         if CAUSAL:
-            causal_keep = cols <= (row + S_KV - S_Q)
+            causal_keep = logical_cols <= (logical_row + S_KV - S_Q)
             scores = tl.where(causal_keep, scores, -float("inf"))
 
         if HAS_KEY_PADDING_MASK:
@@ -97,7 +123,8 @@ def _standard_attn_fwd_kernel(
     denom = 0.0
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     for start_n in range(0, S_KV, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
+        logical_cols = start_n + tl.arange(0, BLOCK_N)
+        cols = valid_start + logical_cols
         col_mask = cols < S_KV
         k = tl.load(
             k_ptr
@@ -112,7 +139,7 @@ def _standard_attn_fwd_kernel(
         scores = tl.where(col_mask, scores, -float("inf"))
 
         if CAUSAL:
-            causal_keep = cols <= (row + S_KV - S_Q)
+            causal_keep = logical_cols <= (logical_row + S_KV - S_Q)
             scores = tl.where(causal_keep, scores, -float("inf"))
 
         if HAS_KEY_PADDING_MASK:

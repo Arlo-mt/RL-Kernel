@@ -153,6 +153,14 @@ class SM90LMHeadOp:
             return self._fallback.forward_fp32(hidden, weight, bias=bias)
         return _SM90LMHeadFunction.apply(hidden, weight, bias, True)
 
+    def parameter_vjp_contributions_fp32(
+        self, *, hidden, weight, grad_output, bias=None
+    ):
+        del weight, bias
+        rows_h = hidden.reshape(-1, hidden.size(-1)).float()
+        rows_g = grad_output.reshape(-1, grad_output.size(-1)).float()
+        return {"weight": rows_g[:, :, None] * rows_h[:, None, :]}
+
     @staticmethod
     def _can_use_sm90(
         hidden: torch.Tensor,

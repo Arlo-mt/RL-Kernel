@@ -359,15 +359,9 @@ def test_backend_profiles_enumerate_required_nodes(manifest):
                 assert node["algorithm_property"]
 
 
-def test_triton_profile_records_missing_required_not_na(manifest):
+def test_triton_profile_has_all_required_candidates(manifest):
     missing = profile_missing_required_nodes(manifest, "triton_cuda_bf16")
-    # Honest red nodes based on current operator_specs candidates.
-    assert "embedding" in missing
-    assert "lm_head" in missing
-    for node in profile_required_nodes(manifest, "triton_cuda_bf16"):
-        if node["node"] in missing:
-            assert node["status"] == "missing_required"
-            assert node.get("expected_backend_id") in (None, "")
+    assert missing == []
 
 
 def test_representative_cases_stable_ids_and_pins(manifest):
@@ -391,7 +385,7 @@ def test_representative_cases_stable_ids_and_pins(manifest):
             for cid in ids
             if profile in get_case(manifest, cid)["profile_ids"]
         ]
-        assert {c["family"] for c in cases} == {"gemm", "attention", "logprob"}
+        assert {"gemm", "attention", "logprob"} <= {c["family"] for c in cases}
         assert len({c["shape"]["M"] for c in cases if c["family"] == "gemm"}) >= 2
         attention_modes = {c["shape"]["mode"] for c in cases if c["family"] == "attention"}
         assert attention_modes == {"prefill", "decode"}

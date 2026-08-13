@@ -53,6 +53,12 @@ class DetGemmOp:
             )
         return _DetGemmFn.apply(a.contiguous(), b.contiguous())
 
+    def parameter_vjp_contributions_fp32(self, *, a, b, grad_output):
+        del b
+        rows_a = a.float()
+        rows_g = grad_output.float()
+        return {"b": rows_a[:, :, None] * rows_g[:, None, :]}
+
 
 def deterministic_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Functional entry. a:[M,K] bf16, b:[K,N] bf16 -> [M,N] bf16."""

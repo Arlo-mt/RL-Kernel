@@ -606,10 +606,7 @@ class TestAdapters:
         untracked = [row for row in rows if row.untracked_red]
         assert untracked == []
         tracked = [row for row in rows if row.tracked_red]
-        tracked_nodes = {(row.backend_profile, row.chain_node) for row in tracked}
-        assert ("triton_cuda_bf16", "embedding") in tracked_nodes
-        assert ("triton_cuda_bf16", "lm_head") in tracked_nodes
-        assert ("triton_cuda_bf16", "logprob") in tracked_nodes
+        assert tracked == []
         kv_rows = [row for row in rows if row.op_name == "kv_cache_attention"]
         assert kv_rows
         assert all(row.candidate_status == "absent_not_required" for row in kv_rows)

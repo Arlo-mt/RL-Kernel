@@ -689,6 +689,16 @@ def _validate_fixture_case_bindings(
         "short_full_model_seq8": {
             "gemm": {"M": int(short["seq_len"])},
             "logprob": {"B": 1, "T": int(short["seq_len"]) - int(short["prompt_len"])},
+            "attention": {
+                "B": 1,
+                "Sq": int(short["seq_len"]),
+                "Skv": int(short["seq_len"]),
+                "mode": "prefill",
+            },
+            "norm": {"T": int(short["seq_len"])},
+            "elementwise": {"T": int(short["seq_len"])},
+            "embedding": {"T": int(short["seq_len"])},
+            "lm_head": {"T": int(short["seq_len"])},
         },
         "long_full_model_seq32": {
             "attention": {"B": 1, "Sq": 1, "Skv": int(long["seq_len"]), "mode": "decode"}
@@ -701,6 +711,10 @@ def _validate_fixture_case_bindings(
                 "Skv": primary_max_seq,
                 "mode": "prefill",
             },
+            "norm": {"T": primary_total_tokens},
+            "elementwise": {"T": primary_total_tokens},
+            "embedding": {"T": primary_total_tokens},
+            "lm_head": {"T": primary_total_tokens},
         },
     }
     for case in cases:

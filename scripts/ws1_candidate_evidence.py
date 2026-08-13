@@ -67,6 +67,17 @@ def _case_args(case: dict[str, Any], seed: int) -> SimpleNamespace:
             )
         elif operator_spec in {"logp", "batch_invariant_logp"}:
             common.update(batch=shape["B"], seq=shape["T"], vocab=shape["vocab"])
+        elif operator_spec == "rms_norm":
+            common.update(batch=1, seq=shape["T"], normalized_dim=4096)
+        elif operator_spec in {"silu", "swiglu", "rope"}:
+            common.update(batch=1, seq=shape["T"])
+        elif operator_spec in {"embedding", "lm_head"}:
+            common.update(
+                batch=1,
+                seq=shape["T"],
+                normalized_dim=4096,
+                vocab=151936,
+            )
         else:
             raise WorkloadError(f"unsupported representative operator_spec {operator_spec!r}")
     except KeyError as exc:
@@ -76,7 +87,13 @@ def _case_args(case: dict[str, Any], seed: int) -> SimpleNamespace:
     return SimpleNamespace(**common)
 
 
-def run_case(case: dict[str, Any], *, seed: int, device: torch.device) -> dict[str, Any]:
+def run_case(
+    case: dict[str, Any],
+    *,
+    seed: int,
+    device: torch.device,
+    check_grad: bool = False,
+) -> dict[str, Any]:
     args = _case_args(case, seed)
     candidate = make_candidate(args)
     actual_path = _object_path(candidate.fn)
@@ -93,7 +110,12 @@ def run_case(case: dict[str, Any], *, seed: int, device: torch.device) -> dict[s
 
     operator_case = make_operator_case(args, torch.bfloat16, device)
     report = run_operator_suite(
-        case["operator_spec"], candidates=[candidate], cases=[operator_case]
+        case["operator_spec"],
+        candidates=[candidate],
+        cases=[operator_case],
+        check_grad=check_grad,
+        grad_mode="random",
+        grad_seed=seed + 1000,
     )
     torch.cuda.synchronize(device)
     candidate_report = report.candidates[0]
@@ -102,6 +124,8 @@ def run_case(case: dict[str, Any], *, seed: int, device: torch.device) -> dict[s
             "shape": list(output.shape),
             "dtype": output.candidate_dtype,
             "max_abs_error": output.max_abs_error,
+            "judgment": output.judgment,
+            "tensor": output.message,
             "passed": output.passed,
         }
         for checked_case in candidate_report.cases
@@ -118,6 +142,11 @@ def run_case(case: dict[str, Any], *, seed: int, device: torch.device) -> dict[s
         "algorithm_property": case["algorithm_property"],
         "shape": case["shape"],
         "runtime_status": "passed" if report.passed else "failed",
+        "judgment_status": {
+            judgment: all(item["passed"] for item in output_checks if item["judgment"] == judgment)
+            for judgment in ("forward_accuracy", "gradient_accuracy")
+            if any(item["judgment"] == judgment for item in output_checks)
+        },
         "outputs": output_checks,
     }
 
@@ -134,6 +163,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Profile to run; repeatable. Defaults to both required profiles.",
     )
     parser.add_argument("--case-id", action="append", help="Optional case_id filter.")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Include C8 operator case_ids (norm/elementwise/embedding). "
+            "Default is C2 gemm/attention/logprob only."
+        ),
+    )
+    parser.add_argument(
+        "--check-grad",
+        action="store_true",
+        help="Also run the manifest-pinned candidate-vs-FP32-reference VJP.",
+    )
     parser.add_argument("--emit-json", default="-", help="Output path, or '-' for stdout.")
     return parser
 
@@ -148,11 +190,13 @@ def main(argv: list[str] | None = None) -> int:
         manifest = load_manifest(args.manifest)
         profiles = set(args.profile or ("cuda_bf16", "triton_cuda_bf16"))
         selected_ids = set(args.case_id or ())
+        default_families = {"gemm", "attention", "logprob"}
         cases = [
             case
             for case in manifest.representative_cases
             if profiles.intersection(case["profile_ids"])
             and (not selected_ids or case["case_id"] in selected_ids)
+            and (args.all or selected_ids or case["family"] in default_families)
         ]
         resolved_ids = {case["case_id"] for case in cases}
         if selected_ids - resolved_ids:
@@ -161,10 +205,45 @@ def main(argv: list[str] | None = None) -> int:
         device = torch.device("cuda:0")
         log_stream = sys.stderr if args.emit_json == "-" else sys.stdout
         with contextlib.redirect_stdout(log_stream):
-            results = [
-                run_case(case, seed=manifest.seed + i, device=device)
-                for i, case in enumerate(cases)
-            ]
+            results = []
+            for i, case in enumerate(cases):
+                try:
+                    results.append(
+                        run_case(
+                            case,
+                            seed=manifest.seed + i,
+                            device=device,
+                            check_grad=args.check_grad,
+                        )
+                    )
+                    torch.cuda.empty_cache()
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "out of memory" not in message.lower():
+                        raise
+                    # A 6 GiB card cannot materialize the pinned full-vocab
+                    # candidate/reference pair. Preserve the case-level
+                    # evidence and continue; this is a resource blocker, never
+                    # a pass or a silent fallback.
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    results.append(
+                        {
+                            "case_id": case["case_id"],
+                            "fixture_id": case["fixture_id"],
+                            "operator_spec": case["operator_spec"],
+                            "expected_backend_id": case["expected_backend_id"],
+                            "actual_backend_id": case["actual_backend_id"],
+                            "expected_kernel_config_id": case["expected_kernel_config_id"],
+                            "actual_kernel_config_id": case["actual_kernel_config_id"],
+                            "algorithm_property": case["algorithm_property"],
+                            "shape": case["shape"],
+                            "runtime_status": "blocked_resource",
+                            "error": message,
+                            "judgment_status": {},
+                            "outputs": [],
+                        }
+                    )
     except (
         RuntimeError,
         ValueError,

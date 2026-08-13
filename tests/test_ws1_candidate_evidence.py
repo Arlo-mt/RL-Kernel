@@ -33,7 +33,8 @@ def test_ws1_cuda_and_triton_candidate_runtime_provenance():
     assert payload["profiles"] == ["cuda_bf16", "triton_cuda_bf16"]
     assert payload["device"]["index"] == 0
     assert payload["device"]["execution_world_size"] == 1
-    assert len(payload["cases"]) == 10
+    # gemm 4 + attention 6 (primary/long/short × 2 profiles) + logprob 2
+    assert len(payload["cases"]) == 12
     assert {case["actual_backend_id"] for case in payload["cases"]} == {"cuda", "triton"}
     for case in payload["cases"]:
         assert case["runtime_status"] == "passed"

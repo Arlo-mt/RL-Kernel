@@ -21,7 +21,19 @@ from rl_engine.kernels.gtest.forward_invariance import (
     assert_forward_batch_invariant as _assert_forward_batch_invariant,
 )
 from rl_engine.kernels.gtest.forward_invariance import build_config_matrix
-from rl_engine.kernels.gtest.tolerance import BackendProvenance, load_contract, resolve_tolerance
+from rl_engine.kernels.gtest.gradient_adapters import (
+    get_adapter,
+    load_adapter_gold,
+    load_adapter_operator,
+    make_forward_runner,
+    required_forward_adapters,
+)
+from rl_engine.kernels.gtest.tolerance import (
+    BackendProvenance,
+    load_contract,
+    normalize_dtype_name,
+    resolve_tolerance,
+)
 from rl_engine.testing.ws1_workload import LogicalBatch, LogicalSample, PaddedBatch, load_manifest
 
 
@@ -505,3 +517,96 @@ class TestLogprobSmoke:
         )
         assert report.logprob_smoke is not None
         assert report.logprob_smoke.passed
+
+
+_REQUIRED_FORWARD_OPS = (
+    "embedding",
+    "rms_norm",
+    "qk_norm",
+    "det_gemm",
+    "rope",
+    "attention",
+    "silu",
+    "swiglu",
+    "lm_head",
+    "logp",
+    "batch_invariant_logp",
+    "pack",
+)
+_OPTIONAL_FORWARD_OPS = ("linear_logp",)
+
+
+class TestForwardAdapters:
+    """C3 must run every C2 required chain op (plus pack) through one runner."""
+
+    def test_required_forward_ops_are_enumerable(self):
+        names = {spec.op_name for spec in required_forward_adapters()}
+        assert set(_REQUIRED_FORWARD_OPS) <= names
+        for op_name in _REQUIRED_FORWARD_OPS:
+            adapter = get_adapter(op_name)
+            assert adapter.requirement != "absent_not_required"
+
+    def test_native_rms_norm_forward_passes_c3(self, contract, manifest):
+        report = _run_native_forward("rms_norm", contract, manifest)
+        assert report.passed
+        assert all(item.passed for item in report.accuracy_reports)
+        assert all(item.passed for item in report.invariance_reports)
+
+    @pytest.mark.parametrize("op_name", _REQUIRED_FORWARD_OPS + _OPTIONAL_FORWARD_OPS)
+    def test_native_forward_adapter_is_batch_invariant(self, op_name, contract, manifest):
+        report = _run_native_forward(op_name, contract, manifest)
+        assert all(item.passed for item in report.invariance_reports), report.to_dict()
+        assert all(item.passed for item in report.accuracy_reports), report.to_dict()
+        assert report.passed
+
+
+def _run_native_forward(op_name: str, contract, manifest) -> ForwardInvarianceReport:
+    adapter = get_adapter(op_name)
+    gold = load_adapter_gold(op_name)
+    candidate = load_adapter_operator(op_name, "pytorch")
+    shape = {
+        "hidden": 8,
+        "vocab_size": 256,
+        "n_heads": 4,
+        "n_kv_heads": 1,
+        "head_dim": 16,
+    }
+    runner = make_forward_runner(
+        op_name,
+        candidate,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        reference=False,
+        backend_family="cuda",
+        kernel_id=f"pytorch-{op_name}",
+        **shape,
+    )
+    probe = runner(next(config for config in build_config_matrix(manifest) if config.is_canonical))
+    if isinstance(probe, RuntimeObservation):
+        observed_dtype = probe.output_dtype
+    else:
+        observed_dtype = normalize_dtype_name(next(iter(probe.values())).dtype)
+    return assert_forward_batch_invariant(
+        runner,
+        contract=contract,
+        manifest=manifest,
+        backend_profile="cuda_bf16",
+        provenance=_make_provenance(),
+        gold_fn=make_forward_runner(
+            op_name,
+            gold,
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            reference=True,
+            **shape,
+        ),
+        op_class=adapter.op_class,
+        op_name=op_name,
+        include_logprob_smoke=adapter.op_class == "logprob",
+        candidate_id=f"pytorch-{op_name}",
+        device="cpu:test-double",
+        compute_capability="synthetic",
+        observed_actual_backend="cuda",
+        observed_kernel_id=f"pytorch-{op_name}",
+        observed_output_dtype=observed_dtype,
+    )

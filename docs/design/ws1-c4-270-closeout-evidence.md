@@ -1,5 +1,12 @@
 # WS1 C4 (#270) closeout evidence
 
+> Historical snapshot from the original C4 landing. The current adapter and
+> accumulator protocol supersedes the runtime tally below: CUDA/Triton
+> RMSNorm and deterministic GEMM parameter VJPs now use logical-row FP32
+> contributions, CUDA generic logp has a row-local VJP, and Triton embedding /
+> LM-head / plain logp candidates are declared in C2. Re-run the current C8
+> sweep for authoritative evidence.
+
 **Parent:** #266 · **Depends on:** #267 / #268 · **Branch:** `feat/ws1-c4-gradient-invariance-270`
 **Scope:** shared gradient harness + enumerable adapters only
 

@@ -56,6 +56,8 @@ The CLI primarily covers **accuracy** (candidate vs gold).
 | `scripts/check_operator.py` | **CLI entry** (accuracy) |
 | `rl_engine/kernels/gtest/gradient_invariance.py` | C4 gradient invariance API |
 | `rl_engine/kernels/gtest/gradient_adapters.py` | C4 enumerable adapters + status matrix |
+| `rl_engine/kernels/gtest/elementwise_inventory.py` | C5 elementwise / RoPE inventory |
+| `rl_engine/kernels/gtest/four_judgment_matrix.py` | C8 four-judgment matrix schema |
 | `scripts/check_gradient_invariance.py` | C4 GPU evidence CLI |
 
 ---
@@ -95,9 +97,12 @@ Edit `rl_engine/kernels/gtest/operator_specs.py` and add an entry to `OP_SPECS`.
 Currently registered (source of truth is the code):
 
 ```text
-rms_norm, attention, logp, linear_logp, embedding, lm_head,
-det_gemm, rope, silu, swiglu, batch_invariant_logp
+rms_norm, qk_norm, attention, logp, linear_logp, embedding, lm_head,
+det_gemm, rope, silu, swiglu, batch_invariant_logp, pack
 ```
+
+`qk_norm` reuses the `rms_norm` spec. `pack` is layout-supported and is covered by
+the C3/C4 CPU contract tests, not a per-profile GPU CLI cell.
 
 ---
 
@@ -228,7 +233,7 @@ python scripts/check_operator.py --op rms_norm --candidate cuda --dtype bf16 --d
 | Output vs gold | `forward_accuracy` |
 | Gradient vs gold | `gradient_accuracy` |
 
-Batch/chunk **bitwise invariance** and train/infer **three aggregates** are not separate `check_operator.py` switches. Use C3/C4:
+Batch/chunk **bitwise invariance** and train/infer **three aggregates** are not separate `check_operator.py` switches. Use C3/C4. C3 now runs the same enumerable WS1 ops as C4 (`make_forward_runner`):
 
 ```python
 from rl_engine.kernels.gtest import (
@@ -424,3 +429,5 @@ New pytest code should call `resolve_tolerance` instead of copying magic numbers
 | 2026-08-11 | Initial English guide aligned with C1; documents CLI, `OP_SPECS`, inputs, and contract usage |
 | 2026-08-13 | Document C4 `assert_gradient_batch_invariant` and `check_gradient_invariance.py` |
 | 2026-08-13 | C4 adapters run on `config.physical_layout` (packed / chunked / padded / permuted) and return physical tensors restored through the C2 map; a new adapter must vary with the layout or its bitwise verdicts are tautologies |
+| 2026-08-13 | C3 `check_forward_invariance.py` / `make_forward_runner` cover every C2 required chain op plus pack, not only logp |
+| 2026-08-13 | C5 inventory + C8 `sweep_ws1_four_judgments.py`; C2 v5 adds remaining operator case_ids |

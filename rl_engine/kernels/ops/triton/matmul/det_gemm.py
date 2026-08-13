@@ -119,6 +119,12 @@ class TritonDetGemmOp:
         assert a.is_cuda and b.is_cuda, "CUDA only"
         return _TritonDetGemmFn.apply(a, b)
 
+    def parameter_vjp_contributions_fp32(self, *, a, b, grad_output):
+        del b
+        rows_a = a.float()
+        rows_g = grad_output.float()
+        return {"b": rows_a[:, :, None] * rows_g[:, None, :]}
+
 
 def deterministic_gemm_triton(a, b):
     return _TritonDetGemmFn.apply(a, b)

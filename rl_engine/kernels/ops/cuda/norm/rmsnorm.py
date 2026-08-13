@@ -87,3 +87,10 @@ class RMSNormCudaOp:
         x_2d = x.contiguous().view(-1, hidden)
         y_2d = rmsnorm_cuda(x_2d, weight.contiguous(), eps=eps)
         return y_2d.view_as(x)
+
+    def parameter_vjp_contributions_fp32(self, *, x, weight, grad_output, eps=1e-6):
+        del weight
+        x32 = x.float()
+        rstd = torch.rsqrt(x32.square().mean(dim=-1) + float(eps))
+        rows = grad_output.float() * x32 * rstd.unsqueeze(-1)
+        return {"weight": rows}

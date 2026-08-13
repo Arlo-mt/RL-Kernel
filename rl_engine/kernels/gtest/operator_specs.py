@@ -70,6 +70,7 @@ OP_SPECS = {
         gold_method="forward_fp32",
         candidate_paths={
             "pytorch": "rl_engine.kernels.ops.pytorch.loss.logp.NativeLogpOp",
+            "triton": "rl_engine.kernels.ops.triton.loss.logp.TritonLogpOp",
             "cuda": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
             "cuda-generic": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpGenericOp",
             "cuda-sm90": "rl_engine.kernels.ops.cuda.loss.logp.FusedLogpSM90Op",
@@ -95,6 +96,7 @@ OP_SPECS = {
         gold_method="forward_fp32",
         candidate_paths={
             "pytorch": "rl_engine.kernels.ops.pytorch.linear.embedding.NativeEmbeddingOp",
+            "triton": "rl_engine.kernels.ops.triton.linear.embedding.TritonEmbeddingOp",
             "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp",
         },
         grad_input_names=("weight",),
@@ -106,6 +108,7 @@ OP_SPECS = {
         gold_method="forward_fp32",
         candidate_paths={
             "pytorch": "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp",
+            "triton": "rl_engine.kernels.ops.triton.linear.lm_head.TritonLMHeadOp",
             "cuda-sm90": "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp",
         },
         grad_input_names=("hidden", "weight"),
