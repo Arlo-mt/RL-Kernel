@@ -330,6 +330,18 @@ class MegatronAttentionMaterializer:
                     )
                 )
                 continue
+            if contract is None:
+                applications.append(
+                    application(
+                        descriptor,
+                        requested,
+                        None,
+                        None,
+                        MaterializationStatus.ERROR,
+                        f"attention contract is unavailable: {blocked}",
+                    )
+                )
+                continue
             applications.append(
                 self._runtime_application(
                     descriptor,

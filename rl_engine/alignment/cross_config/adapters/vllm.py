@@ -374,6 +374,18 @@ class VllmRolloutMaterializer:
                     )
                 )
                 continue
+            if contract is None:
+                applications.append(
+                    application(
+                        descriptor,
+                        requested,
+                        None,
+                        None,
+                        MaterializationStatus.ERROR,
+                        f"attention contract is unavailable: {blocked}",
+                    )
+                )
+                continue
             if path == "rollout.context_parallel_size" and effective_cp != requested_cp:
                 applications.append(
                     application(

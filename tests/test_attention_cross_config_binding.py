@@ -800,8 +800,28 @@ def test_arrival_merge_order_is_unsupported_not_silently_corrected():
     assert _statuses(materialization, "attention.reduction_order") == [
         MaterializationStatus.UNSUPPORTED
     ]
+    assert _statuses(materialization, "training.tensor_parallel_size") == [
+        MaterializationStatus.ERROR
+    ]
     assert materialization.binding.side_configs["training"]["contract"] is None
     assert "arrival" in materialization.binding.side_configs["training"]["contract_error"]
+
+
+def test_unsupported_reduction_invalidates_vllm_contract_applications():
+    normalized = {
+        "batch": {"size": 2},
+        "rollout": {"tensor_parallel_size": 2, "context_parallel_size": 2},
+        "attention": {"reduction_order": "arrival"},
+    }
+    materialization = VllmRolloutMaterializer().materialize(normalized, WS2_ATTENTION_KNOBS)
+
+    assert _statuses(materialization, "attention.reduction_order") == [
+        MaterializationStatus.UNSUPPORTED
+    ]
+    assert _statuses(materialization, "rollout.tensor_parallel_size") == [
+        MaterializationStatus.ERROR
+    ]
+    assert materialization.binding.side_configs["rollout"]["contract"] is None
 
 
 def test_bf16_reduction_accumulation_is_unsupported():
