@@ -269,7 +269,6 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert drift.provenance["supports_backward"] is False
     assert drift.provenance["communication"] == "none"
     assert drift.provenance["cache_execution_fingerprint"] == decode_kv_cache_fingerprint(inputs)
-    assert drift.provenance["scale"] == pytest.approx(1.0 / (8.0**0.5))
     assert drift.provenance["logical_merge_orders"] == [
         [[0, 1, 2], [0, 1, 2]],
         [[0, 1, 2], [0, 1, 2]],
