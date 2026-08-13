@@ -46,6 +46,10 @@ class AttentionPartialState:
             raise ValueError("partial attention out must have shape [B, Hq, Sq, D]")
         if self.lse.shape != self.out.shape[:3]:
             raise ValueError("partial attention lse must have shape [B, Hq, Sq]")
+        if self.out.device != self.lse.device:
+            raise ValueError("partial attention out/lse must be on the same device")
+        if self.out.dtype is not torch.float32 or self.lse.dtype is not torch.float32:
+            raise ValueError("partial attention out/lse must remain FP32 before merge")
         if self.block_start < 0:
             raise ValueError("block_start must be non-negative")
         if self.block_end < self.block_start:
@@ -330,6 +334,8 @@ class DeterministicCPAttentionReferenceOp:
         ``output_dtype`` defaults to the input dtype.
         """
 
+        resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
+        _validate_output_dtype(resolved_output_dtype)
         out, lse = self._forward_impl(
             q,
             k,
@@ -342,7 +348,7 @@ class DeterministicCPAttentionReferenceOp:
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
         )
-        out = out.to(q.dtype if output_dtype is None else output_dtype)
+        out = out.to(resolved_output_dtype)
         return out, lse
 
     def forward_fp32_with_lse(
@@ -415,6 +421,7 @@ class DeterministicCPAttentionReferenceOp:
         v_leaf = v.detach().clone().requires_grad_(True)
 
         resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
+        _validate_output_dtype(resolved_output_dtype)
         out, lse = self.forward_with_lse(
             q_leaf,
             k_leaf,
@@ -881,6 +888,14 @@ def _validate_scale(scale: Optional[float]) -> None:
         raise ValueError("scale must be a positive finite number")
     if not math.isfinite(float(scale)) or float(scale) <= 0:
         raise ValueError("scale must be a positive finite number")
+
+
+def _validate_output_dtype(output_dtype: torch.dtype) -> None:
+    if not isinstance(output_dtype, torch.dtype):
+        raise ValueError("output_dtype must be a real floating-point torch dtype")
+    probe = torch.empty((), dtype=output_dtype)
+    if not torch.is_floating_point(probe) or torch.is_complex(probe):
+        raise ValueError("output_dtype must be a real floating-point torch dtype")
 
 
 def _zero_dependency(*tensors: torch.Tensor) -> torch.Tensor:

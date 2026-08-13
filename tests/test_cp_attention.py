@@ -645,6 +645,23 @@ def test_boolean_parallelism_arguments_fail_closed(kwargs):
         op.forward_fp32_with_lse(q, k, v, **kwargs)
 
 
+@pytest.mark.parametrize("output_dtype", [torch.long, torch.complex64, "fp32"])
+def test_nonfloating_output_dtype_fails_closed(output_dtype):
+    op = DeterministicCPAttentionReferenceOp()
+    q, k, v = _qkv(1, 4, 4, seed=27, heads=4, kv_heads=2, dim=8)
+
+    with pytest.raises(ValueError, match="output_dtype must be a real floating-point"):
+        op.forward_with_lse(q, k, v, output_dtype=output_dtype)
+
+
+def test_partial_states_must_remain_fp32_and_colocated():
+    out = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    lse = torch.zeros(1, 1, 1, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="must remain FP32"):
+        AttentionPartialState(out=out, lse=lse, block_start=0, block_end=1)
+
+
 def test_overlapping_partial_ranges_raise():
     out = torch.zeros(1, 1, 1, 1)
     lse = torch.zeros(1, 1, 1)
