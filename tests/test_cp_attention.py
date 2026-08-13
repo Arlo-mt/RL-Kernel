@@ -550,6 +550,15 @@ def test_backward_report_validates_dout_shape_and_dtype():
             cp_world_size=2,
         )
 
+    with pytest.raises(ValueError, match="dout must have the same dtype"):
+        op.backward_reference(
+            q.to(torch.bfloat16),
+            k.to(torch.bfloat16),
+            v.to(torch.bfloat16),
+            torch.ones_like(q),
+            cp_world_size=2,
+        )
+
 
 def test_inputs_are_not_mutated():
     op = DeterministicCPAttentionReferenceOp()
