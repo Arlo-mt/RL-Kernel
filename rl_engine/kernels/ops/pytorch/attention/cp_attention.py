@@ -503,6 +503,7 @@ class DeterministicCPAttentionReferenceOp:
         """
 
         _validate_qkv(q, k, v)
+        _validate_scale(scale)
         if q_start < 0 or k_start < 0:
             raise ValueError("q_start and k_start must be non-negative")
         if total_kv_len < k_start + k.size(2):
@@ -598,9 +599,14 @@ class DeterministicCPAttentionReferenceOp:
         kv_chunk_size: Optional[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _validate_qkv(q, k, v)
-        if cp_world_size < 1:
+        _validate_scale(scale)
+        if isinstance(cp_world_size, bool) or not isinstance(cp_world_size, int) or cp_world_size < 1:
             raise ValueError("cp_world_size must be >= 1")
-        if kv_chunk_size is not None and kv_chunk_size < 1:
+        if kv_chunk_size is not None and (
+            isinstance(kv_chunk_size, bool)
+            or not isinstance(kv_chunk_size, int)
+            or kv_chunk_size < 1
+        ):
             raise ValueError("kv_chunk_size must be >= 1 when provided")
 
         batch, hq, sq, dim = q.shape
@@ -850,8 +856,27 @@ def _validate_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         raise ValueError("k and v must have the same shape")
     if q.size(0) != k.size(0) or q.size(3) != k.size(3):
         raise ValueError("q, k, and v must share batch size and head dim")
+    if q.size(1) < 1 or k.size(1) < 1 or q.size(3) < 1:
+        raise ValueError("q, k, and v must have positive head counts and head dim")
+    if not all(torch.is_floating_point(tensor) for tensor in (q, k, v)) or any(
+        torch.is_complex(tensor) for tensor in (q, k, v)
+    ):
+        raise ValueError("q, k, and v must be real floating-point tensors")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("q, k, and v must be on the same device")
     if q.size(1) % k.size(1) != 0:
         raise ValueError(f"Hq={q.size(1)} not divisible by Hkv={k.size(1)} (GQA group)")
+
+
+def _validate_scale(scale: Optional[float]) -> None:
+    if scale is None:
+        return
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError("scale must be a positive finite number")
+    if not math.isfinite(float(scale)) or float(scale) <= 0:
+        raise ValueError("scale must be a positive finite number")
 
 
 def _zero_dependency(*tensors: torch.Tensor) -> torch.Tensor:
