@@ -466,6 +466,8 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             errors.append(f"P2P rank {index} arithmetic provenance is invalid")
         if row.get("downcast_at") != "final_write":
             errors.append(f"P2P rank {index} downcast provenance is invalid")
+        if row.get("final_output_dtype") != "bfloat16":
+            errors.append(f"P2P rank {index} final output dtype is not BF16")
         if not str(row.get("device", "")).startswith("cuda"):
             errors.append(f"P2P rank {index} was not executed on CUDA")
         query_range = row.get("query_range")
@@ -478,16 +480,32 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         else:
             expected_query_ranges.append(query_range)
         gathered_indices = row.get("gathered_block_indices")
+        block_manifest = row.get("expected_block_manifest")
+        manifest_indices = (
+            [block.get("global_block_index") for block in block_manifest]
+            if isinstance(block_manifest, list)
+            and block_manifest
+            and all(isinstance(block, dict) for block in block_manifest)
+            else None
+        )
         if not (
             isinstance(gathered_indices, list)
             and gathered_indices
             and gathered_indices == list(range(len(gathered_indices)))
+            and manifest_indices == gathered_indices
         ):
             errors.append(f"P2P rank {index} gathered block order/coverage is invalid")
         else:
             gathered_manifests.append(gathered_indices)
         for name in ("out_max_abs", "lse_max_abs"):
             errors.extend(_scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}"))
+        errors.extend(
+            _scalar_threshold_errors(
+                row.get("final_out_max_abs"),
+                row.get("final_write_atol"),
+                f"P2P rank {index}.final_out_max_abs",
+            )
+        )
     if seen_ranks != {0, 1}:
         errors.append("P2P report must cover ranks 0 and 1 exactly")
     if sorted(expected_query_ranges) != expected_query_ranges or any(

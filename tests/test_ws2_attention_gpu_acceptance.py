@@ -193,6 +193,16 @@ def test_pr5_validation_rejects_nonfinite_or_negative_drift(tmp_path):
 
 def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
     def row(rank, query_range):
+        manifest = [
+            {
+                "global_block_index": block,
+                "kv_block_start": block * 4,
+                "kv_block_end": block * 4 + 4,
+                "owner_cp_rank": 0 if block < 2 else 1,
+                "owner_tp_rank": 0,
+            }
+            for block in range(4)
+        ]
         return {
             "rank": rank,
             "world_size": 2,
@@ -202,11 +212,15 @@ def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
             "dtype": "bf16",
             "accum_dtype": "fp32",
             "downcast_at": "final_write",
+            "final_output_dtype": "bfloat16",
             "query_range": query_range,
+            "expected_block_manifest": manifest,
             "gathered_block_indices": [0, 1, 2, 3],
             "out_max_abs": 0.0,
             "lse_max_abs": 0.0,
+            "final_out_max_abs": 0.0,
             "atol": 2.0e-4,
+            "final_write_atol": 2.0e-2,
         }
 
     report = {
@@ -223,6 +237,38 @@ def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
     errors = validate_p2p_report(report)
     assert any("NCCL reference transport" in error for error in errors)
     assert any("ranks 0 and 1" in error for error in errors)
+
+
+def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence():
+    report = {
+        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
+        "backend": "nccl",
+        "world_size": 2,
+        "global_failure_count": 0,
+        "ranks": [
+            {
+                "rank": rank,
+                "world_size": 2,
+                "passed": True,
+                "transport": "p2p_nccl_reference",
+                "device": f"cuda:{rank}",
+                "dtype": "bf16",
+                "accum_dtype": "fp32",
+                "downcast_at": "final_write",
+                "query_range": [rank * 8, (rank + 1) * 8],
+                "gathered_block_indices": [0, 1],
+                "out_max_abs": 0.0,
+                "lse_max_abs": 0.0,
+                "atol": 2.0e-4,
+            }
+            for rank in range(2)
+        ],
+    }
+
+    errors = validate_p2p_report(report)
+    assert any("final output dtype" in error for error in errors)
+    assert any("gathered block order/coverage" in error for error in errors)
+    assert any("final_out_max_abs" in error for error in errors)
 
 
 def test_pr5_validation_rejects_forged_plan_set_coverage(tmp_path):

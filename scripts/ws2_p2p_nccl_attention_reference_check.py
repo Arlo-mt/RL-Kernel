@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Two-GPU P2P NCCL reference check for issue #235.
+"""Two-GPU P2P NCCL correctness reference for issue #235.
 
 Run with:
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2357)
     parser.add_argument("--atol", type=float, default=2.0e-4)
+    parser.add_argument("--final-write-atol", type=float, default=2.0e-2)
     return parser.parse_args(argv)
 
 
@@ -100,12 +102,18 @@ def run_check(
     rank: int,
     device: torch.device,
 ) -> dict[str, object]:
+    if args.batch < 1:
+        raise ValueError("batch must be positive")
     if args.seq_len < 2 or args.seq_len % 2 != 0:
         raise ValueError("seq_len must be positive and divisible by CP=2")
     if args.chunk_size < 1:
         raise ValueError("chunk_size must be positive")
-    if args.q_heads % args.kv_heads != 0:
-        raise ValueError("q_heads must be divisible by kv_heads")
+    if args.q_heads != 16 or args.kv_heads != 4 or args.head_dim != 128:
+        raise ValueError("TP=2 Qwen3-8B local heads must be Hq=16, Hkv=4, D=128")
+    for name in ("atol", "final_write_atol"):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
 
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
     shape_q = (args.batch, args.q_heads, args.seq_len, args.head_dim)
@@ -114,7 +122,6 @@ def run_check(
     k = torch.randn(shape_kv, generator=generator, dtype=torch.bfloat16).to(device)
     v = torch.randn(shape_kv, generator=generator, dtype=torch.bfloat16).to(device)
     owner_ranges = ((0, args.seq_len // 2), (args.seq_len // 2, args.seq_len))
-    query_ranges = owner_ranges
     blocks: list[AttentionCPBlockMetadata] = []
     for owner, (owner_start, owner_end) in enumerate(owner_ranges):
         for start in range(owner_start, owner_end, args.chunk_size):
@@ -138,7 +145,7 @@ def run_check(
         status="implemented",
         expected_blocks=tuple(blocks),
         expected_kv_token_range=(0, args.seq_len),
-        query_token_ranges=query_ranges,
+        query_token_ranges=owner_ranges,
     )
     reference = DeterministicCPAttentionReferenceOp()
     local_states: list[AttentionCPPartialState] = []
@@ -155,9 +162,7 @@ def run_check(
             total_query_len=args.seq_len,
             causal=True,
         )
-        local_states.append(
-            AttentionCPPartialState(state.out, state.lse, block)
-        )
+        local_states.append(AttentionCPPartialState(state.out, state.lse, block))
 
     communication = P2PNCCLAttentionCPCommunication()
     gathered = communication.all_gather_partial_states(tuple(local_states), plan)
@@ -177,15 +182,21 @@ def run_check(
         plan,
     )
     full_out, full_lse = reference.forward_fp32_with_lse(q, k, v, causal=True)
-    start, end = query_ranges[rank]
+    start, end = owner_ranges[rank]
     out_max_abs = float((local.out - full_out[:, :, start:end, :]).abs().max().item())
     lse_max_abs = float((local.lse - full_lse[:, :, start:end]).abs().max().item())
-    expected_indices = list(range(len(blocks)))
+    final_out = local.out.to(q.dtype)
+    expected_final_out = full_out[:, :, start:end, :].to(q.dtype)
+    final_out_max_abs = float(
+        (final_out.float() - expected_final_out.float()).abs().max().item()
+    )
     gathered_indices = [state.block.global_block_index for state in gathered]
     passed = (
-        gathered_indices == expected_indices
+        gathered_indices == list(range(len(blocks)))
         and out_max_abs <= args.atol
         and lse_max_abs <= args.atol
+        and final_out.dtype == q.dtype
+        and final_out_max_abs <= args.final_write_atol
     )
     return {
         "rank": rank,
@@ -193,13 +204,17 @@ def run_check(
         "dtype": "bf16",
         "accum_dtype": "fp32",
         "downcast_at": "final_write",
+        "final_output_dtype": str(final_out.dtype).removeprefix("torch."),
         "transport": "p2p_nccl_reference",
         "query_range": [start, end],
         "world_size": 2,
+        "expected_block_manifest": [block.provenance() for block in blocks],
         "gathered_block_indices": gathered_indices,
         "out_max_abs": out_max_abs,
         "lse_max_abs": lse_max_abs,
+        "final_out_max_abs": final_out_max_abs,
         "atol": args.atol,
+        "final_write_atol": args.final_write_atol,
         "passed": passed,
     }
 
