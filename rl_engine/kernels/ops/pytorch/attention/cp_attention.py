@@ -406,6 +406,10 @@ class DeterministicCPAttentionReferenceOp:
             raise ValueError("dout must have shape [B, Hq, Sq, D], matching q")
         if not torch.is_floating_point(dout) or torch.is_complex(dout):
             raise ValueError("dout must be a real floating-point tensor")
+        if dout.device != q.device:
+            raise ValueError("dout must be on the same device as q, k, and v")
+        if dout.dtype != q.dtype:
+            raise ValueError("dout must have the same dtype as q")
         q_leaf = q.detach().clone().requires_grad_(True)
         k_leaf = k.detach().clone().requires_grad_(True)
         v_leaf = v.detach().clone().requires_grad_(True)
@@ -424,7 +428,7 @@ class DeterministicCPAttentionReferenceOp:
             kv_chunk_size=kv_chunk_size,
             output_dtype=resolved_output_dtype,
         )
-        torch.autograd.backward(out, dout.to(device=out.device, dtype=out.dtype))
+        torch.autograd.backward(out, dout.to(dtype=out.dtype))
         if q_leaf.grad is None or k_leaf.grad is None or v_leaf.grad is None:
             raise RuntimeError("CP attention backward did not produce dq/dk/dv")
 
