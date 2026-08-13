@@ -516,9 +516,7 @@ class DeterministicCPAttentionReferenceOp:
                 ],
                 "cp_world_size": cp_world_size,
                 "kv_chunk_size": kv_chunk_size,
-                "requested_split_kv_policy": (
-                    "disabled" if kv_chunk_size is None else "fixed"
-                ),
+                "requested_split_kv_policy": ("disabled" if kv_chunk_size is None else "fixed"),
                 "requested_split_kv_size": kv_chunk_size,
                 "actual_split_kv_plans": split_kv_execution_plan_provenance(
                     k.size(2),
@@ -610,9 +608,7 @@ class DeterministicCPAttentionReferenceOp:
             v_fingerprint=_tensor_fingerprint(v),
             out_fingerprint=_tensor_fingerprint(out),
             lse_fingerprint=_tensor_fingerprint(lse),
-            key_padding_mask_fingerprint=(
-                None if mask is None else _tensor_fingerprint(mask)
-            ),
+            key_padding_mask_fingerprint=(None if mask is None else _tensor_fingerprint(mask)),
             query_position_offsets_fingerprint=_tensor_fingerprint(query_offsets),
             key_position_offsets_fingerprint=_tensor_fingerprint(key_offsets),
         )
@@ -740,7 +736,11 @@ class DeterministicCPAttentionReferenceOp:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _validate_qkv(q, k, v)
         _validate_scale(scale)
-        if isinstance(cp_world_size, bool) or not isinstance(cp_world_size, int) or cp_world_size < 1:
+        if (
+            isinstance(cp_world_size, bool)
+            or not isinstance(cp_world_size, int)
+            or cp_world_size < 1
+        ):
             raise ValueError("cp_world_size must be >= 1")
         if kv_chunk_size is not None and (
             isinstance(kv_chunk_size, bool)
@@ -932,16 +932,22 @@ def _backward_from_saved_state(
                 if state.causal:
                     query_base = state.query_position_offsets[:, None] + q_start
                     key_base = state.key_position_offsets[:, None] + k_start
-                    q_pos = torch.arange(
-                        q_end - q_start,
-                        device=q.device,
-                        dtype=torch.long,
-                    ) + query_base
-                    k_pos = torch.arange(
-                        k_end - k_start,
-                        device=q.device,
-                        dtype=torch.long,
-                    ) + key_base
+                    q_pos = (
+                        torch.arange(
+                            q_end - q_start,
+                            device=q.device,
+                            dtype=torch.long,
+                        )
+                        + query_base
+                    )
+                    k_pos = (
+                        torch.arange(
+                            k_end - k_start,
+                            device=q.device,
+                            dtype=torch.long,
+                        )
+                        + key_base
+                    )
                     scores = scores.masked_fill(
                         (k_pos[:, None, :] > q_pos[:, :, None])[:, None, :, :],
                         float("-inf"),
@@ -963,9 +969,7 @@ def _backward_from_saved_state(
                 )
                 dp = torch.matmul(dout_block, v_block.transpose(-1, -2))
                 # The global softmax dot term is dout dot the saved global output.
-                ds = probability * (
-                    dp - (dout_block * out_block).sum(dim=-1, keepdim=True)
-                )
+                ds = probability * (dp - (dout_block * out_block).sum(dim=-1, keepdim=True))
                 dq_block += torch.matmul(ds, k_block) * state.scale
                 dk_expanded[:, :, k_start:k_end, :] += (
                     torch.matmul(ds.transpose(-1, -2), q_block) * state.scale
@@ -1081,16 +1085,13 @@ def _validate_saved_forward_state(
     if not masks_match:
         mismatches.append("key_padding_mask")
     actual_mask_fingerprint = (
-        None
-        if state.key_padding_mask is None
-        else _tensor_fingerprint(state.key_padding_mask)
+        None if state.key_padding_mask is None else _tensor_fingerprint(state.key_padding_mask)
     )
     if state.key_padding_mask_fingerprint != actual_mask_fingerprint:
         mismatches.append("key_padding_mask_fingerprint")
     if mismatches:
         raise ValueError(
-            "saved_forward_state does not match the backward invocation: "
-            + ", ".join(mismatches)
+            "saved_forward_state does not match the backward invocation: " + ", ".join(mismatches)
         )
 
 
@@ -1315,9 +1316,7 @@ def split_kv_execution_plan_provenance(
     if kv_chunk_size is not None and kv_chunk_size < 1:
         raise ValueError("kv_chunk_size must be >= 1 when provided")
     result: list[dict[str, object]] = []
-    for owner_cp_rank, (rank_start, rank_end) in enumerate(
-        _split_bounds(length, cp_world_size)
-    ):
+    for owner_cp_rank, (rank_start, rank_end) in enumerate(_split_bounds(length, cp_world_size)):
         if rank_start == rank_end:
             continue
         if kv_chunk_size is None:
@@ -1354,9 +1353,7 @@ def build_reference_split_kv_runtime_plan_set(
 
     totals = tuple(total_kv_tokens)
     if not totals or any(total < cp_world_size for total in totals):
-        raise ValueError(
-            "reference runtime plan sets require at least one KV token per CP owner"
-        )
+        raise ValueError("reference runtime plan sets require at least one KV token per CP owner")
     if tp_world_size < 1 or cp_world_size < 1:
         raise ValueError("TP and CP world sizes must be >= 1")
     if kv_chunk_size is not None and kv_chunk_size < 1:
