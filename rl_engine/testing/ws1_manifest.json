@@ -665,7 +665,7 @@
           "node": "embedding",
           "expected_backend_id": "triton",
           "expected_kernel_config_id": "triton_embedding",
-          "algorithm_property": "deterministic_table_lookup",
+          "algorithm_property": "deterministic_table_lookup_atomic_free_backward",
           "status": "declared"
         },
         {
@@ -721,7 +721,7 @@
           "node": "lm_head",
           "expected_backend_id": "triton",
           "expected_kernel_config_id": "triton_lm_head_no_splitk",
-          "algorithm_property": "deterministic_untied_lm_head",
+          "algorithm_property": "deterministic_no_split_k_lm_head",
           "status": "declared"
         },
         {
@@ -2171,7 +2171,7 @@
       }
     }
   ],
-  "fixture_identity_sha256": "4cfce614fa7e2f6a5c1ce801fa47c1d2cfb2be3667d009a33f06687c62f57807",
+  "fixture_identity_sha256": "3fa8a5913795a4a0011e038a5a33831dc63b096fce67c9817766f493dd66c222",
   "provenance_boundary": {
     "c2_scope": "logical_workload_identity_and_executed_representative_candidate_binding",
     "not_in_c2": [

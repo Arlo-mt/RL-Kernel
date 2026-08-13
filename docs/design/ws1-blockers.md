@@ -25,7 +25,7 @@ Re-run `check_gradient_invariance.py --op det_gemm` to confirm on the target GPU
 ## cuda-logp-no-backward
 
 **Resolved on 2026-08-13:** `FusedLogpGenericOp` now has a row-local FP32
-softmax VJP bridge. RTX 3060 C4 reports all `dlogits` invariance errors as 0.
+softmax VJP bridge. H20 C4/C8 reports all `dlogits` invariance errors as 0.
 
 - **Op:** `logp`
 - **Profile:** `cuda_bf16` (C2 status is `declared`, not `missing_required`)
@@ -35,7 +35,6 @@ softmax VJP bridge. RTX 3060 C4 reports all `dlogits` invariance errors as 0.
   ```bash
   python scripts/check_gradient_invariance.py --op logp --candidate cuda --backend-profile cuda_bf16
   ```
-- **Hopper:** will not clear this.
 
 ## triton-attention-left-pad
 

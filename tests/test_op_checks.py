@@ -376,6 +376,28 @@ def test_candidate_arch_key_uses_tolerance_override():
     assert output.atol == 5.0e-2
 
 
+def test_legacy_contract_rejects_non_forward_judgment():
+    """Legacy accuracy mirrors must not be reused as gradient thresholds."""
+    from rl_engine.kernels.gtest.op_checks import _resolve_tolerance
+
+    contract = {
+        "accuracy": {
+            "default": {
+                "logprob": {
+                    "float32": {"atol": 1.0e-5, "rtol": 0.0},
+                }
+            }
+        }
+    }
+    with pytest.raises(ContractResolveError, match="legacy accuracy contracts"):
+        _resolve_tolerance(
+            contract,
+            op_class="logprob",
+            dtype=torch.float32,
+            judgment="gradient_accuracy",
+        )
+
+
 def test_logp_native_candidate_backward_suite_passes():
     report = run_operator_suite(
         "logp",

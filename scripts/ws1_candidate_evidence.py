@@ -251,6 +251,29 @@ def main(argv: list[str] | None = None) -> int:
                             "outputs": [],
                         }
                     )
+        fixture_identity_sha256 = manifest.raw["fixture_identity_sha256"]
+        props = torch.cuda.get_device_properties(device)
+        payload = {
+            "schema_version": "ws1-c2-runtime-provenance-v1",
+            "workload_id": manifest.workload_id,
+            "fixture_identity_sha256": fixture_identity_sha256,
+            "execution_dtype": "bfloat16",
+            "device": {
+                "index": device.index,
+                "name": props.name,
+                "compute_capability": f"sm{props.major}{props.minor}",
+                "execution_world_size": 1,
+            },
+            "software": {
+                "python": platform.python_version(),
+                "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
+            },
+            "profiles": sorted(profiles),
+            "passed": bool(results)
+            and all(result["runtime_status"] == "passed" for result in results),
+            "cases": results,
+        }
     except (
         RuntimeError,
         ValueError,
@@ -261,28 +284,6 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-
-    props = torch.cuda.get_device_properties(device)
-    payload = {
-        "schema_version": "ws1-c2-runtime-provenance-v1",
-        "workload_id": manifest.workload_id,
-        "fixture_identity_sha256": manifest.raw["fixture_identity_sha256"],
-        "execution_dtype": "bfloat16",
-        "device": {
-            "index": device.index,
-            "name": props.name,
-            "compute_capability": f"sm{props.major}{props.minor}",
-            "execution_world_size": 1,
-        },
-        "software": {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "cuda_runtime": torch.version.cuda,
-        },
-        "profiles": sorted(profiles),
-        "passed": bool(results) and all(result["runtime_status"] == "passed" for result in results),
-        "cases": results,
-    }
     rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if args.emit_json == "-":
         sys.stdout.write(rendered)

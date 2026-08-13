@@ -28,9 +28,13 @@ class _TritonLMHeadFn(torch.autograd.Function):
         hidden, weight, bias = ctx.saved_tensors
         grad_2d = grad_output.reshape(-1, weight.size(0)).float()
         hidden_2d = hidden.reshape(-1, hidden.size(-1)).float()
-        grad_hidden = grad_2d.matmul(weight.float()).reshape_as(hidden).to(hidden.dtype)
-        grad_weight = grad_2d.transpose(0, 1).matmul(hidden_2d).to(weight.dtype)
-        grad_bias = grad_2d.sum(0).to(bias.dtype) if ctx.has_bias else None
+        grad_hidden = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_hidden = grad_2d.matmul(weight.float()).reshape_as(hidden).to(hidden.dtype)
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_2d.transpose(0, 1).matmul(hidden_2d).to(weight.dtype)
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = grad_2d.sum(0).to(bias.dtype)
         return grad_hidden, grad_weight, grad_bias
 
 

@@ -433,7 +433,7 @@ def resolve_tolerance(
     atol = float(cell["atol"])
     rtol = float(cell["rtol"])
 
-    if judgment in INVARIANCE_JUDGMENTS and status == "applicable":
+    if judgment in INVARIANCE_JUDGMENTS and status in {"applicable", "optional"}:
         if mode != "bitwise" or atol != 0.0 or rtol != 0.0:
             raise ContractResolveError(
                 f"Batch/Chunk invariance requires bitwise atol=0 rtol=0; got "
@@ -799,13 +799,13 @@ def _validate_judgments(judgments: Mapping[str, Any]) -> None:
                             raise ContractSchemaError(
                                 f"cell missing {thr}: {judgment}/{op_class}/{dtype_name}"
                             )
-                if judgment in INVARIANCE_JUDGMENTS and status == "applicable":
+                if judgment in INVARIANCE_JUDGMENTS and status in {"applicable", "optional"}:
                     mode = cell.get("mode")
                     atol = float(cell.get("atol", 1.0))
                     rtol = float(cell.get("rtol", 1.0))
                     if mode != "bitwise" or atol != 0.0 or rtol != 0.0:
                         raise ContractSchemaError(
-                            f"invariance applicable cells must be bitwise 0/0: "
+                            f"invariance applicable/optional cells must be bitwise 0/0: "
                             f"{judgment}/{op_class}/{dtype_name}"
                         )
 

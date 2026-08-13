@@ -7,7 +7,9 @@
 
 **Parent:** #266 · **Depends on:** C3 / C4 · **Not a substitute for #150 / C10**
 
-C8 collects `backend_profile × case_id × op × {forward_accuracy, forward_invariance, gradient_accuracy, gradient_invariance}` using the existing C3 and C4 CLIs. It does not invent a third comparator.
+C8 combines C2 case-runner accuracy judgments with C3/C4 forward and gradient
+invariance judgments for each `backend_profile × case_id × op`. It does not
+invent a third comparator.
 
 Classify-only (CPU):
 
@@ -33,6 +35,11 @@ On Hopper, `cuda-sm90` cells become runnable automatically. Rebuild the extensio
 | `N/A` | pack (layout_supported) with a C2/C4 reason |
 
 Required untested is **red**, never bare N/A.
+
+**Exception:** declared `cuda-sm90` cells on a non-Hopper host are
+`pending_hopper`, not red. That status is a separate closeout gate: Hopper
+execute must clear it to zero, while non-Hopper classify-only may leave it
+pending under `--allow-pending-hopper`.
 
 ## Close status
 

@@ -294,7 +294,10 @@ class TestCandidateRoPELayouts:
         try:
             from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
 
-            ops.append(("cuda-sm90", RoPESM90Op()))
+            # SM90 kernel may be present in a prebuilt extension on SM86 hosts;
+            # only add the candidate when the active device can actually launch it.
+            if torch.cuda.get_device_capability(0)[0] == 9:
+                ops.append(("cuda-sm90", RoPESM90Op()))
         except RuntimeError:
             pass
         return ops

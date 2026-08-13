@@ -101,6 +101,13 @@ class _RoPEFunction(torch.autograd.Function):
         return grad_x, None, None
 
 
+def _is_hopper(device: torch.device) -> bool:
+    try:
+        return torch.cuda.get_device_capability(device)[0] == 9
+    except Exception:
+        return False
+
+
 class RoPESM90Op:
     """Custom CUDA RoPE op for SM90 (GPT-NeoX rotate-half), differentiable w.r.t. ``x``.
 
@@ -125,4 +132,9 @@ class RoPESM90Op:
     def forward(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
         if x.device.type != "cuda":
             raise RuntimeError(f"RoPESM90Op requires a CUDA tensor, got device '{x.device}'.")
+        if not _is_hopper(x.device):
+            raise RuntimeError(
+                "RoPESM90Op requires Hopper (SM90) CUDA; "
+                f"got compute capability {torch.cuda.get_device_capability(x.device)}"
+            )
         return _RoPEFunction.apply(x, positions, theta)

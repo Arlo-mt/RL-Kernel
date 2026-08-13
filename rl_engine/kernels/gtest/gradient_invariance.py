@@ -414,7 +414,11 @@ def assert_gradient_batch_invariant(
     if gold_fn is None:
         raise ValueError("gold_fn is required for gradient accuracy")
 
-    canonical_batch = next(c.logical_batch for c in config_list if c.is_canonical)
+    canonical_configs = [c for c in config_list if c.is_canonical]
+    if not canonical_configs:
+        raise ValueError("configs must contain exactly one canonical configuration")
+    canonical_config = canonical_configs[0]
+    canonical_batch = canonical_config.logical_batch
     plan = singleton_aggregate_plan(canonical_batch)
     if plan.denominator != "active_token_count_across_all_samples":
         raise ValueError(f"unsupported gradient denominator {plan.denominator!r}")
@@ -459,7 +463,6 @@ def assert_gradient_batch_invariant(
         collected[config.config_id] = grads
         observations[config.config_id] = observation
 
-    canonical_config = next((c for c in config_list if c.is_canonical), config_list[0])
     canonical_grads = collected[canonical_config.config_id]
     canonical_observation = observations[canonical_config.config_id]
     if canonical_observation is not None:

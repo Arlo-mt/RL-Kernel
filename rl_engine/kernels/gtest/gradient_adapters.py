@@ -725,7 +725,10 @@ def _to_rows(op_name: str, value: torch.Tensor, n_rows: int) -> torch.Tensor:
     """Normalize an operator output / input-grad back to (n_rows, *tail)."""
     if op_name == "rope":
         # RoPE runs as (1, heads, tokens, head_dim); tokens is the row axis.
-        return value.permute(0, 2, 1, 3).reshape(n_rows, *value.shape[1:2], value.shape[3])
+        permuted = value.permute(0, 2, 1, 3)
+        if permuted.shape[1] != n_rows:
+            raise ValueError(f"{op_name} produced {permuted.shape[1]} rows, expected {n_rows}")
+        return permuted.reshape(n_rows, permuted.shape[2], permuted.shape[3])
     if value.shape[0] != n_rows:
         raise ValueError(f"{op_name} produced {value.shape[0]} rows, expected {n_rows}")
     return value
@@ -1337,8 +1340,8 @@ def listed_source_paths(adapter: GradientAdapterSpec) -> list[Path]:
 
 
 __all__ = [
-    "AdapterStatusRow",
     "GRADIENT_ADAPTERS",
+    "AdapterStatusRow",
     "GradientAdapterSpec",
     "adapter_names",
     "get_adapter",

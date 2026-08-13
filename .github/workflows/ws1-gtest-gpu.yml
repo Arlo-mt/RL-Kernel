@@ -31,9 +31,19 @@ on:
     branches: [ main ]
     paths:
       - "rl_engine/kernels/gtest/**"
+      - "rl_engine/kernels/ops/**"
       - "rl_engine/testing/**"
       - "scripts/sweep_ws1_four_judgments.py"
+      - "scripts/check_forward_invariance.py"
+      - "scripts/check_gradient_invariance.py"
+      - "scripts/ws1_candidate_evidence.py"
+      - "tests/test_ws1_*.py"
+      - "tests/test_forward_invariance.py"
+      - "tests/test_gradient_invariance.py"
+      - "tests/test_four_judgment_matrix.py"
+      - "tests/test_triton_batch_invariant_attention.py"
       - "ci/run_ws1_gtest.sh"
+      - "ci/run_gpu_ci.sh"
       - ".github/workflows/ws1-gtest-gpu.yml"
   workflow_dispatch:
 
@@ -60,6 +70,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install runpodctl
         run: |

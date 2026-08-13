@@ -46,6 +46,8 @@ class _TritonEmbeddingFunction(torch.autograd.Function):
     def forward(ctx, token_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         ids = token_ids.reshape(-1).to(dtype=torch.int64).contiguous()
         vocab, hidden = weight.shape
+        if ids.numel() and bool(((ids < 0) | (ids >= vocab)).any()):
+            raise ValueError(f"token_ids must be in [0, {vocab})")
         out = torch.empty((ids.numel(), hidden), device=weight.device, dtype=weight.dtype)
         _embedding_fwd[(ids.numel(),)](
             ids,

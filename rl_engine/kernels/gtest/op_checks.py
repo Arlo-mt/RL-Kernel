@@ -517,6 +517,12 @@ def _resolve_tolerance(
         return float(spec.atol), float(spec.rtol)
 
     # Legacy fixtures used by some unit tests that inject a minimal contract.
+    # They only mirror forward accuracy thresholds; never apply them to grads.
+    if judgment != "forward_accuracy":
+        raise ContractResolveError(
+            f"legacy accuracy contracts only support judgment='forward_accuracy'; "
+            f"got {judgment!r}"
+        )
     dtype_name = normalize_dtype_name(dtype)
     if arch_key is not None:
         arch_values = (

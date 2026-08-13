@@ -380,6 +380,38 @@ def test_triton_attention_backward_matches_native_vjp():
 
 
 @requires_cuda
+def test_triton_attention_partial_pad_backward_matches_native_vjp():
+    """GQA + partial key padding: compare dq/dk/dv against NativeAttentionOp."""
+    dtype = torch.bfloat16
+    q, k, v = _qkv(2, 8, 8, q_heads=4, kv_heads=2, dtype=dtype, seed=24)
+    mask = torch.ones((2, 8), device="cuda", dtype=torch.bool)
+    mask[0, 6:] = False
+    mask[1, 5:] = False
+    dy = torch.randn_like(q)
+    op = TritonBatchInvariantAttentionOp()
+    native = NativeAttentionOp()
+
+    out, dq, dk, dv = _run_backward(
+        op, q, k, v, dy, causal=True, key_padding_mask=mask
+    )
+    ref_out, ref_dq, ref_dk, ref_dv = _run_backward(
+        native, q, k, v, dy, causal=True, key_padding_mask=mask
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(dq).all() and torch.isfinite(dk).all() and torch.isfinite(dv).all()
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dq.float(), ref_dq.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), ref_dk.float(), atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dv.float(), ref_dv.float(), atol=5e-2, rtol=2e-2)
+    # Padded key positions must not accumulate gradient.
+    assert torch.equal(dk[0, :, 6:], torch.zeros_like(dk[0, :, 6:]))
+    assert torch.equal(dv[0, :, 6:], torch.zeros_like(dv[0, :, 6:]))
+    assert torch.equal(dk[1, :, 5:], torch.zeros_like(dk[1, :, 5:]))
+    assert torch.equal(dv[1, :, 5:], torch.zeros_like(dv[1, :, 5:]))
+
+
+@requires_cuda
 def test_triton_attention_backward_batch_position_invariant():
     dtype = torch.bfloat16
     q_real, k_real, v_real = _qkv(1, 8, 8, dtype=dtype, seed=10)

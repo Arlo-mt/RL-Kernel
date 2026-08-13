@@ -11,12 +11,12 @@ from rl_engine.utils.logger import logger
 
 def _sm90_supported(logits: torch.Tensor) -> bool:
     """Whether the TMA forward can run these logits directly.
+
     Hopper (SM90) only, bf16/fp32 only, and the TMA descriptor needs the vocab
     row stride (``V * element_size``) to be a multiple of 16 bytes.
 
-    The device capability is checked per input (not just at registry init) so a
-    cached op instance handed a tensor on a non-Hopper GPU falls back instead of
-    launching the SM90 kernel on hardware that cannot run it.
+    The device capability is checked per input (not just at registry init). The
+    caller raises when this returns false; silent fallback is forbidden.
     """
     if not logits.is_cuda or logits.dtype not in (torch.bfloat16, torch.float32):
         return False

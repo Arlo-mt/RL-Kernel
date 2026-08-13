@@ -59,7 +59,13 @@ print(f"[ws1-gtest] C8 counts={counts} source={payload.get('git')}")
 if red:
     raise SystemExit(f"C8 has {red} red cells")
 cells = payload.get("cells") or []
+if not cells:
+    raise SystemExit("C8 artifact contains no cells")
+if int(counts.get("green", 0)) == 0:
+    raise SystemExit("C8 artifact has no green cells")
 required = [c for c in cells if c.get("op_name") != "pack" and c.get("status") == "green"]
+if not required:
+    raise SystemExit("C8 artifact has no green required cells")
 for cell in required:
     if not cell.get("judgment", "").endswith("invariance"):
         continue

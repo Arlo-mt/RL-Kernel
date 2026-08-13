@@ -219,14 +219,20 @@ def undefined_cells(report: MatrixReport) -> tuple[MatrixCell, ...]:
 
 
 def hidden_required_na(report: MatrixReport) -> tuple[MatrixCell, ...]:
-    """Required missing-candidate cells must not be skipped without a C2 reason."""
+    """Required ops must not be N/A without an explicit C2 layout/optional reason."""
 
+    # Reasons written by classify_adapter_cell for legitimate N/A cells.
+    allowed_markers = ("layout_supported", "profile-independent", "optional_fused")
     hidden: list[MatrixCell] = []
     for cell in report.cells:
         if cell.op_name == "pack":
             continue
-        if cell.status == "skipped" and "optional" not in cell.detail:
-            hidden.append(cell)
+        if cell.status != "N/A":
+            continue
+        detail = cell.detail or ""
+        if any(marker in detail for marker in allowed_markers):
+            continue
+        hidden.append(cell)
     return tuple(hidden)
 
 

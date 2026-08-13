@@ -71,6 +71,36 @@ def test_pack_is_explicit_na_with_c2_reason():
     assert all("profile-independent" in cell.detail for cell in pack)
 
 
+def test_hidden_required_na_detects_unreasoned_na_status():
+    from rl_engine.kernels.gtest.four_judgment_matrix import MatrixCell, MatrixReport
+
+    report = MatrixReport(
+        cells=(
+            MatrixCell(
+                profile="cuda_bf16",
+                op_name="silu",
+                judgment="forward_accuracy",
+                tier="short",
+                case_id=None,
+                status="N/A",
+                detail="silently skipped without C2 reason",
+            ),
+            MatrixCell(
+                profile="cuda_bf16",
+                op_name="linear_logp",
+                judgment="forward_accuracy",
+                tier="short",
+                case_id=None,
+                status="N/A",
+                detail="optional_fused with no C2 required node",
+            ),
+        )
+    )
+    hidden = hidden_required_na(report)
+    assert len(hidden) == 1
+    assert hidden[0].op_name == "silu"
+
+
 def test_sm90_declared_cells_are_pending_hopper():
     report = build_classified_matrix()
     hopper = [

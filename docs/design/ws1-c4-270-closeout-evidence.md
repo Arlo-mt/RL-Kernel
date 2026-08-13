@@ -134,20 +134,28 @@ The GPU gate also needs shapes the real kernels accept — the deterministic CUD
 attention requires `head_dim == 128`, so the CLI exposes `--n-heads`,
 `--n-kv-heads` and `--head-dim` and defaults to a runnable shape.
 
-## Open finding — CUDA `logprob` has no backward
+## Historical finding — CUDA `logprob` had no backward
 
-`FusedLogpGenericOp` (`rl_engine/kernels/ops/cuda/loss/logp.py:94-133`) calls
-`_C.fused_logp` directly and is not wired through `torch.autograd.Function`, so
-`dlogits` cannot be produced at all. C2 declares `cuda_bf16 / logprob` as
-`declared`, but #270 requires `dlogits` as a stable gradient name on the
-training path. This is the same class as the three Triton `missing_required`
-nodes, except C2 does not record it — so it is a **Blocker candidate**, not a
-`missing_required` row that can simply be tracked.
+> **Historical snapshot only.** This residual was open at the C4 landing
+> (`596feb0`). Current C8 evidence
+> (`docs/design/ws1-c8-274-closeout-evidence.md`,
+> `docs/design/ws1-c8-execute.json`) reports `logp` green on both profiles at
+> source commit `5c33dcd` with manifest `ws1-c2-v7`. Do not treat this section
+> as a live blocker.
 
-## Open finding — RMSNorm `dweight` is not chunk/batch decomposable
+`FusedLogpGenericOp` previously called `_C.fused_logp` without a
+`torch.autograd.Function`, so `dlogits` could not be produced. That gap is
+closed by the row-local FP32 softmax VJP bridge; see `docs/design/ws1-blockers.md`.
 
-`dx` is bitwise invariant across the whole matrix on both profiles. `dweight`
-is not, and the cause is a row-count-dependent accumulation shape:
+## Historical finding — RMSNorm `dweight` is not chunk/batch decomposable
+
+> **Historical snapshot only.** At the C4 landing, kernel-level `dweight` /
+> `dW` accumulation was shape-dependent. The current adapter protocol reduces
+> logical-row FP32 contributions, so C8 evidence no longer treats this as a
+> live red cell. Re-run the C8 sweep for authoritative status.
+
+`dx` was bitwise invariant across the whole matrix on both profiles. Kernel
+`dweight` was not, because of a row-count-dependent accumulation shape:
 
 - CUDA: `csrc/cuda/rmsnorm.cu:71-75` fixes `RMSNORM_DW_ROWS_PER_CHUNK = 256` and
   derives `chunks = ceil(T / 256)`; `rmsnorm_partial_dw_kernel` left-folds rows
@@ -160,18 +168,11 @@ launches re-associates the sum: a left fold over 59 rows is not bitwise equal to
 the sum of left folds over 11 + 16 + 13 + 19 rows. That is precisely the
 `shape_dependent_bwd_accum = forbidden` property the adapter registry declares —
 previously asserted only as a string, never as behaviour. `det_gemm`'s `dW`
-fails the same way on both profiles.
+failed the same way on both profiles at the C4 landing.
 
-Per #266 this is a **Blocker candidate**, not a reason to reopen #145, and per
-the C4 plan (§8) fixing the kernel is outside C4 (audit, not rewrite). Making it
-green requires a `dweight` accumulation whose granularity composes across
-launches — e.g. reducing in fixed row blocks aligned to logical sample
-boundaries rather than to the per-launch row count.
-
-Tracked red (unchanged, not N/A, not a silent pass): Triton `embedding`,
-`lm_head`, and plain `logp` remain C2 `missing_required`. C4 surfaces them in
-the status matrix and refuses to run them, so #270's "CUDA and Triton required
-gradient adapters are complete and green" box stays unticked.
+Historical tracked red at the C4 landing: Triton `embedding`, `lm_head`, and
+plain `logp` were C2 `missing_required`. Those candidates are now declared and
+green in C8 evidence (`docs/design/ws1-c8-execute.json`).
 
 ## Parent boundary
 
