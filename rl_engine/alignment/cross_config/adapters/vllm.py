@@ -16,7 +16,8 @@ actually is:
   ``init_batch_invariance()`` at worker startup.
 
 Like the Megatron adapter, nothing here imports ``vllm``; configs are duck-typed so
-the module is importable anywhere.
+the module is importable anywhere. Configured-only values remain ``UNOBSERVABLE``;
+``APPLIED`` requires an explicit post-execution ``AttentionRuntimeReadback``.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from typing import Any, Optional
 
 from rl_engine.alignment.cross_config.adapters._common import (
     QWEN3_8B,
+    AttentionRuntimeReadback,
     Qwen3ModelSpec,
     application,
     attention_dtype,
@@ -35,6 +37,7 @@ from rl_engine.alignment.cross_config.adapters._common import (
     build_sharding_spec,
     causal_offsets_for,
     flatten,
+    split_kv_spec,
     unsupported_reduction_reason,
 )
 from rl_engine.alignment.cross_config.determinism import DeterminismProbe, vllm_probe_from_env
@@ -204,7 +207,7 @@ class VllmProvenanceAdapter:
 
     @property
     def split_kv_policy(self) -> Optional[int]:
-        """The split-KV knob #235 PR5/PR7 needs; #236 has no field for it yet."""
+        """Diagnostic vLLM maximum split count, not the logical chunk-size contract."""
 
         splits = _value(self.attention_config, "flash_attn_max_num_splits_for_cuda_graph")
         return int(splits) if splits is not None else None
@@ -218,7 +221,7 @@ class VllmProvenanceAdapter:
             "distributed_context_fingerprint": self.distributed_context_fingerprint,
             "frozen_scope_violations": list(self.frozen_scope_violations()),
             "kv_page_size": self.kv_page_size,
-            "split_kv_policy": self.split_kv_policy,
+            "flash_attn_max_num_splits_for_cuda_graph": self.split_kv_policy,
             "determinism": self.determinism_probe().to_dict(),
         }
 
@@ -238,6 +241,7 @@ class VllmRolloutMaterializer:
         mode: AttentionMode = AttentionMode.CHUNKED_PREFILL,
         backend_id: str = "vllm.flash_attn",
         provenance: Optional[VllmProvenanceAdapter] = None,
+        runtime_readback: Optional[AttentionRuntimeReadback] = None,
     ):
         self.model = model
         self.global_sequence_length = global_sequence_length
@@ -246,6 +250,7 @@ class VllmRolloutMaterializer:
         self.mode = mode
         self.backend_id = backend_id
         self.provenance = provenance
+        self.runtime_readback = runtime_readback
 
     @property
     def implementation_fingerprint(self) -> str:
@@ -312,6 +317,7 @@ class VllmRolloutMaterializer:
             causal_offsets=causal_offsets_for(sharding, batch_size),
             sharding=sharding,
             reduction=build_reduction_spec(flat),
+            split_kv=split_kv_spec(flat),
             rope=rope,
             export_lse=True,
         )
@@ -385,14 +391,11 @@ class VllmRolloutMaterializer:
                 )
                 continue
             applications.append(
-                application(
+                self._runtime_application(
                     descriptor,
                     requested,
-                    requested,
-                    requested,
-                    MaterializationStatus.APPLIED,
-                    "bound to the rollout-side attention contract",
-                    frozen_scope_violations=list(scope_violations),
+                    contract=contract,
+                    scope_violations=scope_violations,
                 )
             )
 
@@ -408,6 +411,9 @@ class VllmRolloutMaterializer:
             "attention_mode": self.mode.value,
             "contract": contract.to_dict() if contract is not None else None,
             "contract_error": contract_error or blocked,
+            "runtime_readback": (
+                None if self.runtime_readback is None else self.runtime_readback.to_dict()
+            ),
             "frozen_scope_violations": list(scope_violations),
         }
         if self.provenance is not None:
@@ -439,4 +445,84 @@ class VllmRolloutMaterializer:
                 },
                 runtime_kind=self.runtime_kind,
             ),
+        )
+
+    def _runtime_application(
+        self,
+        descriptor: KnobDescriptor,
+        requested: Any,
+        *,
+        contract: AttentionContract,
+        scope_violations: tuple[str, ...],
+    ) -> KnobApplication:
+        readback = self.runtime_readback
+        if readback is None:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                None,
+                MaterializationStatus.UNOBSERVABLE,
+                "configured in the rollout contract, but no vLLM runtime readback was supplied",
+                frozen_scope_violations=list(scope_violations),
+            )
+        if scope_violations or not readback.frozen_scope_verified:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.UNOBSERVABLE,
+                "vLLM frozen-scope assertions were not all verified by runtime readback",
+                runtime_readback_source=readback.source,
+                frozen_scope_violations=list(scope_violations),
+            )
+        if readback.split_kv_fallback:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.FALLBACK,
+                "vLLM runtime reported a Split-KV fallback",
+                runtime_readback_source=readback.source,
+            )
+        if readback.contract != contract:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.FALLBACK,
+                "vLLM runtime contract differs from the requested contract",
+                runtime_readback_source=readback.source,
+            )
+        if descriptor.path not in readback.actual_knobs:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                None,
+                MaterializationStatus.UNOBSERVABLE,
+                "vLLM runtime readback does not expose this knob",
+                runtime_readback_source=readback.source,
+            )
+        actual = readback.actual_knobs[descriptor.path]
+        status = (
+            MaterializationStatus.APPLIED if actual == requested else MaterializationStatus.FALLBACK
+        )
+        reason = (
+            "verified from the executed vLLM runtime"
+            if status is MaterializationStatus.APPLIED
+            else "vLLM runtime value differs from the requested value"
+        )
+        return application(
+            descriptor,
+            requested,
+            requested,
+            actual,
+            status,
+            reason,
+            runtime_readback_source=readback.source,
+            frozen_scope_violations=list(scope_violations),
         )

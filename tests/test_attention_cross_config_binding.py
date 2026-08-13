@@ -11,6 +11,8 @@ on a 2-node x 2-GPU cluster would never be exercised.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ import pytest
 from rl_engine.alignment.cross_config.adapters import (
     QWEN3_8B,
     WS2_ATTENTION_KNOBS,
+    AttentionRuntimeReadback,
     MegatronAttentionMaterializer,
     MegatronProvenanceAdapter,
     VllmProvenanceAdapter,
@@ -30,6 +33,7 @@ from rl_engine.alignment.cross_config.attention_binding import (
     BindingErrorCode,
     BindingTier,
     bind_attention_contracts,
+    bind_attention_runtime_readbacks,
     first_blocking_issue,
     identity_fingerprint,
     summarize_binding,
@@ -40,7 +44,17 @@ from rl_engine.alignment.cross_config.determinism import (
     vllm_probe_from_env,
 )
 from rl_engine.alignment.cross_config.schema import MaterializationStatus
-from rl_engine.kernels.attention_contract import AttentionContractError, AttentionMode
+from rl_engine.kernels.attention_contract import (
+    AttentionContractError,
+    AttentionMode,
+    AttentionRole,
+    KVCacheSpec,
+    SplitKVExecutionPlan,
+    SplitKVRuntimePlanEntry,
+    SplitKVRuntimePlanSet,
+    SplitKVSpec,
+    build_split_kv_runtime_plan_set,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -50,13 +64,15 @@ TRAINING_KNOBS = {
     "training.tensor_parallel_size": 2,
     "training.context_parallel_size": 2,
     "training.compute_dtype": "bf16",
+    "attention.split_kv_policy": 32,
 }
 
 ROLLOUT_KNOBS = {
     "batch.size": 2,
     "rollout.tensor_parallel_size": 2,
-    "rollout.context_parallel_size": 1,
+    "rollout.context_parallel_size": 2,
     "rollout.dtype": "bf16",
+    "attention.split_kv_policy": 32,
 }
 
 
@@ -86,15 +102,33 @@ def _contracts():
     return rollout, training
 
 
+def _plan_set(contract, *, backend):
+    return build_split_kv_runtime_plan_set(
+        (contract.sharding.global_sequence_length,) * contract.batch_size,
+        tp_world_size=contract.sharding.tp_world_size,
+        cp_world_size=contract.sharding.cp_world_size,
+        split_kv=contract.split_kv,
+        backend=backend,
+    )
+
+
 def _bind(rollout_identity=None, training_identity=None, **kwargs):
     rollout, training = _contracts()
+    rollout = kwargs.pop("rollout_contract", rollout)
+    training = kwargs.pop("training_contract", training)
     return bind_attention_contracts(
-        rollout_contract=kwargs.pop("rollout_contract", rollout),
-        training_contract=kwargs.pop("training_contract", training),
+        rollout_contract=rollout,
+        training_contract=training,
         rollout_identity=rollout_identity if rollout_identity is not None else _identity(),
         training_identity=training_identity if training_identity is not None else _identity(),
         rollout_backend_id="vllm.flash_attn",
         training_backend_id="rlkernel.cp_attention_reference",
+        rollout_split_kv_plan_set=kwargs.pop(
+            "rollout_split_kv_plan_set", _plan_set(rollout, backend="vllm.readback")
+        ),
+        training_split_kv_plan_set=kwargs.pop(
+            "training_split_kv_plan_set", _plan_set(training, backend="megatron.readback")
+        ),
         **kwargs,
     )
 
@@ -104,7 +138,7 @@ def _bind(rollout_identity=None, training_identity=None, **kwargs):
 # --------------------------------------------------------------------------
 
 
-def test_matching_identity_binds_despite_different_materialization():
+def test_matching_identity_and_topology_bind_despite_different_materialization():
     """The core claim of PR4: same identity + same reduction, different runtimes."""
 
     result = _bind()
@@ -112,10 +146,9 @@ def test_matching_identity_binds_despite_different_materialization():
     assert result.comparable
     assert result.passed
     assert result.issues == ()
-    # Training runs CP=2 full prefill, rollout runs CP=1 chunked prefill. Those
-    # differences are recorded, not rejected.
+    # Attention mode is a framework materialization difference, while both sides
+    # execute the same TP=2/CP=2 local ownership and Split-K schedule.
     assert "mode" in result.recorded_differences
-    assert "sharding.cp_world_size" in result.recorded_differences
     assert result.recorded_differences["mode"] == {
         "rollout": "chunked_prefill",
         "training": "prefill",
@@ -259,28 +292,133 @@ def test_batch_size_mismatch_is_not_comparable():
     assert any(issue.field == "batch_size" for issue in result.issues)
 
 
-def test_split_kv_policy_difference_is_recorded():
-    """#236 has no split-KV field, so the adapter supplies it to the recorded tier."""
+def test_missing_split_kv_runtime_evidence_fails_closed():
+    result = _bind(rollout_split_kv_plan_set=None)
 
-    result = _bind(
-        rollout_recorded_extra={"split_kv_policy": 8},
-        training_recorded_extra={"split_kv_policy": None},
+    assert result.comparable
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.SPLIT_KV_RUNTIME_MISSING)
+
+
+def test_split_kv_requested_policy_mismatch_fails_closed():
+    rollout, training = _contracts()
+    rollout = replace(rollout, split_kv=SplitKVSpec.fixed(16))
+    result = _bind(rollout_contract=rollout)
+
+    assert result.comparable
+    assert not result.passed
+    assert any(issue.field == "split_kv" for issue in result.issues)
+
+
+def test_split_kv_runtime_boundary_mismatch_fails_closed():
+    rollout, training = _contracts()
+    mismatched_rollout = build_split_kv_runtime_plan_set(
+        (rollout.sharding.global_sequence_length,) * rollout.batch_size,
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=SplitKVSpec.fixed(16),
+        backend="vllm.readback",
+    )
+    result = _bind(rollout_split_kv_plan_set=mismatched_rollout)
+
+    assert not result.passed
+    issues = result.issues_by_code(BindingErrorCode.SPLIT_KV_MISMATCH)
+    assert any(issue.field == "split_kv_runtime_plan_set" for issue in issues)
+
+
+def test_split_kv_plan_set_must_match_its_own_contract_topology():
+    rollout, _ = _contracts()
+    wrong_topology = build_split_kv_runtime_plan_set(
+        (rollout.sharding.global_sequence_length,) * rollout.batch_size,
+        tp_world_size=1,
+        cp_world_size=2,
+        split_kv=rollout.split_kv,
+        backend="vllm.readback",
     )
 
-    assert result.passed
-    assert result.recorded_differences["split_kv_policy"] == {
-        "rollout": 8,
-        "training": None,
-    }
+    result = _bind(rollout_split_kv_plan_set=wrong_topology)
 
-
-def test_matching_split_kv_policy_is_not_reported_as_a_difference():
-    result = _bind(
-        rollout_recorded_extra={"split_kv_policy": 32},
-        training_recorded_extra={"split_kv_policy": 32},
+    assert not result.passed
+    assert any(
+        issue.field == "rollout.split_kv_runtime_plan_set"
+        for issue in result.issues_by_code(BindingErrorCode.SPLIT_KV_MISMATCH)
     )
 
-    assert "split_kv_policy" not in result.recorded_differences
+
+@pytest.mark.parametrize(
+    ("field_name", "corrupt_value"),
+    [
+        ("merge_order", Enum("BadOrder", {"ARRIVAL": "arrival"}).ARRIVAL),
+        ("acc_dtype", Enum("BadDType", {"BF16": "bf16"}).BF16),
+        ("downcast_at", Enum("BadDowncast", {"PER_BLOCK": "per_block"}).PER_BLOCK),
+    ],
+)
+def test_split_kv_runtime_merge_semantic_corruption_fails_closed(field_name, corrupt_value):
+    rollout, _ = _contracts()
+    corrupted = _plan_set(rollout, backend="vllm.readback")
+    # Runtime reports are deserialized at this boundary. Simulate a corrupted
+    # report after construction to prove binding compares the actual fields.
+    object.__setattr__(corrupted.entries[0].execution, field_name, corrupt_value)
+
+    result = _bind(rollout_split_kv_plan_set=corrupted)
+
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.SPLIT_KV_MISMATCH)
+
+
+def test_split_kv_runtime_fallback_fails_closed():
+    rollout, _ = _contracts()
+    plan_set = _plan_set(rollout, backend="vllm.readback")
+    fallback_entries = []
+    for entry in plan_set.entries:
+        execution = entry.execution
+        fallback_entries.append(
+            SplitKVRuntimePlanEntry(
+                coordinate=entry.coordinate,
+                expected_kv_range=entry.expected_kv_range,
+                execution=SplitKVExecutionPlan(
+                    requested_mode=execution.requested_mode,
+                    requested_split_size=execution.requested_split_size,
+                    actual_mode=execution.actual_mode,
+                    actual_split_size=execution.actual_split_size,
+                    boundaries=execution.boundaries,
+                    merge_order=execution.merge_order,
+                    acc_dtype=execution.acc_dtype,
+                    downcast_at=execution.downcast_at,
+                    backend=execution.backend,
+                    source="runtime_fallback",
+                    fallback=True,
+                    fallback_reason="backend substituted a runtime plan",
+                ),
+            )
+        )
+    fallback = SplitKVRuntimePlanSet(
+        batch_size=plan_set.batch_size,
+        tp_world_size=plan_set.tp_world_size,
+        cp_world_size=plan_set.cp_world_size,
+        total_kv_tokens=plan_set.total_kv_tokens,
+        entries=tuple(fallback_entries),
+    )
+
+    result = _bind(rollout_split_kv_plan_set=fallback)
+
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.SPLIT_KV_FALLBACK)
+
+
+@pytest.mark.parametrize(
+    "rollout_overrides",
+    [
+        {"rollout.tensor_parallel_size": 1},
+        {"rollout.context_parallel_size": 1},
+    ],
+)
+def test_tp_or_cp_topology_mismatch_is_not_comparable(rollout_overrides):
+    rollout = VllmRolloutMaterializer().build_contract({**ROLLOUT_KNOBS, **rollout_overrides})
+    result = _bind(rollout_contract=rollout)
+
+    assert not result.comparable
+    assert result.issues_by_code(BindingErrorCode.TOPOLOGY_MISMATCH)
 
 
 # --------------------------------------------------------------------------
@@ -480,6 +618,175 @@ def _statuses(materialization, path):
     return [app.status for app in materialization.applications if app.path == path]
 
 
+def _readback(materializer, flat, *, source):
+    contract = materializer.build_contract(flat)
+    return AttentionRuntimeReadback(
+        contract=contract,
+        actual_knobs=dict(flat),
+        split_kv_plan_set=_plan_set(contract, backend=source),
+        source=source,
+        frozen_scope_verified=True,
+    )
+
+
+def test_configured_contract_without_runtime_readback_is_unobservable():
+    normalized = {
+        "batch": {"size": 2},
+        "training": {
+            "tensor_parallel_size": 2,
+            "context_parallel_size": 2,
+            "compute_dtype": "bf16",
+        },
+        "attention": {"split_kv_policy": 32},
+    }
+    materialization = MegatronAttentionMaterializer().materialize(normalized, WS2_ATTENTION_KNOBS)
+
+    assert materialization.applications
+    assert {app.status for app in materialization.applications} == {
+        MaterializationStatus.UNOBSERVABLE
+    }
+    assert all(app.actual is None for app in materialization.applications)
+
+
+@pytest.mark.parametrize(
+    ("materializer_type", "flat", "source"),
+    [
+        (MegatronAttentionMaterializer, TRAINING_KNOBS, "megatron.runtime_readback"),
+        (VllmRolloutMaterializer, ROLLOUT_KNOBS, "vllm.runtime_readback"),
+    ],
+)
+def test_runtime_readback_can_verify_materialized_knobs(materializer_type, flat, source):
+    configured = materializer_type()
+    readback = _readback(configured, flat, source=source)
+    materializer = materializer_type(runtime_readback=readback)
+    normalized = {}
+    for path, value in flat.items():
+        section, key = path.split(".", 1)
+        normalized.setdefault(section, {})[key] = value
+
+    materialization = materializer.materialize(normalized, WS2_ATTENTION_KNOBS)
+
+    assert materialization.applications
+    assert {app.status for app in materialization.applications} == {MaterializationStatus.APPLIED}
+    side = "training" if materializer_type is MegatronAttentionMaterializer else "rollout"
+    assert materialization.binding.side_configs[side]["runtime_readback"]["source"] == source
+
+
+def test_runtime_readback_mismatch_is_a_fallback():
+    configured = MegatronAttentionMaterializer()
+    readback = _readback(configured, TRAINING_KNOBS, source="megatron.runtime_readback")
+    actual = dict(readback.actual_knobs)
+    actual["training.context_parallel_size"] = 1
+    mismatched = AttentionRuntimeReadback(
+        contract=readback.contract,
+        actual_knobs=actual,
+        split_kv_plan_set=readback.split_kv_plan_set,
+        source=readback.source,
+        frozen_scope_verified=True,
+    )
+    normalized = {
+        "batch": {"size": 2},
+        "training": {
+            "tensor_parallel_size": 2,
+            "context_parallel_size": 2,
+            "compute_dtype": "bf16",
+        },
+        "attention": {"split_kv_policy": 32},
+    }
+    materialization = MegatronAttentionMaterializer(runtime_readback=mismatched).materialize(
+        normalized, WS2_ATTENTION_KNOBS
+    )
+
+    assert _statuses(materialization, "training.context_parallel_size") == [
+        MaterializationStatus.FALLBACK
+    ]
+
+
+def test_decode_split_kv_plan_set_must_match_kv_cache_lengths():
+    rollout, _ = _contracts()
+    kv_cache = KVCacheSpec(
+        cache_positions=(3, 5),
+        kv_seq_lens=(4, 6),
+        block_table=((0, 1, -1), (2, 3, 4)),
+        global_token_positions=tuple(range(4)) + tuple(range(6)),
+        page_size=2,
+    )
+    decode = replace(
+        rollout,
+        role=AttentionRole.INFER,
+        mode=AttentionMode.DECODE,
+        query_sequence_length=1,
+        causal_offsets=(3, 5),
+        kv_cache=kv_cache,
+    )
+    wrong_lengths = build_split_kv_runtime_plan_set(
+        (4, 8),
+        tp_world_size=2,
+        cp_world_size=2,
+        split_kv=decode.split_kv,
+        backend="vllm.decode.readback",
+    )
+
+    with pytest.raises(ValueError, match="KV-cache lengths"):
+        AttentionRuntimeReadback(
+            contract=decode,
+            actual_knobs={},
+            split_kv_plan_set=wrong_lengths,
+            source="vllm.decode.readback",
+            frozen_scope_verified=True,
+        )
+
+
+def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
+    rollout_materializer = VllmRolloutMaterializer()
+    training_materializer = MegatronAttentionMaterializer()
+    rollout = _readback(rollout_materializer, ROLLOUT_KNOBS, source="vllm.runtime_readback")
+    training = _readback(
+        training_materializer,
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="rlkernel.cp_attention_reference",
+    )
+
+    assert result.passed
+    assert result.provenance["split_kv_runtime"]["rollout"]["coverage"] == (
+        "complete_batch_tp_cp_owner_cartesian_product"
+    )
+
+
+def test_strict_runtime_readback_entrypoint_rejects_unverified_frozen_scope():
+    rollout_materializer = VllmRolloutMaterializer()
+    training_materializer = MegatronAttentionMaterializer()
+    rollout = _readback(rollout_materializer, ROLLOUT_KNOBS, source="vllm.runtime_readback")
+    rollout = replace(rollout, frozen_scope_verified=False)
+    training = _readback(
+        training_materializer,
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="rlkernel.cp_attention_reference",
+    )
+
+    assert result.comparable
+    assert not result.passed
+    assert any(issue.field == "rollout.frozen_scope_verified" for issue in result.issues)
+
+
 def test_arrival_merge_order_is_unsupported_not_silently_corrected():
     """The control group must stay distinguishable from the treatment."""
 
@@ -535,6 +842,7 @@ def test_vllm_cp_falls_back_to_one_in_decode_and_says_why():
     materialization = materializer.materialize(normalized, WS2_ATTENTION_KNOBS)
     contract_error = materialization.binding.side_configs["rollout"]["contract_error"]
     assert "#235 PR6" in contract_error
+    assert MaterializationStatus.APPLIED not in {app.status for app in materialization.applications}
 
 
 def test_decode_contract_is_refused_without_kv_cache_identity():
@@ -613,6 +921,7 @@ def test_vllm_provenance_reads_page_size_and_split_kv_policy():
 
     assert adapter.kv_page_size == 16
     assert adapter.split_kv_policy == 32
+    assert adapter.to_dict()["flash_attn_max_num_splits_for_cuda_graph"] == 32
 
 
 def test_vllm_provenance_flags_fp8_kv_cache_and_cascade_attention():

@@ -40,21 +40,26 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Optional
 
 from rl_engine.kernels.attention_contract import (
     AttentionContract,
+    AttentionContractError,
     AttentionDType,
     AttentionMerge,
     AttentionRole,
     DowncastPoint,
     ReductionOrder,
+    SplitKVRuntimePlanSet,
+    validate_split_kv_plan_set_alignment,
 )
 
 __all__ = [
     "ATTENTION_LSE_DOMAIN",
     "AttentionBindingError",
     "AttentionBindingResult",
+    "AttentionRuntimeReadback",
     "BindingErrorCode",
     "BindingIssue",
     "BindingTier",
@@ -63,8 +68,10 @@ __all__ = [
     "RECORDED_FIELDS",
     "SEMANTIC_CONTRACT_FIELDS",
     "SEMANTIC_REDUCTION_FIELDS",
+    "TOPOLOGY_FIELDS",
     "WS2_ATTENTION_REDUCTION_MANDATE",
     "bind_attention_contracts",
+    "bind_attention_runtime_readbacks",
     "first_blocking_issue",
     "identity_fingerprint",
     "summarize_binding",
@@ -97,6 +104,51 @@ class BindingErrorCode(str, Enum):
     LSE_NOT_EXPORTED = "LSE_NOT_EXPORTED"
     ROLE_COLLISION = "ROLE_COLLISION"
     DETERMINISM_INCOMPATIBLE = "DETERMINISM_INCOMPATIBLE"
+    TOPOLOGY_MISMATCH = "TOPOLOGY_MISMATCH"
+    SPLIT_KV_RUNTIME_MISSING = "SPLIT_KV_RUNTIME_MISSING"
+    SPLIT_KV_MISMATCH = "SPLIT_KV_MISMATCH"
+    SPLIT_KV_FALLBACK = "SPLIT_KV_FALLBACK"
+
+
+@dataclass(frozen=True)
+class AttentionRuntimeReadback:
+    """Actual attention contract and all-rank Split-KV evidence from one engine."""
+
+    contract: AttentionContract
+    actual_knobs: Mapping[str, Any]
+    split_kv_plan_set: SplitKVRuntimePlanSet
+    source: str
+    frozen_scope_verified: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.contract, AttentionContract):
+            raise TypeError("runtime readback contract must be an AttentionContract")
+        if not isinstance(self.actual_knobs, Mapping):
+            raise TypeError("runtime readback actual_knobs must be a mapping")
+        if not isinstance(self.split_kv_plan_set, SplitKVRuntimePlanSet):
+            raise TypeError("runtime readback requires a complete SplitKVRuntimePlanSet")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("runtime readback source must be a non-empty string")
+        if not isinstance(self.frozen_scope_verified, bool):
+            raise TypeError("frozen_scope_verified must be a bool")
+
+        plan_error = _split_kv_plan_contract_error(self.contract, self.split_kv_plan_set)
+        if plan_error is not None:
+            raise ValueError(plan_error)
+        object.__setattr__(self, "actual_knobs", MappingProxyType(dict(self.actual_knobs)))
+
+    @property
+    def split_kv_fallback(self) -> bool:
+        return bool(_split_kv_fallbacks(self.split_kv_plan_set))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "frozen_scope_verified": self.frozen_scope_verified,
+            "contract": self.contract.to_dict(),
+            "actual_knobs": dict(self.actual_knobs),
+            "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
+        }
 
 
 #: Attention exports attention-domain LSE, never vocab-logprob LSE (#235).
@@ -154,6 +206,29 @@ SEMANTIC_REDUCTION_FIELDS: tuple[str, ...] = (
 SEMANTIC_CONTRACT_FIELDS: tuple[str, ...] = ("dtype",)
 
 
+#: Sharding fields that determine local GQA head and sequence ownership. These are
+#: comparison preconditions, not harmless backend provenance: a TP/CP mismatch
+#: means the two ranks did not evaluate the same local attention problem.
+TOPOLOGY_FIELDS: tuple[str, ...] = (
+    "tp_rank",
+    "tp_world_size",
+    "cp_rank",
+    "cp_world_size",
+    "global_q_heads",
+    "global_kv_heads",
+    "local_q_head_start",
+    "local_q_heads",
+    "local_kv_head_start",
+    "local_kv_heads",
+    "global_sequence_length",
+    "local_sequence_length",
+    "global_block_indices",
+    "global_block_token_starts",
+    "local_block_offsets",
+    "packed_sequence_offsets",
+)
+
+
 #: The WS2 mandate itself. ``#236`` currently declares single-member enums for
 #: ``merge`` / ``order`` / ``downcast_at``, so those checks are tautological today;
 #: they are written out anyway so that widening any of those enums later fails here
@@ -181,14 +256,6 @@ RECORDED_FIELDS: tuple[str, ...] = (
     "kv_cache.page_size",
     "kv_cache.prefix_cache_enabled",
     "kv_cache.block_table_shape",
-    "sharding.cp_world_size",
-    "sharding.tp_world_size",
-    "sharding.local_sequence_length",
-    # Supplied by the caller, not by the contract: #236 has no split-KV field yet, so
-    # the value comes from vLLM's flash_attn_max_num_splits_for_cuda_graph via the
-    # adapter. Recorded so split-KV differences are at least visible in provenance
-    # until #236 grows the field and it can move into the contract proper.
-    "split_kv_policy",
 )
 
 
@@ -233,7 +300,7 @@ class AttentionBindingResult:
     binding_fingerprint: str = ""
     recorded_differences: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
-    schema_version: str = "cross_config.attention_binding.v1"
+    schema_version: str = "cross_config.attention_binding.v2"
 
     def issues_by_code(self, code: BindingErrorCode) -> tuple[BindingIssue, ...]:
         return tuple(issue for issue in self.issues if issue.code is code)
@@ -291,9 +358,6 @@ def _recorded_view(
         "mode": contract.mode.value,
         "backend_id": None,
         "reduction.engine": contract.reduction.engine.value,
-        "sharding.cp_world_size": contract.sharding.cp_world_size,
-        "sharding.tp_world_size": contract.sharding.tp_world_size,
-        "sharding.local_sequence_length": contract.sharding.local_sequence_length,
     }
     if rope is not None:
         view.update(
@@ -322,6 +386,69 @@ def _recorded_view(
     return view
 
 
+def _topology_view(contract: AttentionContract) -> dict[str, Any]:
+    sharding = contract.sharding
+    return {name: getattr(sharding, name) for name in TOPOLOGY_FIELDS}
+
+
+def _split_kv_fallbacks(plan_set: SplitKVRuntimePlanSet) -> list[dict[str, Any]]:
+    return [
+        entry.to_dict()
+        for entry in plan_set.entries
+        if entry.execution.fallback
+        or entry.execution.actual_mode is None
+        or entry.execution.actual_mode is not entry.execution.requested_mode
+        or entry.execution.actual_split_size != entry.execution.requested_split_size
+    ]
+
+
+def _split_kv_plan_contract_error(
+    contract: AttentionContract,
+    plan_set: SplitKVRuntimePlanSet,
+) -> str | None:
+    sharding = contract.sharding
+    expected_topology = (
+        contract.batch_size,
+        sharding.tp_world_size,
+        sharding.cp_world_size,
+    )
+    actual_topology = (
+        plan_set.batch_size,
+        plan_set.tp_world_size,
+        plan_set.cp_world_size,
+    )
+    if actual_topology != expected_topology:
+        return (
+            "Split-KV plan-set batch/TP/CP topology does not match the attention "
+            f"contract: actual={actual_topology}, expected={expected_topology}"
+        )
+    if contract.mode.value in {"prefill", "chunked_prefill"}:
+        expected_totals = (sharding.global_sequence_length,) * contract.batch_size
+        if plan_set.total_kv_tokens != expected_totals:
+            return (
+                "Split-KV plan-set KV lengths do not match the prefill attention "
+                f"contract: actual={plan_set.total_kv_tokens}, expected={expected_totals}"
+            )
+    elif contract.kv_cache is not None:
+        expected_totals = contract.kv_cache.kv_seq_lens
+        if plan_set.total_kv_tokens != expected_totals:
+            return (
+                "Split-KV plan-set KV lengths do not match decode KV-cache lengths: "
+                f"actual={plan_set.total_kv_tokens}, expected={expected_totals}"
+            )
+    for entry in plan_set.entries:
+        execution = entry.execution
+        if (
+            execution.requested_mode is not contract.split_kv.mode
+            or execution.requested_split_size != contract.split_kv.fixed_split_size
+        ):
+            return (
+                "Split-KV runtime request does not match the first-class attention "
+                f"contract at {entry.coordinate}"
+            )
+    return None
+
+
 #: Identity fields where ``None`` is a real value rather than an omission. Qwen3-8B
 #: applies no RoPE scaling, so ``rope_scaling=None`` must not read as "undeclared" --
 #: both sides still have to agree on it, which the equality pass below handles.
@@ -347,6 +474,8 @@ def bind_attention_contracts(
     determinism_issues: Sequence[BindingIssue] = (),
     require_full_identity: bool = True,
     allow_dtype_difference: bool = False,
+    rollout_split_kv_plan_set: Optional[SplitKVRuntimePlanSet] = None,
+    training_split_kv_plan_set: Optional[SplitKVRuntimePlanSet] = None,
     rollout_recorded_extra: Optional[Mapping[str, Any]] = None,
     training_recorded_extra: Optional[Mapping[str, Any]] = None,
 ) -> AttentionBindingResult:
@@ -364,9 +493,13 @@ def bind_attention_contracts(
     ``allow_dtype_difference`` exists for the #235 PR5 sweep that deliberately scores
     a BF16 path against an FP32 reference. It must stay ``False`` everywhere else.
 
-    ``rollout_recorded_extra`` / ``training_recorded_extra`` carry materialization
-    facts that #236 does not yet model -- today that is ``split_kv_policy``. They are
-    merged into the recorded tier, never into identity or semantics.
+    Strict binding requires complete actual Split-KV plan sets from both runtimes.
+    A configured policy is insufficient because auto-selection, graph capture, and
+    backend fallbacks can change the executed boundaries. The plan sets cover the
+    complete batch x TP x CP x KV-owner Cartesian product.
+
+    ``rollout_recorded_extra`` / ``training_recorded_extra`` are diagnostic-only
+    backend facts. They can never make a semantic mismatch admissible.
     """
 
     if rollout_contract.role is not AttentionRole.INFER:
@@ -409,6 +542,26 @@ def bind_attention_contracts(
                     message=(
                         f"{name!r} differs between sides; the pair is not comparable "
                         "and any drift computed from it is meaningless"
+                    ),
+                )
+            )
+
+    comparable = not any(issue.tier is BindingTier.IDENTICAL for issue in issues)
+
+    rollout_topology = _topology_view(rollout_contract)
+    training_topology = _topology_view(training_contract)
+    for name in TOPOLOGY_FIELDS:
+        if rollout_topology[name] != training_topology[name]:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.TOPOLOGY_MISMATCH,
+                    tier=BindingTier.IDENTICAL,
+                    field=f"sharding.{name}",
+                    rollout=rollout_topology[name],
+                    training=training_topology[name],
+                    message=(
+                        f"sharding.{name} changes TP/CP ownership; the pair is not "
+                        "the same local attention problem"
                     ),
                 )
             )
@@ -467,6 +620,79 @@ def bind_attention_contracts(
             )
         )
 
+    if rollout_contract.split_kv != training_contract.split_kv:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.SPLIT_KV_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="split_kv",
+                rollout=rollout_contract.split_kv.to_dict(),
+                training=training_contract.split_kv.to_dict(),
+                message="training and rollout must request the same first-class Split-KV policy",
+            )
+        )
+
+    for side, plan_set in (
+        ("rollout", rollout_split_kv_plan_set),
+        ("training", training_split_kv_plan_set),
+    ):
+        if plan_set is None:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.SPLIT_KV_RUNTIME_MISSING,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.split_kv_runtime_plan_set",
+                    message=(
+                        f"{side} did not report a complete actual Split-KV plan set; "
+                        "configured policy alone is not runtime evidence"
+                    ),
+                )
+            )
+            continue
+        contract = rollout_contract if side == "rollout" else training_contract
+        contract_error = _split_kv_plan_contract_error(contract, plan_set)
+        if contract_error is not None:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.SPLIT_KV_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.split_kv_runtime_plan_set",
+                    rollout=plan_set.to_dict() if side == "rollout" else None,
+                    training=plan_set.to_dict() if side == "training" else None,
+                    message=contract_error,
+                )
+            )
+        fallbacks = _split_kv_fallbacks(plan_set)
+        if fallbacks:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.SPLIT_KV_FALLBACK,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.split_kv_runtime_plan_set",
+                    rollout=fallbacks if side == "rollout" else None,
+                    training=fallbacks if side == "training" else None,
+                    message=f"{side} Split-KV runtime used an unknown or fallback plan",
+                )
+            )
+
+    if rollout_split_kv_plan_set is not None and training_split_kv_plan_set is not None:
+        try:
+            validate_split_kv_plan_set_alignment(
+                training_split_kv_plan_set,
+                rollout_split_kv_plan_set,
+            )
+        except AttentionContractError as exc:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.SPLIT_KV_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field="split_kv_runtime_plan_set",
+                    rollout=rollout_split_kv_plan_set.to_dict(),
+                    training=training_split_kv_plan_set.to_dict(),
+                    message=str(exc),
+                )
+            )
+
     for side, contract in (("rollout", rollout_contract), ("training", training_contract)):
         if not contract.export_lse:
             issues.append(
@@ -513,6 +739,14 @@ def bind_attention_contracts(
     provenance = {
         "lse_domain": ATTENTION_LSE_DOMAIN,
         "dtype": training_contract.dtype.value,
+        "split_kv_runtime": {
+            "rollout": (
+                None if rollout_split_kv_plan_set is None else rollout_split_kv_plan_set.to_dict()
+            ),
+            "training": (
+                None if training_split_kv_plan_set is None else training_split_kv_plan_set.to_dict()
+            ),
+        },
         "rollout": {
             "contract": rollout_contract.to_dict(),
             "backend_id": rollout_backend_id,
@@ -535,6 +769,8 @@ def bind_attention_contracts(
             {
                 "identity": identity_fp,
                 "reduction": reduction_fp,
+                "topology": training_topology,
+                "split_kv": provenance["split_kv_runtime"],
                 "lse_domain": ATTENTION_LSE_DOMAIN,
                 "rollout_backend": rollout_backend_id,
                 "training_backend": training_backend_id,
@@ -542,6 +778,47 @@ def bind_attention_contracts(
         ),
         recorded_differences=recorded_differences,
         provenance=provenance,
+    )
+
+
+def bind_attention_runtime_readbacks(
+    *,
+    rollout: AttentionRuntimeReadback,
+    training: AttentionRuntimeReadback,
+    rollout_identity: Mapping[str, Any],
+    training_identity: Mapping[str, Any],
+    rollout_backend_id: str,
+    training_backend_id: str,
+    determinism_issues: Sequence[BindingIssue] = (),
+) -> AttentionBindingResult:
+    """Strict public handoff from executed framework runtimes to PR4 binding.
+
+    The Megatron/vLLM launchers remain environment-owned. Once both launchers have
+    reconstructed their actual contracts and all-rank Split-KV reports, this entry
+    point performs the complete comparison without accepting configured-only data.
+    """
+
+    missing_scope_evidence = []
+    for side, readback in (("rollout", rollout), ("training", training)):
+        if not readback.frozen_scope_verified:
+            missing_scope_evidence.append(
+                BindingIssue(
+                    code=BindingErrorCode.DETERMINISM_INCOMPATIBLE,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.frozen_scope_verified",
+                    message=f"{side} runtime did not verify the frozen attention scope",
+                )
+            )
+    return bind_attention_contracts(
+        rollout_contract=rollout.contract,
+        training_contract=training.contract,
+        rollout_identity=rollout_identity,
+        training_identity=training_identity,
+        rollout_backend_id=rollout_backend_id,
+        training_backend_id=training_backend_id,
+        determinism_issues=tuple(determinism_issues) + tuple(missing_scope_evidence),
+        rollout_split_kv_plan_set=rollout.split_kv_plan_set,
+        training_split_kv_plan_set=training.split_kv_plan_set,
     )
 
 

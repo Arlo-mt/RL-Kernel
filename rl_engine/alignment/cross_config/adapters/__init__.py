@@ -3,7 +3,11 @@
 
 """Runtime adapters for the WS2 Qwen3-8B Megatron + vLLM cross-config target."""
 
-from rl_engine.alignment.cross_config.adapters._common import QWEN3_8B, Qwen3ModelSpec
+from rl_engine.alignment.cross_config.adapters._common import (
+    QWEN3_8B,
+    AttentionRuntimeReadback,
+    Qwen3ModelSpec,
+)
 from rl_engine.alignment.cross_config.adapters.knobs import (
     MEGATRON_ATTENTION_BACKENDS,
     WS2_ATTENTION_KNOB_DESCRIPTORS,
@@ -21,6 +25,7 @@ from rl_engine.alignment.cross_config.adapters.vllm import (
 
 __all__ = [
     "MEGATRON_ATTENTION_BACKENDS",
+    "AttentionRuntimeReadback",
     "MegatronAttentionMaterializer",
     "MegatronProvenanceAdapter",
     "QWEN3_8B",

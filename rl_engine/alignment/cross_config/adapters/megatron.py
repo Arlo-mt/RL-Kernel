@@ -17,10 +17,10 @@ Two things live here:
     CPU model, so nothing had ever materialized a real distributed runtime.
 
 Scope boundary: materialization builds and validates the training-side
-:class:`AttentionContract` and reports what would be constructed. It does not
-launch ``torchrun``, initialize process groups, or execute attention. Binding a
-constructed Megatron model to this contract is the next step and needs the 2-node
-x 2-GPU environment that #239 fixes.
+:class:`AttentionContract` and reports what would be constructed. Without an
+``AttentionRuntimeReadback`` it reports ``UNOBSERVABLE``, never ``APPLIED``. It
+does not launch ``torchrun``, initialize process groups, or execute attention;
+the 2-node x 2-GPU launcher must inject readback collected after execution.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from rl_engine.alignment.cross_config.adapters._common import (
     QWEN3_8B,
+    AttentionRuntimeReadback,
     Qwen3ModelSpec,
     application,
     attention_dtype,
@@ -39,6 +40,7 @@ from rl_engine.alignment.cross_config.adapters._common import (
     build_sharding_spec,
     causal_offsets_for,
     flatten,
+    split_kv_spec,
     unsupported_reduction_reason,
 )
 from rl_engine.alignment.cross_config.determinism import (
@@ -214,6 +216,7 @@ class MegatronAttentionMaterializer:
         cp_rank: int = 0,
         backend_id: str = "rlkernel.cp_attention_reference",
         provenance: Optional[MegatronProvenanceAdapter] = None,
+        runtime_readback: Optional[AttentionRuntimeReadback] = None,
     ):
         self.model = model
         self.global_sequence_length = global_sequence_length
@@ -221,6 +224,7 @@ class MegatronAttentionMaterializer:
         self.cp_rank = cp_rank
         self.backend_id = backend_id
         self.provenance = provenance
+        self.runtime_readback = runtime_readback
 
     @property
     def implementation_fingerprint(self) -> str:
@@ -272,6 +276,7 @@ class MegatronAttentionMaterializer:
             causal_offsets=causal_offsets_for(sharding, batch_size),
             sharding=sharding,
             reduction=build_reduction_spec(flat),
+            split_kv=split_kv_spec(flat),
             rope=rope,
             export_lse=True,
         )
@@ -326,14 +331,11 @@ class MegatronAttentionMaterializer:
                 )
                 continue
             applications.append(
-                application(
+                self._runtime_application(
                     descriptor,
                     requested,
-                    requested,
-                    requested,
-                    MaterializationStatus.APPLIED,
-                    "bound to the training-side attention contract",
-                    frozen_scope_violations=list(scope_violations),
+                    contract=contract,
+                    scope_violations=scope_violations,
                 )
             )
 
@@ -347,6 +349,9 @@ class MegatronAttentionMaterializer:
             "cp_comm_type": flat.get("training.cp_comm_type"),
             "contract": contract.to_dict() if contract is not None else None,
             "contract_error": contract_error or blocked,
+            "runtime_readback": (
+                None if self.runtime_readback is None else self.runtime_readback.to_dict()
+            ),
             "frozen_scope_violations": list(scope_violations),
         }
         if self.provenance is not None:
@@ -378,4 +383,87 @@ class MegatronAttentionMaterializer:
                 },
                 runtime_kind=self.runtime_kind,
             ),
+        )
+
+    def _runtime_application(
+        self,
+        descriptor: KnobDescriptor,
+        requested: Any,
+        *,
+        contract: AttentionContract,
+        scope_violations: tuple[str, ...],
+    ) -> KnobApplication:
+        readback = self.runtime_readback
+        if readback is None:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                None,
+                MaterializationStatus.UNOBSERVABLE,
+                (
+                    "configured in the training contract, but no Megatron runtime "
+                    "readback was supplied"
+                ),
+                frozen_scope_violations=list(scope_violations),
+            )
+        if scope_violations or not readback.frozen_scope_verified:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.UNOBSERVABLE,
+                "Megatron frozen-scope assertions were not all verified by runtime readback",
+                runtime_readback_source=readback.source,
+                frozen_scope_violations=list(scope_violations),
+            )
+        if readback.split_kv_fallback:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.FALLBACK,
+                "Megatron runtime reported a Split-KV fallback",
+                runtime_readback_source=readback.source,
+            )
+        if readback.contract != contract:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                readback.actual_knobs.get(descriptor.path),
+                MaterializationStatus.FALLBACK,
+                "Megatron runtime contract differs from the requested contract",
+                runtime_readback_source=readback.source,
+            )
+        if descriptor.path not in readback.actual_knobs:
+            return application(
+                descriptor,
+                requested,
+                requested,
+                None,
+                MaterializationStatus.UNOBSERVABLE,
+                "Megatron runtime readback does not expose this knob",
+                runtime_readback_source=readback.source,
+            )
+        actual = readback.actual_knobs[descriptor.path]
+        status = (
+            MaterializationStatus.APPLIED if actual == requested else MaterializationStatus.FALLBACK
+        )
+        reason = (
+            "verified from the executed Megatron runtime"
+            if status is MaterializationStatus.APPLIED
+            else "Megatron runtime value differs from the requested value"
+        )
+        return application(
+            descriptor,
+            requested,
+            requested,
+            actual,
+            status,
+            reason,
+            runtime_readback_source=readback.source,
+            frozen_scope_violations=list(scope_violations),
         )

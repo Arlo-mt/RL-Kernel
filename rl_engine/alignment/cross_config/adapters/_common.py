@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from rl_engine.alignment.cross_config.attention_binding import AttentionRuntimeReadback
 from rl_engine.alignment.cross_config.runtime import KnobApplication
 from rl_engine.alignment.cross_config.schema import (
     IsolationScope,
@@ -23,17 +24,20 @@ from rl_engine.kernels.attention_contract import (
     ReductionOrder,
     ReductionSpec,
     ShardingSpec,
+    SplitKVSpec,
 )
 
 __all__ = [
     "QWEN3_8B",
     "Qwen3ModelSpec",
+    "AttentionRuntimeReadback",
     "application",
     "attention_dtype",
     "build_reduction_spec",
     "build_sharding_spec",
     "causal_offsets_for",
     "flatten",
+    "split_kv_spec",
     "unsupported_reduction_reason",
 ]
 
@@ -105,6 +109,20 @@ def attention_dtype(value: Any, *, field: str) -> AttentionDType:
             f"{field}={value!r} is not a supported attention dtype; "
             f"expected one of {sorted(set(_DTYPE_ALIASES))}"
         ) from exc
+
+
+def split_kv_spec(flat: Mapping[str, Any]) -> SplitKVSpec:
+    """Build the first-class logical Split-KV request.
+
+    The integer is a fixed logical KV chunk size in tokens. It is intentionally
+    not vLLM's ``flash_attn_max_num_splits_for_cuda_graph``: that setting is only
+    an upper bound and cannot prove which runtime boundaries executed.
+    """
+
+    split_size = flat.get("attention.split_kv_policy")
+    if split_size is None:
+        return SplitKVSpec.disabled()
+    return SplitKVSpec.fixed(int(split_size))
 
 
 def flatten(value: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:

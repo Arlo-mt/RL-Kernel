@@ -110,10 +110,11 @@ WS2_ATTENTION_KNOB_DESCRIPTORS: tuple[KnobDescriptor, ...] = (
         allowed_values=("unfused_rope_attention", "fused_rope_attention"),
     ),
     KnobDescriptor(
-        # vLLM: AttentionConfig.flash_attn_max_num_splits_for_cuda_graph
+        # Shared logical KV chunk size. Runtime adapters must separately report
+        # the actual per-owner boundaries; a configured value is not evidence.
         "attention.split_kv_policy",
         IsolationScope.ENGINE_CONSTRUCTION,
-        ("rollout",),
+        ("rollout", "training"),
     ),
     KnobDescriptor(
         # vLLM: CacheConfig.block_size -> AttentionContract.kv_cache.page_size

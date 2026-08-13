@@ -27,9 +27,9 @@ tiers, in `rl_engine/alignment/cross_config/attention_binding.py`:
 
 | tier | fields | rule | failure |
 | --- | --- | --- | --- |
-| `IDENTICAL` | checkpoint, model version, weight version, tokenizer, token ids, active mask, position ids, padding side, pre-update state, Q/KV heads, head dim, RoPE theta/scaling/rotary dim, QK-Norm, cached global token positions, KV sequence lengths | equal bit for bit | `comparable=False`; no drift number from the pair means anything |
-| `SEMANTIC` | `reduction.merge`, `reduction.acc_dtype`, `reduction.order`, `reduction.downcast_at`, `export_lse`, cross-side determinism mode | both sides equal **and** equal to the WS2 mandate | fail closed |
-| `RECORDED` | `mode`, `backend_id`, `reduction.engine`, RoPE materialization state and fusion boundary, KV-cache paging, CP/TP world sizes, local sequence length | free to differ | none; recorded into provenance and measured |
+| `IDENTICAL` | checkpoint/model/token identity plus complete TP/CP GQA head and sequence ownership | equal bit for bit | `comparable=False`; no drift number from the pair means anything |
+| `SEMANTIC` | reduction contract, dtype, exported LSE, first-class Split-KV request, complete actual Split-KV plan sets, cross-side determinism | both sides equal **and** equal to the WS2 mandate | fail closed |
+| `RECORDED` | `mode`, `backend_id`, `reduction.engine`, RoPE materialization state and fusion boundary, KV-cache paging | free to differ | recorded into provenance and measured |
 
 Two placements are load-bearing:
 
@@ -37,9 +37,13 @@ Two placements are load-bearing:
   deterministic reference while rollout runs a Transformer Engine merge oracle.
   Forcing them equal would defeat the oracle comparison that #235 PR2/PR3/PR5/PR6
   depend on.
-* **`reduction.order` and `reduction.acc_dtype` are `SEMANTIC`.** This is the entire
-  WS2 claim: merge order and accumulation precision are decided by the contract, not
-  by whichever backend happens to be selected.
+* **TP/CP topology is `IDENTICAL`, not `RECORDED`.** TP selects local Qwen3 GQA head
+  ownership and CP selects local sequence ownership. Different topology is a
+  different local attention problem, not a backend detail.
+* **`reduction.order`, `reduction.acc_dtype`, and actual Split-KV schedules are
+  `SEMANTIC`.** Both runtimes must export the complete batch x TP x CP x KV-owner
+  plan set, including logical boundaries, merge order, FP32 accumulation, final
+  downcast, and fallback state. Configured policy alone never passes strict binding.
 
 `comparable` and `passed` are separate flags. A pair with mismatched identity is not
 comparable. A pair that is comparable but violates the reduction mandate is still
@@ -75,10 +79,16 @@ adapters:
 * `adapters/megatron.py` -- `MegatronProvenanceAdapter` (construction and
   distributed-context fingerprints, determinism probe, frozen-scope assertions) and
   `MegatronAttentionMaterializer`.
-* `adapters/vllm.py` -- `VllmProvenanceAdapter` (adds `kv_page_size` from
-  `CacheConfig.block_size` and `split_kv_policy` from
-  `AttentionConfig.flash_attn_max_num_splits_for_cuda_graph`) and
-  `VllmRolloutMaterializer`.
+* `adapters/vllm.py` -- `VllmProvenanceAdapter` (including diagnostic vLLM split
+  limits) and `VllmRolloutMaterializer`.
+* `AttentionRuntimeReadback` -- the explicit handoff from an executed engine. It
+  carries the reconstructed actual contract, actual knob values, frozen-scope
+  verification, and the complete Split-KV runtime plan set.
+
+Constructing a contract is not runtime verification. Without a readback, adapter
+applications are `UNOBSERVABLE`; only matching values reconstructed from a real
+Megatron or vLLM execution are `APPLIED`. `bind_attention_runtime_readbacks` is the
+strict public entry point used after both framework launchers collect that evidence.
 
 Neither module imports `megatron` or `vllm`; configs are duck-typed, so the binding
 rules are exercised on CPU in CI rather than only on a 2-node cluster.
@@ -94,7 +104,9 @@ collapsing them onto the supported value:
 | `attention.reduction_downcast_at=per_block` | `UNSUPPORTED` | `DowncastPoint` declares only `final_write` |
 | `attention.reduction_engine=te_oracle` | `UNSUPPORTED` | the TE merge oracle lands in #235 PR2/PR3; PR4's TE plan is provenance only |
 | `attention.reduction_acc_dtype=bf16` | `UNSUPPORTED` | the CP `(out, lse)` merge accumulates in FP32 |
-| `rollout.context_parallel_size>1` with `mode=decode` | `FALLBACK` | vLLM CP covers prefill only; recorded with the reason |
+| configured contract without runtime readback | `UNOBSERVABLE` | requested values do not prove what executed |
+| `rollout.context_parallel_size>1` with effective decode CP=1 | `ERROR`/`FALLBACK` | strict TP=2/CP=2 acceptance rejects the topology change |
+| missing/mismatched/fallback Split-KV plan set | binding failure | Split-KV provenance must cover every batch/TP/CP/owner coordinate |
 
 ## Knobs
 
