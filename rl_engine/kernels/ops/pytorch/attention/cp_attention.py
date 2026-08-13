@@ -973,6 +973,7 @@ def split_kv_execution_plan_provenance(
     for owner_cp_rank, (rank_start, rank_end) in enumerate(_split_bounds(length, cp_world_size)):
         if rank_start == rank_end:
             continue
+        boundaries: tuple[tuple[int, int], ...]
         if kv_chunk_size is None:
             boundaries = ((rank_start, rank_end),)
             mode = SplitKVMode.DISABLED
@@ -1019,6 +1020,7 @@ def build_reference_split_kv_runtime_plan_set(
         for tp_rank in range(tp_world_size):
             for cp_rank in range(cp_world_size):
                 for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    boundaries: tuple[tuple[int, int], ...]
                     if kv_chunk_size is None:
                         mode = SplitKVMode.DISABLED
                         boundaries = ((owner_start, owner_end),)
