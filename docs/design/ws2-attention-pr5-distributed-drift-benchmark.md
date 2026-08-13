@@ -30,9 +30,11 @@ The report separates two drift classes:
 | `backward` | Optional PR8 `dq/dk/dv` drift report when `--include-backward` is used. |
 | `distributed_p2p_reference` | Real NCCL P2P partial-state gather, FP32 merge, and query scatter drift. |
 
-Selected-logprob `dlogp` remains `not_available` here because the full logprob
-chain integration is outside PR5. PR4/WS2 runtime integration should fill that
-field once Attention is wired into the chain.
+With `--include-dlogp`, PR5 projects both Attention outputs through the same
+deterministic synthetic FP32 lm_head and reports active-token selected-logprob
+drift. This closes the operator-attribution leg without pretending to replace
+PR4's full Qwen3 model/runtime integration. Without that flag, dlogp is recorded
+as `not_requested` rather than silently omitted.
 
 ## Commands
 
@@ -51,8 +53,33 @@ python benchmarks/benchmark_ws2_cp_attention_drift.py \
   --cp-world-sizes 2 \
   --kv-chunk-sizes none,1 \
   --include-backward \
+  --include-dlogp \
   --output artifacts/ws2-cp-attention-drift.json
 ```
+
+Strict GPU acceptance manifest (expected to fail until every required GPU/NCCL
+case and the self-owned CUDA AG/RS operators are executable):
+
+```bash
+python scripts/ws2_attention_gpu_acceptance.py \
+  --mode manifest \
+  --output artifacts/ws2-attention-acceptance-manifest.json
+```
+
+Strict GPU run after stacking the issue #235 implementation PRs in one checkout:
+
+```bash
+python scripts/ws2_attention_gpu_acceptance.py \
+  --mode run \
+  --output artifacts/ws2-attention-gpu-acceptance.json
+```
+
+The orchestrator requires the Qwen3-8B `TP=2, CP=2, BF16` matrix, full and
+chunked prefill, FlashInfer paged prefill/decode with disabled and fixed
+Split-K, attention-domain `out/lse`, active-token `dlogp`, PR8 `dq/dk/dv`,
+batch/page-layout invariance, the P2P NCCL reference, and the self-owned CUDA
+AG/RS path. Missing scripts, dry-runs, requested-only Split-K provenance,
+skipped collectives, or unavailable metrics fail closed.
 
 Two-GPU NCCL transport check:
 
@@ -127,3 +154,6 @@ Each case records topology, RoPE/cache provenance, split-KV policy, block
 metadata hash, drift summaries, per-logical-CP-rank metrics, and optional
 backward drift. The merge order is always `global_block_index`, and
 `downcast_at` is always `final_write`.
+
+The PR5 report schema is `ws2_cp_attention_drift/v2`. The strict aggregate
+report schema is `ws2_attention_gpu_acceptance/v1`.

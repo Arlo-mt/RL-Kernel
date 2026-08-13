@@ -40,7 +40,7 @@ def test_smoke_report_has_pr5_schema_and_qwen3_tp2_cp2_case():
     assert report["target"]["global_num_query_heads"] == 32
     assert report["target"]["global_num_kv_heads"] == 8
     assert report["te_context_parallel_merge"]["te_module"].endswith("context_parallel")
-    assert report["dlogp"]["status"] == "not_available"
+    assert report["dlogp"]["status"] == "not_requested"
     assert len(report["cases"]) == 2
 
     names = {case["case_name"] for case in report["cases"]}
@@ -76,6 +76,33 @@ def test_smoke_report_has_pr5_schema_and_qwen3_tp2_cp2_case():
     assert chunked["merge_order_probe"]["out"]["max_abs"] == 0.0
     assert len(chunked["per_rank"]) == 2
     assert chunked["per_rank"][0]["out"]["active_count"] > 0
+    assert chunked["dlogp"]["status"] == "not_requested"
+
+
+def test_include_dlogp_reports_active_selected_token_drift():
+    report = run_benchmark(
+        parse_args(
+            [
+                "--smoke",
+                "--include-dlogp",
+                "--tp-world-sizes",
+                "2",
+                "--cp-world-sizes",
+                "2",
+                "--kv-chunk-sizes",
+                "none,1",
+            ]
+        )
+    )
+
+    assert report["dlogp"]["status"] == "requested"
+    for case in report["cases"]:
+        dlogp = case["dlogp"]
+        assert dlogp["status"] == "available"
+        assert dlogp["projection"] == "synthetic_fp32_lm_head_projection"
+        assert dlogp["active_token_count"] == 3
+        assert dlogp["drift"]["active_count"] == 3
+        assert dlogp["drift"]["max_abs"] >= 0.0
 
 
 def test_report_writes_reproducible_json_artifact(tmp_path):

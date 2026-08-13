@@ -76,7 +76,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         reports: list[dict[str, object] | None] = [None] * world_size
         dist.all_gather_object(reports, result)
         if rank == 0:
-            print(json.dumps({"ranks": reports}, indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
+                        "backend": str(dist.get_backend()),
+                        "world_size": world_size,
+                        "global_failure_count": int(failures.item()),
+                        "ranks": reports,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         return 0 if int(failures.item()) == 0 else 1
     finally:
         dist.destroy_process_group()
@@ -183,6 +195,7 @@ def run_check(
         "downcast_at": "final_write",
         "transport": "p2p_nccl_reference",
         "query_range": [start, end],
+        "world_size": 2,
         "gathered_block_indices": gathered_indices,
         "out_max_abs": out_max_abs,
         "lse_max_abs": lse_max_abs,

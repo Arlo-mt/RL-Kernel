@@ -38,17 +38,10 @@ from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     merge_attention_partial_states,
     split_kv_execution_plan_provenance,
 )
-from rl_engine.kernels.ops.cuda.attention.cp_comm import (
-    AttentionCPBlockMetadata,
-    AttentionCPCommunicationPlan,
-    AttentionCPMergedState,
-    AttentionCPPartialState,
-    AttentionParallelSpec,
-    P2PNCCLAttentionCPCommunication,
-)
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
+from rl_engine.testing.reference_ops import selected_logprobs_reference
 
-SCHEMA_VERSION = "ws2_cp_attention_drift/v1"
+SCHEMA_VERSION = "ws2_cp_attention_drift/v2"
 ISSUE = 235
 PR = 5
 DEFAULT_SEQ_LEN = 16
@@ -221,6 +214,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Include optional PR8 dq/dk/dv drift fields.",
     )
     parser.add_argument(
+        "--include-dlogp",
+        action="store_true",
+        help=(
+            "Project attention outputs through a deterministic synthetic lm_head "
+            "and report active-token dlogp drift."
+        ),
+    )
+    parser.add_argument(
         "--no-rope",
         action="store_false",
         dest="compose_rope",
@@ -271,8 +272,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         },
         "te_context_parallel_merge": te_status,
         "dlogp": {
-            "status": "not_available",
-            "reason": "selected-logprob chain integration is outside PR5 benchmark scope",
+            "status": "requested" if args.include_dlogp else "not_requested",
+            "reason": None
+            if args.include_dlogp
+            else "selected-logprob chain was not requested",
+            "source": "synthetic_fp32_lm_head_projection",
         },
         "cases": cases,
     }
@@ -291,6 +295,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
                                 cp_world_size=cp_world_size,
                                 kv_chunk_size=kv_chunk_size,
                                 te_adapter=te_adapter,
+                                include_dlogp=args.include_dlogp,
                             )
                         )
     finally:
@@ -329,6 +334,7 @@ def _run_case(
     cp_world_size: int,
     kv_chunk_size: int | None,
     te_adapter: TEContextParallelMergeAdapter | None,
+    include_dlogp: bool,
 ) -> dict[str, object]:
     _validate_topology(tp_world_size, cp_world_size)
     dtype = _dtype_from_name(args.dtype)
@@ -390,6 +396,16 @@ def _run_case(
         cp_world_size=cp_world_size,
         kv_chunk_size=kv_chunk_size,
         backend="deterministic_cp_reference",
+    )
+    dlogp_report = _dlogp_report(
+        candidate_dtype_out,
+        reference_out,
+        batch=args.batch,
+        seq_len=seq_len,
+        local_hidden=local_hq * QWEN3_8B_HEAD_DIM,
+        seed=case_seed + 101,
+        device=device,
+        enabled=include_dlogp,
     )
     case: dict[str, object] = {
         "case_name": _case_name(tp_world_size, cp_world_size, kv_chunk_size, args.dtype),
@@ -476,6 +492,7 @@ def _run_case(
             cp_world_size,
         ),
         "backward": {"status": "not_requested"},
+        "dlogp": dlogp_report,
     }
     distributed_reference = _run_distributed_p2p_reference(
         q,
@@ -547,6 +564,24 @@ def _run_distributed_p2p_reference(
             "reason": "WORLD_SIZE must equal cp_world_size for the CP reference",
             "world_size": world_size,
             "cp_world_size": cp_world_size,
+        }
+
+    try:
+        from rl_engine.kernels.ops.cuda.attention.cp_comm import (
+            AttentionCPBlockMetadata,
+            AttentionCPCommunicationPlan,
+            AttentionCPMergedState,
+            AttentionCPPartialState,
+            AttentionParallelSpec,
+            P2PNCCLAttentionCPCommunication,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "rl_engine.kernels.ops.cuda.attention.cp_comm":
+            raise
+        return {
+            "status": "unavailable",
+            "reason": "PR7 CP communication module is not present in this checkout",
+            "required_dependency": "#279",
         }
 
     rank = int(dist.get_rank())
@@ -910,6 +945,72 @@ def _drift_stats(candidate: torch.Tensor, reference: torch.Tensor) -> dict[str, 
         "p95_abs": float(torch.quantile(diff, 0.95).item()),
         "p99_abs": float(torch.quantile(diff, 0.99).item()),
         "active_count": active_count,
+    }
+
+
+def _dlogp_report(
+    candidate_out: torch.Tensor,
+    reference_out: torch.Tensor,
+    *,
+    batch: int,
+    seq_len: int,
+    local_hidden: int,
+    seed: int,
+    device: torch.device,
+    enabled: bool,
+) -> dict[str, object]:
+    """Run the selected-token log-probability leg on the attention outputs.
+
+    The benchmark intentionally uses a small deterministic synthetic projection,
+    but performs both logits and log-softmax in FP32 so the reported value isolates
+    attention drift instead of a second dtype/reduction difference in the checker.
+    """
+
+    if not enabled:
+        return {
+            "status": "not_requested",
+            "reason": "use --include-dlogp to exercise the selected-logprob chain",
+        }
+    if candidate_out.shape != reference_out.shape:
+        raise ValueError(
+            "candidate and reference attention outputs must have matching shapes"
+        )
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    vocab_size = 17
+    weight = torch.randn(
+        vocab_size,
+        local_hidden,
+        generator=generator,
+        dtype=torch.float32,
+    ).to(device=device)
+    target_ids = torch.arange(batch * seq_len, device=device, dtype=torch.long).reshape(
+        batch, seq_len
+    ) % vocab_size
+    active_mask = torch.ones((batch, seq_len), device=device, dtype=torch.bool)
+    if seq_len > 1:
+        active_mask[:, 0] = False
+
+    def project(out: torch.Tensor) -> torch.Tensor:
+        hidden = out.float().transpose(1, 2).reshape(batch, seq_len, local_hidden)
+        logits = torch.matmul(hidden, weight.transpose(0, 1))
+        return selected_logprobs_reference(
+            logits,
+            target_ids,
+            mask=active_mask,
+            output_dtype=torch.float32,
+        )
+
+    candidate_logp = project(candidate_out)
+    reference_logp = project(reference_out)
+    return {
+        "status": "available",
+        "projection": "synthetic_fp32_lm_head_projection",
+        "vocab_size": vocab_size,
+        "active_token_count": int(active_mask.sum().item()),
+        "drift": _drift_stats(
+            candidate_logp[active_mask],
+            reference_logp[active_mask],
+        ),
     }
 
 
