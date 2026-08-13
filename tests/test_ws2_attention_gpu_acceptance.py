@@ -117,7 +117,10 @@ def _valid_pr5_report():
                             "actual_split_boundaries": (
                                 [owner_range]
                                 if split_size is None
-                                else [[owner_range[0], owner_range[0] + 1], [owner_range[0] + 1, owner_range[1]]]
+                                else [
+                                    [owner_range[0], owner_range[0] + 1],
+                                    [owner_range[0] + 1, owner_range[1]],
+                                ]
                             ),
                             "split_kv_merge_order": "global_block_index",
                             "split_kv_accum_dtype": "fp32",

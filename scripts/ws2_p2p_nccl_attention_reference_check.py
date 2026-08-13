@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.kernels.ops.cuda.attention.cp_comm import (
+from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
     AttentionCPMergedState,
@@ -33,7 +33,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionParallelSpec,
     P2PNCCLAttentionCPCommunication,
 )
-from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+from rl_engine.kernels.ops.pytorch.attention.cp_attention import (  # noqa: E402
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
     merge_attention_partial_states,
@@ -187,9 +187,7 @@ def run_check(
     lse_max_abs = float((local.lse - full_lse[:, :, start:end]).abs().max().item())
     final_out = local.out.to(q.dtype)
     expected_final_out = full_out[:, :, start:end, :].to(q.dtype)
-    final_out_max_abs = float(
-        (final_out.float() - expected_final_out.float()).abs().max().item()
-    )
+    final_out_max_abs = float((final_out.float() - expected_final_out.float()).abs().max().item())
     gathered_indices = [state.block.global_block_index for state in gathered]
     passed = (
         gathered_indices == list(range(len(blocks)))

@@ -30,7 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+from rl_engine.kernels.ops.pytorch.attention.cp_attention import (  # noqa: E402
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
     build_reference_split_kv_runtime_plan_set,
@@ -38,8 +38,8 @@ from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     merge_attention_partial_states,
     split_kv_execution_plan_provenance,
 )
-from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
-from rl_engine.testing.reference_ops import selected_logprobs_reference
+from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp  # noqa: E402
+from rl_engine.testing.reference_ops import selected_logprobs_reference  # noqa: E402
 
 SCHEMA_VERSION = "ws2_cp_attention_drift/v2"
 ISSUE = 235
@@ -273,9 +273,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, object]:
         "te_context_parallel_merge": te_status,
         "dlogp": {
             "status": "requested" if args.include_dlogp else "not_requested",
-            "reason": None
-            if args.include_dlogp
-            else "selected-logprob chain was not requested",
+            "reason": None if args.include_dlogp else "selected-logprob chain was not requested",
             "source": "synthetic_fp32_lm_head_projection",
         },
         "cases": cases,
@@ -972,9 +970,7 @@ def _dlogp_report(
             "reason": "use --include-dlogp to exercise the selected-logprob chain",
         }
     if candidate_out.shape != reference_out.shape:
-        raise ValueError(
-            "candidate and reference attention outputs must have matching shapes"
-        )
+        raise ValueError("candidate and reference attention outputs must have matching shapes")
     generator = torch.Generator(device="cpu").manual_seed(seed)
     vocab_size = 17
     weight = torch.randn(
@@ -983,9 +979,10 @@ def _dlogp_report(
         generator=generator,
         dtype=torch.float32,
     ).to(device=device)
-    target_ids = torch.arange(batch * seq_len, device=device, dtype=torch.long).reshape(
-        batch, seq_len
-    ) % vocab_size
+    target_ids = (
+        torch.arange(batch * seq_len, device=device, dtype=torch.long).reshape(batch, seq_len)
+        % vocab_size
+    )
     active_mask = torch.ones((batch, seq_len), device=device, dtype=torch.bool)
     if seq_len > 1:
         active_mask[:, 0] = False

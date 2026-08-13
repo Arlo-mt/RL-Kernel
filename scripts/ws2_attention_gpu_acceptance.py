@@ -497,7 +497,9 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             assert isinstance(block_manifest, list)
             gathered_manifests.append(block_manifest)
         for name in ("out_max_abs", "lse_max_abs"):
-            errors.extend(_scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}"))
+            errors.extend(
+                _scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}")
+            )
         errors.extend(
             _scalar_threshold_errors(
                 row.get("final_out_max_abs"),
@@ -539,7 +541,9 @@ def _validate_p2p_block_manifest(manifest: Any) -> tuple[list[str], list[int] | 
             errors.append(f"manifest block {index} is missing required metadata")
             continue
         values = {name: block[name] for name in required}
-        if not all(isinstance(value, int) and not isinstance(value, bool) for value in values.values()):
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in values.values()
+        ):
             errors.append(f"manifest block {index} metadata must contain integers")
             continue
         global_index = values["global_block_index"]
@@ -616,7 +620,9 @@ def _validate_runtime_plan_set(
     if not (
         isinstance(totals, list)
         and len(totals) == expected_batch
-        and all(isinstance(total, int) and not isinstance(total, bool) and total > 0 for total in totals)
+        and all(
+            isinstance(total, int) and not isinstance(total, bool) and total > 0 for total in totals
+        )
     ):
         errors.append(f"{label} total_kv_tokens is invalid")
         return errors
@@ -639,12 +645,10 @@ def _validate_runtime_plan_set(
             errors.append(f"{entry_label} is not an object")
             continue
         coordinate_values = tuple(
-            entry.get(key)
-            for key in ("batch_index", "tp_rank", "cp_rank", "owner_cp_rank")
+            entry.get(key) for key in ("batch_index", "tp_rank", "cp_rank", "owner_cp_rank")
         )
         if not all(
-            isinstance(value, int) and not isinstance(value, bool)
-            for value in coordinate_values
+            isinstance(value, int) and not isinstance(value, bool) for value in coordinate_values
         ):
             errors.append(f"{entry_label} coordinate must contain integers")
             continue
@@ -658,7 +662,9 @@ def _validate_runtime_plan_set(
         if not (
             isinstance(expected_range, list)
             and len(expected_range) == 2
-            and all(isinstance(value, int) and not isinstance(value, bool) for value in expected_range)
+            and all(
+                isinstance(value, int) and not isinstance(value, bool) for value in expected_range
+            )
             and 0 <= expected_range[0] < expected_range[1] <= totals[batch_index]
         ):
             errors.append(f"{entry_label} expected_kv_range is invalid")
@@ -692,7 +698,9 @@ def _validate_runtime_plan_set(
             if not (
                 isinstance(boundary, list)
                 and len(boundary) == 2
-                and all(isinstance(value, int) and not isinstance(value, bool) for value in boundary)
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool) for value in boundary
+                )
                 and boundary[0] == cursor
                 and boundary[0] < boundary[1] <= expected_range[1]
             ):
@@ -715,13 +723,15 @@ def _validate_runtime_plan_set(
                 owner_range = owner_ranges.get((batch_index, tp_rank, owner_cp_rank))
                 if owner_range is None or owner_range[0] != cursor:
                     errors.append(
-                        f"{label} owner ranges are not contiguous for batch={batch_index}, tp={tp_rank}"
+                        f"{label} owner ranges are not contiguous for "
+                        f"batch={batch_index}, tp={tp_rank}"
                     )
                     break
                 cursor = owner_range[1]
             if cursor != totals[batch_index]:
                 errors.append(
-                    f"{label} owner ranges do not cover total KV for batch={batch_index}, tp={tp_rank}"
+                    f"{label} owner ranges do not cover total KV for "
+                    f"batch={batch_index}, tp={tp_rank}"
                 )
     return errors
 
