@@ -88,6 +88,8 @@ def _spec_args(op: str) -> argparse.Namespace:
         normalized_dim=8,
         k_dim=8,
         n_dim=8,
+        n_heads=2,
+        head_dim=8,
         theta=1.0e6,
         eps=1.0e-6,
     )
@@ -143,9 +145,9 @@ def test_lm_head_native_candidate_suite_passes_issue_108_helper():
 
 
 def test_issue151_ops_pass_shared_issue_108_spec_path():
-    assert {"embedding", "lm_head"}.issubset(operator_names())
+    assert {"embedding", "lm_head", "qk_norm", "pack"}.issubset(operator_names())
 
-    for op_name in ("embedding", "lm_head"):
+    for op_name in ("embedding", "lm_head", "qk_norm", "pack"):
         args = _spec_args(op_name)
         report = run_operator_suite(
             op_name,

@@ -101,8 +101,17 @@ rms_norm, qk_norm, attention, logp, linear_logp, embedding, lm_head,
 det_gemm, rope, silu, swiglu, batch_invariant_logp, pack
 ```
 
-`qk_norm` reuses the `rms_norm` spec. `pack` is layout-supported and is covered by
-the C3/C4 CPU contract tests, not a per-profile GPU CLI cell.
+`qk_norm` is a first-class `OP_SPECS` key that reuses the RMSNorm kernels on
+`head_dim` (per-head), not the full hidden width.
+
+`pack` is a WS1 layout helper, not a per-profile CUDA/Triton kernel. It is in
+`OP_SPECS` so `check_operator.py --op pack` and the C3/C4 CPU adapters can
+prove logical packing/unpacking. C8 marks every pack cell **N/A** with that
+C2/C4 reason.
+
+`linear_logp` is registered for the CLI but is **not** a WS1 required chain
+node. C2 status is `optional_fused_path`; C4 is `optional_fused`; C8 does not
+require a four-judgment row.
 
 ---
 
@@ -255,8 +264,10 @@ report = assert_gradient_batch_invariant(
 )
 ```
 
-The three logprob aggregates judge **outputs only**. Gradient pass/fail uses only
-`gradient_accuracy` / `gradient_invariance`. GPU evidence:
+`max_abs_dlogp`, `approx_kl0`, and `clipfrac0` are the **sole** chain-level
+logprob / ablation aggregates. The three aggregates judge **outputs only**.
+Gradient pass/fail uses only independent `gradient_accuracy` /
+`gradient_invariance` verdicts. GPU evidence:
 
 ```bash
 python scripts/check_gradient_invariance.py \

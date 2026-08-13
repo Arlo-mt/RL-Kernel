@@ -113,16 +113,6 @@ def _cases_for(manifest: WS1Manifest, *, op_name: str, profile: str) -> dict[str
             found["short"] = case
         elif fixture.startswith("rep_"):
             found["primary"] = case
-    # Plain and batch-invariant selected-logprob use the same logical
-    # representative fixture when a profile declares only one implementation.
-    # The candidate/path check below still rejects a mismatched backend rather
-    # than silently borrowing a cross-profile implementation.
-    if not found and op_name in {"logp", "batch_invariant_logp"}:
-        for case in manifest.representative_cases:
-            if profile not in case.get("profile_ids", ()) or case.get("family") != "logprob":
-                continue
-            fixture = case["fixture_id"]
-            found["short" if fixture.startswith("short_") else "primary"] = case
     return found
 
 

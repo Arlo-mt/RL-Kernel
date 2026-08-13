@@ -360,7 +360,7 @@ def test_triton_attention_all_false_key_padding_mask_row_matches_native():
 
 
 @requires_cuda
-def test_triton_attention_backward_uses_reference_fallback():
+def test_triton_attention_backward_matches_native_vjp():
     dtype = torch.bfloat16
     q, k, v = _qkv(1, 8, 8, dtype=dtype, seed=7)
     dy = torch.randn_like(q)
@@ -374,6 +374,9 @@ def test_triton_attention_backward_uses_reference_fallback():
     torch.testing.assert_close(dq.float(), ref_dq.float(), atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(dk.float(), ref_dk.float(), atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(dv.float(), ref_dv.float(), atol=5e-2, rtol=2e-2)
+    import rl_engine.kernels.ops.triton.attention.standard_attn as attn_mod
+
+    assert not hasattr(attn_mod, "NativeAttentionOp")
 
 
 @requires_cuda

@@ -42,12 +42,20 @@ C4 = REPO_ROOT / "scripts" / "check_gradient_invariance.py"
 C2_CASE = REPO_ROOT / "scripts" / "ws1_candidate_evidence.py"
 
 
-def _classify_process(returncode: int, output: str, *, kind: str) -> tuple[str, str]:
+def _classify_process(
+    returncode: int, output: str, *, kind: str, hopper: bool = False
+) -> tuple[str, str]:
     if returncode == 0:
         return "green", f"{kind} gate passed"
     if "has no backward" in output:
         return "red", "candidate is not wired through torch.autograd"
-    if "fallback forbidden" in output or "is not compiled" in output or "cuda-sm90" in output:
+    hopper_needed = (
+        "is not compiled" in output
+        or "needs a Hopper" in output
+        or "requires Hopper" in output
+        or "fallback forbidden" in output
+    )
+    if hopper_needed and not hopper:
         return "pending_hopper", "declared candidate needs a Hopper build"
     if "missing_required" in output:
         return "red", "C2 marks this node missing_required"
@@ -56,7 +64,31 @@ def _classify_process(returncode: int, output: str, *, kind: str) -> tuple[str, 
     return "red", output.strip().splitlines()[-1][:200] if output.strip() else f"{kind} gate failed"
 
 
-def _run_gate(script: pathlib.Path, op_name: str, candidate: str, profile: str) -> tuple[int, str]:
+def _parse_json_blob(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _observed_from_gate(payload: dict[str, Any] | None) -> dict[str, str] | None:
+    if not payload:
+        return None
+    provenance = payload.get("backend_provenance") or {}
+    backend = provenance.get("actual_backend") or payload.get("observed_actual_backend")
+    kernel = payload.get("observed_kernel_id")
+    if not backend or not kernel:
+        return None
+    return {"backend": str(backend), "kernel": str(kernel)}
+
+
+def _run_gate(
+    script: pathlib.Path, op_name: str, candidate: str, profile: str
+) -> tuple[int, str, dict[str, Any] | None]:
     proc = subprocess.run(
         [
             sys.executable,
@@ -67,12 +99,14 @@ def _run_gate(script: pathlib.Path, op_name: str, candidate: str, profile: str) 
             candidate,
             "--backend-profile",
             profile,
+            "--json",
         ],
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
     )
-    return proc.returncode, proc.stdout + proc.stderr
+    combined = proc.stdout + proc.stderr
+    return proc.returncode, combined, _parse_json_blob(proc.stdout)
 
 
 def _run_case_gate(case_id: str, profile: str, *, gradient: bool) -> tuple[int, str]:
@@ -104,7 +138,7 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
     manifest = load_manifest()
     if _is_hopper():
         base = build_classified_matrix(manifest, allow_sm90=True)
-    invariance: dict[tuple[str, str], dict[str, tuple[str, str]]] = {}
+    invariance: dict[tuple[str, str], dict[str, tuple[str, str, dict[str, str] | None]]] = {}
     for profile in PROFILES:
         for op_name in C8_REQUIRED_OPS:
             sample = next(
@@ -116,13 +150,18 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
             candidate = resolved["expected_backend_id"]
             if not candidate:
                 continue
-            c3_code, c3_out = _run_gate(C3, op_name, str(candidate), profile)
-            c4_code, c4_out = _run_gate(C4, op_name, str(candidate), profile)
-            fwd_status, fwd_detail = _classify_process(c3_code, c3_out, kind="forward")
-            grad_status, grad_detail = _classify_process(c4_code, c4_out, kind="gradient")
+            c3_code, c3_out, c3_payload = _run_gate(C3, op_name, str(candidate), profile)
+            c4_code, c4_out, c4_payload = _run_gate(C4, op_name, str(candidate), profile)
+            hopper = _is_hopper()
+            fwd_status, fwd_detail = _classify_process(
+                c3_code, c3_out, kind="forward", hopper=hopper
+            )
+            grad_status, grad_detail = _classify_process(
+                c4_code, c4_out, kind="gradient", hopper=hopper
+            )
             invariance[(profile, op_name)] = {
-                "forward_invariance": (fwd_status, fwd_detail),
-                "gradient_invariance": (grad_status, grad_detail),
+                "forward_invariance": (fwd_status, fwd_detail, _observed_from_gate(c3_payload)),
+                "gradient_invariance": (grad_status, grad_detail, _observed_from_gate(c4_payload)),
             }
 
     accuracy: dict[tuple[str, str], dict[str, tuple[str, str, dict[str, Any] | None]]] = {}
@@ -143,23 +182,30 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
             judgment_status = case_result.get("judgment_status", {})
             resource_blocked = case_result.get("runtime_status") == "blocked_resource"
         except (ValueError, KeyError, IndexError, json.JSONDecodeError):
+            case_result = {}
             judgment_status = {}
             resource_blocked = False
         actual = {
-            "backend": case["actual_backend_id"],
-            "kernel": case["actual_kernel_config_id"],
+            "backend": str(case_result.get("actual_backend_id") or case["actual_backend_id"]),
+            "kernel": str(
+                case_result.get("actual_kernel_config_id") or case["actual_kernel_config_id"]
+            ),
         }
         accuracy[key] = {
             "forward_accuracy": (
                 (
                     "green"
                     if judgment_status.get("forward_accuracy")
-                    else "pending_hopper" if resource_blocked else "red"
+                    else "red"
                 ),
                 (
                     "representative case forward accuracy passed"
                     if judgment_status.get("forward_accuracy")
-                    else g_out[-400:]
+                    else (
+                        "required untested: resource blocked (OOM)"
+                        if resource_blocked
+                        else g_out[-400:]
+                    )
                 ),
                 actual,
             ),
@@ -167,12 +213,16 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
                 (
                     "green"
                     if judgment_status.get("gradient_accuracy")
-                    else "pending_hopper" if resource_blocked else "red"
+                    else "red"
                 ),
                 (
                     "representative case gradient accuracy passed"
                     if judgment_status.get("gradient_accuracy")
-                    else g_out[-400:]
+                    else (
+                        "required untested: resource blocked (OOM)"
+                        if resource_blocked
+                        else g_out[-400:]
+                    )
                 ),
                 actual,
             ),
@@ -187,13 +237,13 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
                 update = None
             else:
                 status, detail, actual = acc_update
-                update = (status, detail)
+                update = (status, detail, actual)
         else:
             update = invariance.get((cell.profile, cell.op_name), {}).get(cell.judgment)
         if update is None:
             cells.append(cell)
             continue
-        status, detail = update
+        status, detail, actual = update
         cells.append(
             MatrixCell(
                 profile=cell.profile,
@@ -214,6 +264,75 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
     for cell in cells:
         counts[cell.status] += 1
     return MatrixReport(cells=tuple(cells), counts=dict(counts))
+
+
+def _environment() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+    }
+    try:
+        import torch
+
+        info["pytorch"] = torch.__version__
+        info["cuda_runtime"] = getattr(torch.version, "cuda", None)
+        if torch.cuda.is_available():
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            info["compute_capability"] = ".".join(
+                str(x) for x in torch.cuda.get_device_capability(0)
+            )
+            try:
+                info["driver"] = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                    text=True,
+                ).splitlines()[0].strip()
+            except Exception:
+                info["driver"] = None
+    except Exception as exc:  # pragma: no cover
+        info["torch_error"] = str(exc)
+    try:
+        import triton
+
+        info["triton"] = getattr(triton, "__version__", "unknown")
+    except Exception:
+        info["triton"] = None
+    return info
+
+
+def _git_identity() -> dict[str, Any]:
+    def _run(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    return {
+        "commit": _run("rev-parse", "HEAD"),
+        "branch": _run("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(_run("status", "--porcelain")),
+    }
+
+
+def _execute_payload(report: MatrixReport) -> dict[str, Any]:
+    manifest = load_manifest()
+    return {
+        "schema_version": "ws1-c8-execute-v2",
+        "git": _git_identity(),
+        "environment": _environment(),
+        "workload": {
+            "workload_id": manifest.workload_id,
+            "manifest_version": manifest.raw.get("version"),
+            "fixture_identity_sha256": manifest.raw.get("fixture_identity_sha256"),
+        },
+        "command": "python scripts/sweep_ws1_four_judgments.py --execute --json",
+        "threshold_source": "rl_engine/kernels/gtest/tolerance_contract.json",
+        "fallback_policy": "forbidden; required untested is red; pack is N/A with C2/C4 reason",
+        "counts": dict(report.counts),
+        "cells": [cell.to_dict() for cell in report.cells],
+    }
 
 
 def _print_table(report: MatrixReport) -> None:
@@ -245,7 +364,8 @@ def main() -> None:
     if args.execute:
         report = _execute_matrix(report)
     if args.json:
-        print(json.dumps(report.to_dict(), indent=2))
+        payload = _execute_payload(report) if args.execute else report.to_dict()
+        print(json.dumps(payload, indent=2))
     else:
         _print_table(report)
     if any(cell.status == "red" for cell in report.cells):

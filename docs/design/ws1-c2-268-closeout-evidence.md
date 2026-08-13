@@ -1,6 +1,6 @@
 # WS1 C2 (#268) Closeout Evidence
 
-**Issue:** #268 · **Parent:** #266 · **Workload:** `ws1-qwen3-8b-dense-primary-v4`
+**Issue:** #268 · **Parent:** #266 · **Workload:** `ws1-qwen3-8b-dense-primary-v6`
 
 **Branch:** `feat/ws1-c2-canonical-workload-268`
 
@@ -34,7 +34,9 @@
 | expected + actual backend/kernel + algorithm property | **Pass** | runner executes each case, records actual class path, compares it to expected, and checks outputs |
 | One command emits reference (workload ID, seed, dtype) | **Pass** | `scripts/ws1_reference.py` |
 | Packing / QK-Norm / required ops status | **Pass** | packing supported + packed fixture; qk_norm required |
-| Both profiles enumerate required nodes; no untracked missing | **Pass** | Triton gaps are `missing_required` (red, tracked) |
+| Both profiles enumerate required nodes; no untracked missing | **Pass** | Triton required nodes are all `declared` |
+| `linear_logp` is not WS1 required | **Pass** | `required_chain_ops` status `optional_fused_path`; no C8 row |
+| Packing is a layout helper | **Pass** | C2 `packing.supported` + C3/C4 CPU pack adapters; C8 N/A |
 
 C2 executes all representative cases. Full-model dispatch provenance remains owned by C3/C8/C10/C11; this does not claim the C9/C10 full-model gate.
 
@@ -63,7 +65,7 @@ Validated on 2026-08-12:
 | Item | Owner |
 | --- | --- |
 | Full-model runtime observed actual backend | C3 / C8 / C10 / C11 |
-| Triton `missing_required`: embedding, lm_head, logprob | later candidate work / Blocker; tracked red in C2 |
+| Triton embedding / lm_head / logp | declared candidates; C8 execute owns green/red |
 | #150 numerical asserts / full-model e2e | C9 / C10 |
 | Full WS1 EXIT | #266 after C1–C11 |
 

@@ -8,7 +8,6 @@ from typing import Optional
 import torch
 
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.linear.lm_head import NativeLMHeadOp
 from rl_engine.utils.logger import logger
 
 _SUPPORTED_DTYPES = {torch.float32, torch.float16, torch.bfloat16}
@@ -19,16 +18,6 @@ def _is_hopper(device: torch.device) -> bool:
         return torch.cuda.get_device_capability(device)[0] == 9
     except Exception:
         return False
-
-
-def _can_use_det_gemm_backward(hidden: torch.Tensor, weight: torch.Tensor) -> bool:
-    return (
-        hidden.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
-        and _EXT_AVAILABLE
-        and hasattr(_C, "det_gemm_da")
-        and hasattr(_C, "det_gemm_db")
-    )
 
 
 class _SM90LMHeadFunction(torch.autograd.Function):
@@ -60,42 +49,13 @@ class _SM90LMHeadFunction(torch.autograd.Function):
         grad_2d = grad_output.reshape(-1, weight.size(0)).float()
         hidden_f = hidden_2d.float()
         weight_f = weight.float()
-        needs_projection_grad = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
-        use_det_gemm = (
-            hidden_2d.size(0) > 0
-            and needs_projection_grad
-            and _can_use_det_gemm_backward(hidden, weight)
-        )
-        if (
-            hidden_2d.size(0) > 0
-            and needs_projection_grad
-            and hidden.dtype == torch.bfloat16
-            and weight.dtype == torch.bfloat16
-            and not use_det_gemm
-        ):
-            raise RuntimeError(
-                "SM90LMHeadOp.backward requires _C.det_gemm_da/db for bf16 "
-                "batch-invariant gradients."
-            )
 
         if ctx.needs_input_grad[0]:
-            if use_det_gemm:
-                grad_hidden = _C.det_gemm_da(
-                    grad_2d.to(torch.bfloat16).contiguous(),
-                    weight.t().contiguous(),
-                )
-            else:
-                grad_hidden = grad_2d.matmul(weight_f)
-            grad_hidden = grad_hidden.reshape_as(hidden).to(hidden.dtype)
+            # C1 accumulation is FP32. A bf16 GEMM over vocab=151936 misses
+            # the gradient_accuracy contract against the FP32 reference VJP.
+            grad_hidden = grad_2d.matmul(weight_f).reshape_as(hidden).to(hidden.dtype)
         if ctx.needs_input_grad[1]:
-            if use_det_gemm:
-                grad_weight = _C.det_gemm_db(
-                    hidden_2d.contiguous(),
-                    grad_2d.to(torch.bfloat16).contiguous(),
-                ).t()
-            else:
-                grad_weight = grad_2d.transpose(0, 1).matmul(hidden_f)
-            grad_weight = grad_weight.contiguous().to(weight.dtype)
+            grad_weight = grad_2d.transpose(0, 1).matmul(hidden_f).contiguous().to(weight.dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = grad_2d.sum(0).to(bias.dtype)
 
@@ -119,7 +79,6 @@ class SM90LMHeadOp:
                 "lm_head_sm90_forward is not compiled into the extension. "
                 "Rebuild on Hopper with KERNEL_ALIGN_FORCE_SM90=1."
             )
-        self._fallback = NativeLMHeadOp()
         logger.info("Successfully linked to precompiled _C.lm_head_sm90_forward kernel.")
 
     def __call__(
@@ -139,7 +98,10 @@ class SM90LMHeadOp:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._can_use_sm90(hidden, weight, bias):
-            return self._fallback.forward(hidden, weight, bias=bias)
+            raise RuntimeError(
+                "SM90LMHeadOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90LMHeadFunction.apply(hidden, weight, bias, False)
 
     def forward_fp32(
@@ -150,7 +112,10 @@ class SM90LMHeadOp:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._can_use_sm90(hidden, weight, bias):
-            return self._fallback.forward_fp32(hidden, weight, bias=bias)
+            raise RuntimeError(
+                "SM90LMHeadOp requires Hopper CUDA bf16/fp16/fp32 inputs; "
+                "Native/Triton fallback is forbidden"
+            )
         return _SM90LMHeadFunction.apply(hidden, weight, bias, True)
 
     def parameter_vjp_contributions_fp32(

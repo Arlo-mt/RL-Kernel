@@ -118,7 +118,7 @@ GRADIENT_ADAPTERS: dict[str, GradientAdapterSpec] = {
         op_name="qk_norm",
         chain_node="qk_norm",
         op_class="reduction",
-        spec_name="rms_norm",
+        spec_name="qk_norm",
         tensors=(_DX, _DWEIGHT),
         requirement="required",
         source_files=(
@@ -614,10 +614,13 @@ def _row_parameters(
     dtype: torch.dtype,
     hidden: int,
     vocab_size: int,
+    head_dim: int = 16,
 ) -> dict[str, torch.Tensor]:
     """Config-independent trainable parameters, built in the execution dtype."""
-    if op_name in {"rms_norm", "qk_norm"}:
+    if op_name == "rms_norm":
         return {"weight": _shared_parameter((hidden,), device=device, dtype=dtype, offset=1)}
+    if op_name == "qk_norm":
+        return {"weight": _shared_parameter((head_dim,), device=device, dtype=dtype, offset=1)}
     if op_name == "det_gemm":
         return {"b": _shared_parameter((hidden, hidden), device=device, dtype=dtype, offset=2)}
     if op_name == "linear_logp":
@@ -657,9 +660,15 @@ def _row_inputs(
     """
     n = len(keys)
     leading = (n,)
-    if op_name in {"rms_norm", "qk_norm"}:
+    if op_name == "rms_norm":
         return {
             "x": _stack_rows(keys, leading, (hidden,), device=device, dtype=dtype),
+            "weight": params["weight"],
+            "eps": 1.0e-6,
+        }
+    if op_name == "qk_norm":
+        return {
+            "x": _stack_rows(keys, leading, (head_dim,), device=device, dtype=dtype),
             "weight": params["weight"],
             "eps": 1.0e-6,
         }
@@ -751,7 +760,12 @@ def _run_row_stream(
     tokens = _token_lookup(config)
     specs = adapter.tensors
     params = _row_parameters(
-        adapter.op_name, device=device, dtype=dtype, hidden=hidden, vocab_size=vocab_size
+        adapter.op_name,
+        device=device,
+        dtype=dtype,
+        hidden=hidden,
+        vocab_size=vocab_size,
+        head_dim=head_dim,
     )
 
     token_rows: dict[str, list[torch.Tensor | None]] = {
@@ -1007,7 +1021,12 @@ def _run_row_stream_forward(
     plan = _physical_plan(config)
     tokens = _token_lookup(config)
     params = _row_parameters(
-        adapter.op_name, device=device, dtype=dtype, hidden=hidden, vocab_size=vocab_size
+        adapter.op_name,
+        device=device,
+        dtype=dtype,
+        hidden=hidden,
+        vocab_size=vocab_size,
+        head_dim=head_dim,
     )
     out_rows: list[torch.Tensor | None] = [None] * len(plan.row_keys)
     for start, length in plan.call_spans:

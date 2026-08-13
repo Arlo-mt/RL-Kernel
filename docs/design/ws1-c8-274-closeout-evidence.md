@@ -1,0 +1,49 @@
+# WS1 C8 (#274) closeout evidence
+
+**Parent:** #266 · **Depends on:** C3 / C4 · **Not a substitute for #150 / C10**
+
+## Execute result
+
+Checked-in matrix: `docs/design/ws1-c8-execute.json`
+
+```bash
+python scripts/sweep_ws1_four_judgments.py --execute --json
+```
+
+| Host | Device | Result |
+| --- | --- | --- |
+| 2026-08-13 | NVIDIA H20 (sm90), PyTorch 2.8.0+cu128 | `green=176`, `N/A=16` (`pack`), **red=0**, `pending_hopper=0`, process exit 0 |
+
+Both `cuda_bf16` and `triton_cuda_bf16` run the same C1 contract and C2 logical workload. Invariance cells are the C3/C4 bitwise gates (`atol=0`, `rtol=0`). Accuracy cells are the C2 `case_id` runner with BF16 candidate vs FP32 reference.
+
+`pack` remains N/A with the C2/C4 layout-helper reason. It is still a first-class
+gtest op: `check_operator.py --op pack` and
+`tests/test_forward_invariance.py` / `tests/test_gradient_invariance.py` run the
+Native pack adapter on C2 pad/pack/chunk layouts. It is **not** a CUDA or Triton
+candidate.
+
+`linear_logp` is **not** a WS1 required single-op. C2 marks it
+`optional_fused_path`; C4 `optional_fused`; C8 does not include it in
+`C8_REQUIRED_OPS`.
+
+Every other required row has short + primary `case_id`s and four green judgments.
+Invariance cells record the C3/C4 observed `actual_backend_id` and
+`actual_kernel_config_id` (the loaded candidate class path).
+
+## Close criteria map
+
+| #274 AC | Status |
+| --- | --- |
+| Required rows have reference/candidate or C2 boundary | Pass |
+| Separate complete CUDA and Triton matrices, same C1/C2 | Pass |
+| Applicable rows run BF16 + FP32 reference | Pass |
+| Short + representative full-model tiers on C2 `case_id`s | Pass |
+| expected/actual backend + kernel path recorded by the case runner | Pass |
+| Every cell green/red/N/A | Pass (execute artifact; classify-only still paints unrun cells red) |
+| Applicable + required four judgments green | Pass |
+| Batch/Chunk invariance is the C1 bitwise gate | Pass |
+| N/A has C2/C4 reason | Pass (`pack`) |
+| No Native/Triton/reference masquerade | Pass (Triton attention has its own VJP; SM90 ops fail closed) |
+| Zero red | Pass |
+
+C8 all-green is not WS1 EXIT. C6/C7/C9/C10/C11 remain.

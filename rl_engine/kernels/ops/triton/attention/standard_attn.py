@@ -10,8 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
-
 _BLOCK_N = 64
 
 
@@ -170,6 +168,264 @@ def _standard_attn_fwd_kernel(
     tl.store(lse_ptr + (batch * H_Q + q_head) * S_Q + row, max_score + tl.log(denom))
 
 
+@triton.jit
+def _find_valid_start(
+    mask_ptr,
+    batch,
+    S_KV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_KEY_PADDING_MASK: tl.constexpr,
+):
+    valid_start = 0
+    if HAS_KEY_PADDING_MASK:
+        valid_start = S_KV
+        for start_n in range(0, S_KV, BLOCK_N):
+            probe_cols = start_n + tl.arange(0, BLOCK_N)
+            probe_in_bounds = probe_cols < S_KV
+            probe_keep = tl.load(
+                mask_ptr + batch * S_KV + probe_cols,
+                mask=probe_in_bounds,
+                other=0,
+            )
+            block_first = tl.min(
+                tl.where(probe_in_bounds & (probe_keep != 0), probe_cols, S_KV),
+                axis=0,
+            )
+            valid_start = tl.minimum(valid_start, block_first)
+    return valid_start
+
+
+@triton.jit
+def _standard_attn_dq_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    do_ptr,
+    delta_ptr,
+    lse_ptr,
+    mask_ptr,
+    dq_ptr,
+    B: tl.constexpr,
+    H_Q: tl.constexpr,
+    H_KV: tl.constexpr,
+    S_Q: tl.constexpr,
+    S_KV: tl.constexpr,
+    D: tl.constexpr,
+    stride_qb: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qs: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kb: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_ks: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_vb: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vs: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_dob: tl.constexpr,
+    stride_doh: tl.constexpr,
+    stride_dos: tl.constexpr,
+    stride_dod: tl.constexpr,
+    stride_dqb: tl.constexpr,
+    stride_dqh: tl.constexpr,
+    stride_dqs: tl.constexpr,
+    stride_dqd: tl.constexpr,
+    sm_scale: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    HAS_KEY_PADDING_MASK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    q_head = tl.program_id(1)
+    batch = tl.program_id(2)
+    kv_head = q_head // (H_Q // H_KV)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+    q = tl.load(
+        q_ptr + batch * stride_qb + q_head * stride_qh + row * stride_qs + offs_d * stride_qd,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    do = tl.load(
+        do_ptr + batch * stride_dob + q_head * stride_doh + row * stride_dos + offs_d * stride_dod,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    lse = tl.load(lse_ptr + (batch * H_Q + q_head) * S_Q + row)
+    delta = tl.load(delta_ptr + (batch * H_Q + q_head) * S_Q + row)
+    row_valid = (lse == lse) & (lse != -float("inf"))
+
+    valid_start = _find_valid_start(mask_ptr, batch, S_KV, BLOCK_N, HAS_KEY_PADDING_MASK)
+    logical_row = row - valid_start
+
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for start_n in range(0, S_KV, BLOCK_N):
+        logical_cols = start_n + tl.arange(0, BLOCK_N)
+        cols = valid_start + logical_cols
+        col_mask = cols < S_KV
+        k = tl.load(
+            k_ptr
+            + batch * stride_kb
+            + kv_head * stride_kh
+            + cols[:, None] * stride_ks
+            + offs_d[None, :] * stride_kd,
+            mask=col_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.load(
+            v_ptr
+            + batch * stride_vb
+            + kv_head * stride_vh
+            + cols[:, None] * stride_vs
+            + offs_d[None, :] * stride_vd,
+            mask=col_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        scores = tl.sum(k * q[None, :], axis=1) * sm_scale
+        keep = col_mask
+        if CAUSAL:
+            keep = keep & (logical_cols <= (logical_row + S_KV - S_Q))
+        if HAS_KEY_PADDING_MASK:
+            pad_keep = tl.load(mask_ptr + batch * S_KV + cols, mask=col_mask, other=0)
+            keep = keep & (pad_keep != 0)
+        probs = tl.exp(scores - lse)
+        probs = tl.where(keep & row_valid, probs, 0.0)
+        dprob = tl.sum(do[None, :] * v, axis=1)
+        dscore = probs * (dprob - delta)
+        acc += tl.sum(dscore[:, None] * k, axis=0)
+
+    tl.store(
+        dq_ptr + batch * stride_dqb + q_head * stride_dqh + row * stride_dqs + offs_d * stride_dqd,
+        acc * sm_scale,
+        mask=d_mask,
+    )
+
+
+@triton.jit
+def _standard_attn_dkv_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    do_ptr,
+    delta_ptr,
+    lse_ptr,
+    mask_ptr,
+    dk_ptr,
+    dv_ptr,
+    B: tl.constexpr,
+    H_Q: tl.constexpr,
+    H_KV: tl.constexpr,
+    S_Q: tl.constexpr,
+    S_KV: tl.constexpr,
+    D: tl.constexpr,
+    stride_qb: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qs: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_kb: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_ks: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_vb: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vs: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_dob: tl.constexpr,
+    stride_doh: tl.constexpr,
+    stride_dos: tl.constexpr,
+    stride_dod: tl.constexpr,
+    stride_dkb: tl.constexpr,
+    stride_dkh: tl.constexpr,
+    stride_dks: tl.constexpr,
+    stride_dkd: tl.constexpr,
+    stride_dvb: tl.constexpr,
+    stride_dvh: tl.constexpr,
+    stride_dvs: tl.constexpr,
+    stride_dvd: tl.constexpr,
+    sm_scale: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    HAS_KEY_PADDING_MASK: tl.constexpr,
+):
+    col = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    batch = tl.program_id(2)
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+
+    valid_start = _find_valid_start(mask_ptr, batch, S_KV, BLOCK_N, HAS_KEY_PADDING_MASK)
+    logical_col = col - valid_start
+    col_keep = col < S_KV
+    if HAS_KEY_PADDING_MASK:
+        pad_keep = tl.load(mask_ptr + batch * S_KV + col)
+        col_keep = col_keep & (pad_keep != 0) & (col >= valid_start)
+
+    k = tl.load(
+        k_ptr + batch * stride_kb + kv_head * stride_kh + col * stride_ks + offs_d * stride_kd,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    v = tl.load(
+        v_ptr + batch * stride_vb + kv_head * stride_vh + col * stride_vs + offs_d * stride_vd,
+        mask=d_mask,
+        other=0.0,
+    ).to(tl.float32)
+    acc_dk = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    acc_dv = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    group = H_Q // H_KV
+    for gi in range(0, group):
+        q_head = kv_head * group + gi
+        for row in range(0, S_Q):
+            logical_row = row - valid_start
+            row_keep = col_keep
+            if CAUSAL:
+                row_keep = row_keep & (logical_col <= (logical_row + S_KV - S_Q))
+            q = tl.load(
+                q_ptr
+                + batch * stride_qb
+                + q_head * stride_qh
+                + row * stride_qs
+                + offs_d * stride_qd,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            do = tl.load(
+                do_ptr
+                + batch * stride_dob
+                + q_head * stride_doh
+                + row * stride_dos
+                + offs_d * stride_dod,
+                mask=d_mask,
+                other=0.0,
+            ).to(tl.float32)
+            lse = tl.load(lse_ptr + (batch * H_Q + q_head) * S_Q + row)
+            delta = tl.load(delta_ptr + (batch * H_Q + q_head) * S_Q + row)
+            row_valid = (lse == lse) & (lse != -float("inf"))
+            score = tl.sum(q * k, axis=0) * sm_scale
+            prob = tl.exp(score - lse)
+            keep = row_keep & row_valid
+            prob = tl.where(keep, prob, 0.0)
+            dprob = tl.sum(do * v, axis=0)
+            dscore = prob * (dprob - delta)
+            acc_dk += dscore * q
+            acc_dv += prob * do
+
+    tl.store(
+        dk_ptr + batch * stride_dkb + kv_head * stride_dkh + col * stride_dks + offs_d * stride_dkd,
+        acc_dk * sm_scale,
+        mask=d_mask,
+    )
+    tl.store(
+        dv_ptr + batch * stride_dvb + kv_head * stride_dvh + col * stride_dvs + offs_d * stride_dvd,
+        acc_dv,
+        mask=d_mask,
+    )
+
+
 class _TritonBatchInvariantAttention(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -250,7 +506,12 @@ class _TritonBatchInvariantAttention(torch.autograd.Function):
             num_warps=8,
         )
 
-        ctx.save_for_backward(q, k, v, key_padding_mask)
+        mask_for_save = (
+            key_padding_mask
+            if key_padding_mask is not None
+            else q.new_empty((0,), dtype=torch.bool)
+        )
+        ctx.save_for_backward(q, k, v, out, lse, mask_for_save)
         ctx.causal = causal
         ctx.scale = scale
         ctx.has_key_padding_mask = key_padding_mask is not None
@@ -261,21 +522,94 @@ class _TritonBatchInvariantAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        q, k, v, key_padding_mask = ctx.saved_tensors
-        grad_out = grad_outputs[0]
-        with torch.enable_grad():
-            q_ref = q.detach().requires_grad_(True)
-            k_ref = k.detach().requires_grad_(True)
-            v_ref = v.detach().requires_grad_(True)
-            out = NativeAttentionOp().forward(
-                q_ref,
-                k_ref,
-                v_ref,
-                causal=ctx.causal,
-                scale=ctx.scale,
-                key_padding_mask=key_padding_mask if ctx.has_key_padding_mask else None,
-            )
-        dq, dk, dv = torch.autograd.grad(out, (q_ref, k_ref, v_ref), grad_out)
+        q, k, v, out, lse, mask_for_save = ctx.saved_tensors
+        grad_out = grad_outputs[0].contiguous()
+        key_padding_mask = mask_for_save if ctx.has_key_padding_mask else None
+        batch, q_heads, q_len, head_dim = q.shape
+        kv_heads, kv_len = k.shape[1], k.shape[2]
+        block_d = _next_power_of_2(head_dim)
+        dummy_mask = (
+            key_padding_mask
+            if key_padding_mask is not None
+            else q.new_empty((1,), dtype=torch.bool)
+        )
+        delta = (grad_out.float() * out.float()).sum(dim=-1).contiguous()
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        common = dict(
+            B=batch,
+            H_Q=q_heads,
+            H_KV=kv_heads,
+            S_Q=q_len,
+            S_KV=kv_len,
+            D=head_dim,
+            stride_qb=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_qs=q.stride(2),
+            stride_qd=q.stride(3),
+            stride_kb=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_ks=k.stride(2),
+            stride_kd=k.stride(3),
+            sm_scale=float(ctx.scale),
+            BLOCK_N=_BLOCK_N,
+            BLOCK_D=block_d,
+            CAUSAL=ctx.causal,
+            HAS_KEY_PADDING_MASK=ctx.has_key_padding_mask,
+            num_warps=8,
+        )
+        _standard_attn_dq_kernel[(q_len, q_heads, batch)](
+            q,
+            k,
+            v,
+            grad_out,
+            delta,
+            lse,
+            dummy_mask,
+            dq,
+            stride_vb=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_vs=v.stride(2),
+            stride_vd=v.stride(3),
+            stride_dob=grad_out.stride(0),
+            stride_doh=grad_out.stride(1),
+            stride_dos=grad_out.stride(2),
+            stride_dod=grad_out.stride(3),
+            stride_dqb=dq.stride(0),
+            stride_dqh=dq.stride(1),
+            stride_dqs=dq.stride(2),
+            stride_dqd=dq.stride(3),
+            **common,
+        )
+        _standard_attn_dkv_kernel[(kv_len, kv_heads, batch)](
+            q,
+            k,
+            v,
+            grad_out,
+            delta,
+            lse,
+            dummy_mask,
+            dk,
+            dv,
+            stride_vb=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_vs=v.stride(2),
+            stride_vd=v.stride(3),
+            stride_dob=grad_out.stride(0),
+            stride_doh=grad_out.stride(1),
+            stride_dos=grad_out.stride(2),
+            stride_dod=grad_out.stride(3),
+            stride_dkb=dk.stride(0),
+            stride_dkh=dk.stride(1),
+            stride_dks=dk.stride(2),
+            stride_dkd=dk.stride(3),
+            stride_dvb=dv.stride(0),
+            stride_dvh=dv.stride(1),
+            stride_dvs=dv.stride(2),
+            stride_dvd=dv.stride(3),
+            **common,
+        )
         return dq, dk, dv, None, None, None, None
 
 

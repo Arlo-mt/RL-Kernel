@@ -225,17 +225,21 @@ def _run_case_backward(
     # grad_mode="ones" is the old output.sum().backward() smoke path.
     # grad_mode="random" is closer to training, where dL/doutput is non-uniform.
     grad_outputs = _make_grad_outputs(candidate_outputs, grad_mode=grad_mode, seed=grad_seed)
+    shared_upstreams = [
+        grad.to(device=output.device, dtype=output.dtype)
+        for grad, output in zip(grad_outputs, candidate_outputs, strict=True)
+    ]
     candidate_grads = _backward_grads(
         candidate_outputs,
         candidate_inputs,
         case.grad_input_names,
-        grad_outputs=grad_outputs,
+        grad_outputs=shared_upstreams,
     )
     gold_grads = _backward_grads(
         gold_outputs,
         gold_inputs,
         case.grad_input_names,
-        grad_outputs=_match_grad_outputs(grad_outputs, gold_outputs),
+        grad_outputs=_match_grad_outputs(shared_upstreams, gold_outputs),
     )
     output_checks = _compare_case_outputs(
         candidate,
@@ -418,25 +422,17 @@ def _backward_grads(
 ) -> list[torch.Tensor]:
     if len(outputs) != len(grad_outputs):
         raise ValueError(f"got {len(grad_outputs)} upstream gradients for {len(outputs)} outputs")
-    # `ones` makes this equivalent to output.sum().backward(); `random` tests a
-    # stricter vector-Jacobian product.
-    loss_terms = [
-        (output.float() * grad_output.to(device=output.device).float()).sum()
-        for output, grad_output in zip(outputs, grad_outputs, strict=True)
-    ]
-    if not loss_terms:
-        raise ValueError("backward checks require at least one output")
-    loss = loss_terms[0]
-    for term in loss_terms[1:]:
-        loss = loss + term
-    loss.backward()
-    grads: list[torch.Tensor] = []
-    for name in grad_input_names:
-        grad = inputs[name].grad
-        if grad is None:
-            raise ValueError(f"gradient for input {name!r} is None")
-        grads.append(grad)
-    return grads
+    tensors = [inputs[name] for name in grad_input_names]
+    grads = torch.autograd.grad(
+        outputs,
+        tensors,
+        grad_outputs=[
+            grad_output.to(device=output.device, dtype=output.dtype)
+            for output, grad_output in zip(outputs, grad_outputs, strict=True)
+        ],
+        allow_unused=False,
+    )
+    return list(grads)
 
 
 def _make_grad_outputs(

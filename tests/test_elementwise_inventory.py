@@ -38,7 +38,10 @@ def test_every_item_has_a_verdict_or_blocker():
         assert item.entry_point
         assert item.reduction
         assert item.evidence
-        if item.cuda_verdict == "blocker" or item.triton_verdict == "blocker":
+        if item.cuda_verdict in {"blocker", "blocked_hardware"} or item.triton_verdict in {
+            "blocker",
+            "blocked_hardware",
+        }:
             assert item.blocker, item.name
 
 

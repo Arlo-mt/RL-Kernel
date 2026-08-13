@@ -45,6 +45,19 @@ OP_SPECS = {
         },
         grad_input_names=("x", "weight"),
     ),
+    "qk_norm": OperatorSpec(
+        name="qk_norm",
+        op_class="reduction",
+        gold_path="rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp",
+            "triton": "rl_engine.kernels.ops.triton.rmsnorm_triton.RMSNormTritonOp",
+            "cuda": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+            "cuda-sm90": "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp",
+        },
+        grad_input_names=("x", "weight"),
+    ),
     "attention": OperatorSpec(
         name="attention",
         op_class="attention",
@@ -177,7 +190,39 @@ OP_SPECS = {
         },
         grad_input_names=("logits",),
     ),
+    "pack": OperatorSpec(
+        name="pack",
+        op_class="elementwise",
+        gold_path="rl_engine.kernels.gtest.operator_specs.GtestPackOp",
+        gold_method="forward_fp32",
+        candidate_paths={
+            "pytorch": "rl_engine.kernels.gtest.operator_specs.GtestPackOp",
+        },
+        grad_input_names=("x",),
+    ),
 }
+
+
+class GtestPackOp:
+    """gtest view of NativePackOp: compare the packed rows, not cu_seqlens."""
+
+    op_class = "elementwise"
+
+    def __init__(self) -> None:
+        from rl_engine.kernels.ops.pytorch.packing.pack import NativePackOp
+
+        self._op = NativePackOp()
+
+    def __call__(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.forward(x, mask)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        packed, _cu_seqlens = self._op(x, mask)
+        return packed
+
+    def forward_fp32(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        packed, _cu_seqlens = self._op(x.float(), mask)
+        return packed
 
 
 class _LogpSM90CandidateAdapter:

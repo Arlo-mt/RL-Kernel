@@ -28,11 +28,17 @@ python -m pytest rl_engine/tests/test_dispatch.py -v
 python tests/test_op_accuracy.py
 ```
 
-Contract schema / resolver:
+Contract schema / resolver and WS1 C1–C8 CPU gates:
 
 ```bash
-python -m pytest tests/test_tolerance_contract.py tests/test_op_checks.py -q
+python -m pytest tests/test_tolerance_contract.py tests/test_op_checks.py \
+  tests/test_ws1_workload.py tests/test_forward_invariance.py \
+  tests/test_gradient_invariance.py tests/test_elementwise_inventory.py \
+  tests/test_four_judgment_matrix.py tests/test_operator_inputs.py -q
 ```
+
+`max_abs_dlogp`, `approx_kl0`, and `clipfrac0` are the sole chain-level logprob
+aggregates; gradient pass/fail uses independent `gradient_*` verdicts.
 
 ## Documentation Build
 

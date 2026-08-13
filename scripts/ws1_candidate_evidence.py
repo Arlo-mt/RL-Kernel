@@ -69,6 +69,13 @@ def _case_args(case: dict[str, Any], seed: int) -> SimpleNamespace:
             common.update(batch=shape["B"], seq=shape["T"], vocab=shape["vocab"])
         elif operator_spec == "rms_norm":
             common.update(batch=1, seq=shape["T"], normalized_dim=4096)
+        elif operator_spec == "qk_norm":
+            common.update(
+                batch=1,
+                seq=shape["T"],
+                n_heads=1,
+                head_dim=int(shape.get("head_dim", 128)),
+            )
         elif operator_spec in {"silu", "swiglu", "rope"}:
             common.update(batch=1, seq=shape["T"])
         elif operator_spec in {"embedding", "lm_head"}:

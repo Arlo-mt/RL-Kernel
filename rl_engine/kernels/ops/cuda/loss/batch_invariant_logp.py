@@ -25,22 +25,6 @@ def _sm90_supported(logits: torch.Tensor) -> bool:
     return (logits.size(-1) * logits.element_size()) % 16 == 0
 
 
-def _fallback_op():
-    """Portable op for inputs the SM90 forward cannot take. Triton, else native."""
-    try:
-        from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
-            TritonBatchInvariantLogpOp,
-        )
-
-        return TritonBatchInvariantLogpOp()
-    except Exception:  # pragma: no cover - Triton missing
-        from rl_engine.kernels.ops.pytorch.loss.batch_invariant_logp import (
-            NativeBatchInvariantLogpOp,
-        )
-
-        return NativeBatchInvariantLogpOp()
-
-
 class _BatchInvariantLogpSM90Function(torch.autograd.Function):
     # Autograd wrapper: SM90 TMA forward + tile-wise softmax backward.
 
@@ -146,7 +130,10 @@ class BatchInvariantLogpSM90Op:
             )
 
         if not _sm90_supported(logits):
-            return _fallback_op()(logits, target_ids, ignore_index=ignore_index, validate=validate)
+            raise RuntimeError(
+                "BatchInvariantLogpSM90Op requires Hopper CUDA with a 16-byte-aligned "
+                "vocab stride; Triton/Native fallback is forbidden"
+            )
 
         if validate:
             vocab_size = logits.size(-1)

@@ -29,29 +29,13 @@ On Hopper, `cuda-sm90` cells become runnable automatically. Rebuild the extensio
 | --- | --- |
 | `green` | C3/C4 gate passed |
 | `red` | judgment failed, or required cell not executed |
-| `blocked_hardware` | declared `cuda-sm90` on a non-Hopper box |
-| `blocked_c2` | C2 `missing_required` (Triton embedding / lm_head / logp) |
-| `skipped` | pack (layout_supported) or optional fused path |
+| `pending_hopper` | declared `cuda-sm90` on a non-Hopper box |
+| `N/A` | pack (layout_supported) with a C2/C4 reason |
 
 Required untested is **red**, never bare N/A.
 
-## Known reds (sm86, before Hopper)
+## Close status
 
-See `docs/design/ws1-blockers.md`:
+H20 execute is checked in at `docs/design/ws1-c8-execute.json`: **green=176, N/A=16, red=0**. See `docs/design/ws1-c8-274-closeout-evidence.md`.
 
-- `rms_norm` / `qk_norm` `dweight`
-- `det_gemm` `dW`
-- CUDA `logp` no backward
-- Triton attention `padded_left` 1 ULP
-
-C2 version is `ws1-c2-v5` after adding short+primary `case_id`s for the remaining required ops.
-
-sm86 execute tally (RTX 3060): `green=88, red=32, blocked_hardware=32, blocked_c2=24, skipped=16`.
-
-Hopper re-run (after `KERNEL_ALIGN_FORCE_SM90=1 pip install -e .`):
-
-```bash
-python scripts/sweep_ws1_four_judgments.py --execute
-```
-
-This document does **not** claim C8 close (#274 requires zero red).
+Classify-only still paints declared-but-unexecuted cells red. That is required-untested, not a close blocker once `--execute` is green.

@@ -59,11 +59,11 @@ ELEMENTWISE_INVENTORY: tuple[InventoryItem, ...] = (
         differentiable=True,
         entry_point="rl_engine.kernels.ops.{cuda,triton,pytorch}.rotary_embedding.rope",
         reduction="none (rotate_half, position-local)",
-        cuda_verdict="blocked_hardware",
+        cuda_verdict="pass",
         triton_verdict="pass",
         evidence=(
-            "C3/C4 adapters registered; Triton C3/C4 green on sm86; "
-            "CUDA candidate is cuda-sm90 and needs Hopper"
+            "C3/C4 adapters registered; Triton green on sm86+; "
+            "CUDA cuda-sm90 C3/C4 and C8 four-judgment green on H20"
         ),
     ),
     InventoryItem(
