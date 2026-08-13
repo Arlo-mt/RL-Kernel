@@ -159,9 +159,18 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
             grad_status, grad_detail = _classify_process(
                 c4_code, c4_out, kind="gradient", hopper=hopper
             )
+            def _actual(payload: dict[str, Any] | None) -> dict[str, str]:
+                observed = _observed_from_gate(payload) or {}
+                return {
+                    # Record the launched C2 candidate id (cuda / cuda-sm90 / triton).
+                    "backend": str(candidate),
+                    "kernel": observed.get("kernel")
+                    or str(resolved.get("candidate_path") or ""),
+                }
+
             invariance[(profile, op_name)] = {
-                "forward_invariance": (fwd_status, fwd_detail, _observed_from_gate(c3_payload)),
-                "gradient_invariance": (grad_status, grad_detail, _observed_from_gate(c4_payload)),
+                "forward_invariance": (fwd_status, fwd_detail, _actual(c3_payload)),
+                "gradient_invariance": (grad_status, grad_detail, _actual(c4_payload)),
             }
 
     accuracy: dict[tuple[str, str], dict[str, tuple[str, str, dict[str, Any] | None]]] = {}
