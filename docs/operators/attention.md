@@ -94,7 +94,8 @@ before selecting a backend. Legacy `get_op("attention")` behavior remains unchan
 
 Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
 CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
-a silent fallback. See [WS2 CP-aware Attention contract](../design/ws2-cp-attention-contract.md).
+a silent fallback. See the
+[WS2 CP-aware Attention contract in PR #236](https://github.com/RL-Align/RL-Kernel/blob/feat/issue-235-attention-cp-contract/docs/design/ws2-cp-attention-contract.md).
 
 Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
 `disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
