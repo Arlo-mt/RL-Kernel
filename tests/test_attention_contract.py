@@ -321,9 +321,7 @@ def test_complete_split_kv_plan_set_covers_batch_tp_cp_and_owner_coordinates():
     )
 
     assert len(plan_set.entries) == 16
-    assert plan_set.to_dict()["coverage"] == (
-        "complete_batch_tp_cp_owner_cartesian_product"
-    )
+    assert plan_set.to_dict()["coverage"] == ("complete_batch_tp_cp_owner_cartesian_product")
     assert {
         tuple(entry["expected_kv_range"])
         for entry in plan_set.to_dict()["entries"]

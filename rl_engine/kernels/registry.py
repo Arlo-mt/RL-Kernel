@@ -519,7 +519,6 @@ class KernelRegistry:
         requested_backend = requested_backend.strip().lower()
 
         platform = self._platform()
-        op_type = "kv_cache_attention" if contract.mode is AttentionMode.DECODE else "attention"
         candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])
         rejected: list[str] = []
 
