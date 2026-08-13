@@ -5,14 +5,19 @@
 
 import torch
 
-from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import (
-    TritonBatchInvariantLogpOp,
-)
+from rl_engine.kernels.ops.triton.loss.batch_invariant_logp import TritonBatchInvariantLogpOp
 
 
 class TritonLogpOp(TritonBatchInvariantLogpOp):
-    def __call__(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        return super().__call__(logits, token_ids, validate=True)
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+        ignore_index: int = -100,
+        *,
+        validate: bool = True,
+    ) -> torch.Tensor:
+        return super().__call__(logits, token_ids, ignore_index=ignore_index, validate=validate)
 
     def forward(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         return self.__call__(logits, token_ids)

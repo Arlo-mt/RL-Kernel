@@ -19,16 +19,12 @@ from rl_engine.kernels.gtest.four_judgment_matrix import (
 )
 from rl_engine.testing.ws1_workload import load_manifest
 
-_EXECUTE_ARTIFACT = (
-    Path(__file__).resolve().parents[1] / "docs" / "design" / "ws1-c8-execute.json"
-)
+_EXECUTE_ARTIFACT = Path(__file__).resolve().parents[1] / "docs" / "design" / "ws1-c8-execute.json"
 
 
 def test_matrix_covers_required_ops_profiles_judgments_and_tiers():
     report = build_classified_matrix()
-    keys = {
-        (cell.profile, cell.op_name, cell.judgment, cell.tier) for cell in report.cells
-    }
+    keys = {(cell.profile, cell.op_name, cell.judgment, cell.tier) for cell in report.cells}
     expected = {
         (profile, op_name, judgment, tier)
         for profile in PROFILES
@@ -62,7 +58,8 @@ def test_logp_and_batch_invariant_logp_have_own_case_ids():
         assert cells
         assert all(cell.case_id for cell in cells if cell.status != "pending_hopper")
         assert not any(
-            cell.case_id and "batch-invariant" in cell.case_id and op_name == "logp" for cell in cells
+            cell.case_id and "batch-invariant" in cell.case_id and op_name == "logp"
+            for cell in cells
         )
 
 
@@ -83,9 +80,7 @@ def test_sm90_declared_cells_are_pending_hopper():
         and cell.op_name in {"embedding", "lm_head", "rope", "batch_invariant_logp"}
     ]
     assert hopper
-    assert all(
-        cell.status == "pending_hopper" for cell in hopper if cell.case_id is not None
-    )
+    assert all(cell.status == "pending_hopper" for cell in hopper if cell.case_id is not None)
     assert all(cell.candidate == "cuda-sm90" for cell in hopper)
 
 

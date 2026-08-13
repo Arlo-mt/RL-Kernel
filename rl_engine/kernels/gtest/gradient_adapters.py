@@ -576,7 +576,9 @@ def make_forward_runner(
     if adapter.requirement == "absent_not_required":
         raise RuntimeError(f"adapter {op_name!r} is not declared supported+differentiable")
 
-    def run(config: ConfigSpec, **kwargs: Any) -> dict[str, Any] | RuntimeObservation:
+    def run(
+        config: ConfigSpec, **kwargs: Any
+    ) -> dict[tuple[str, int], torch.Tensor] | RuntimeObservation:
         del kwargs
         exec_dtype = torch.float32 if reference else dtype
         outputs = _run_forward(
@@ -813,9 +815,7 @@ def _run_row_stream(
         )
         contribution_fn = getattr(operator, "parameter_vjp_contributions_fp32", None)
         contributions = (
-            contribution_fn(**prepared, grad_output=upstream)
-            if callable(contribution_fn)
-            else None
+            contribution_fn(**prepared, grad_output=upstream) if callable(contribution_fn) else None
         )
         for spec, grad in zip(specs, grads, strict=True):
             if grad is None:
@@ -835,7 +835,9 @@ def _run_row_stream(
                             param_contributions[spec.name][key] = row
                 else:
                     total = param_totals[spec.name]
-                    param_totals[spec.name] = grad.float() if total is None else total + grad.float()
+                    param_totals[spec.name] = (
+                        grad.float() if total is None else total + grad.float()
+                    )
             else:
                 rows = _to_rows(adapter.op_name, grad, length)
                 for index in range(length):

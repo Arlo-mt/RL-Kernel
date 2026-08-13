@@ -16,7 +16,9 @@ from rl_engine.kernels.gtest.operator_specs import operator_names
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="WS1 gtest GPU smoke needs CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="WS1 gtest GPU smoke needs CUDA"
+)
 
 
 def _run(script: str, *args: str, timeout: int = 300) -> None:

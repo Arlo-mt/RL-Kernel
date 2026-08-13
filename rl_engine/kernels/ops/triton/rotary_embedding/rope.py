@@ -130,7 +130,9 @@ def _rope_table(x: Tensor, positions: Tensor, theta: float) -> tuple[Tensor, Ten
     elif x.dim() == 3:
         x_2d = x.contiguous().reshape(-1, D)
     else:
-        raise ValueError(f"RoPE [B, S] positions require x [B, S, D] or [B, H, S, D], got {x.dim()}D")
+        raise ValueError(
+            f"RoPE [B, S] positions require x [B, S, D] or [B, H, S, D], got {x.dim()}D"
+        )
     table_len = batch * seq
     if x_2d.shape[0] % table_len != 0:
         raise ValueError(f"row count {x_2d.shape[0]} not divisible by B*S={table_len}")

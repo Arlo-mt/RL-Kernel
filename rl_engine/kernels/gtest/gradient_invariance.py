@@ -570,8 +570,7 @@ def assert_gradient_batch_invariant(
                     aggregated = _sum_parameter_grads(ordered_rows)
                 else:
                     ordered = [
-                        sample_grads[sample_id][spec.name]
-                        for sample_id in plan.aggregation_order
+                        sample_grads[sample_id][spec.name] for sample_id in plan.aggregation_order
                     ]
                     aggregated = _sum_parameter_grads(ordered)
                 details.append(

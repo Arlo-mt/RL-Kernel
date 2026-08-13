@@ -13,10 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from rl_engine.kernels.gtest.gradient_adapters import (
-    GRADIENT_ADAPTERS,
-    resolve_profile_candidate,
-)
+from rl_engine.kernels.gtest.gradient_adapters import GRADIENT_ADAPTERS, resolve_profile_candidate
 from rl_engine.testing.ws1_workload import WS1Manifest, load_manifest
 
 JUDGMENTS = (

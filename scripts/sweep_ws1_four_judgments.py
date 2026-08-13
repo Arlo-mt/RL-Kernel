@@ -26,9 +26,9 @@ if str(REPO_ROOT) not in sys.path:
 from rl_engine.kernels.gtest.four_judgment_matrix import (  # noqa: E402
     C8_REQUIRED_OPS,
     JUDGMENTS,
+    PROFILES,
     MatrixCell,
     MatrixReport,
-    PROFILES,
     build_classified_matrix,
 )
 from rl_engine.kernels.gtest.gradient_adapters import (  # noqa: E402
@@ -159,13 +159,13 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
             grad_status, grad_detail = _classify_process(
                 c4_code, c4_out, kind="gradient", hopper=hopper
             )
+
             def _actual(payload: dict[str, Any] | None) -> dict[str, str]:
                 observed = _observed_from_gate(payload) or {}
                 return {
                     # Record the launched C2 candidate id (cuda / cuda-sm90 / triton).
                     "backend": str(candidate),
-                    "kernel": observed.get("kernel")
-                    or str(resolved.get("candidate_path") or ""),
+                    "kernel": observed.get("kernel") or str(resolved.get("candidate_path") or ""),
                 }
 
             invariance[(profile, op_name)] = {
@@ -202,11 +202,7 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
         }
         accuracy[key] = {
             "forward_accuracy": (
-                (
-                    "green"
-                    if judgment_status.get("forward_accuracy")
-                    else "red"
-                ),
+                ("green" if judgment_status.get("forward_accuracy") else "red"),
                 (
                     "representative case forward accuracy passed"
                     if judgment_status.get("forward_accuracy")
@@ -219,11 +215,7 @@ def _execute_matrix(base: MatrixReport) -> MatrixReport:
                 actual,
             ),
             "gradient_accuracy": (
-                (
-                    "green"
-                    if judgment_status.get("gradient_accuracy")
-                    else "red"
-                ),
+                ("green" if judgment_status.get("gradient_accuracy") else "red"),
                 (
                     "representative case gradient accuracy passed"
                     if judgment_status.get("gradient_accuracy")
@@ -291,10 +283,14 @@ def _environment() -> dict[str, Any]:
                 str(x) for x in torch.cuda.get_device_capability(0)
             )
             try:
-                info["driver"] = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-                    text=True,
-                ).splitlines()[0].strip()
+                info["driver"] = (
+                    subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                        text=True,
+                    )
+                    .splitlines()[0]
+                    .strip()
+                )
             except Exception:
                 info["driver"] = None
     except Exception as exc:  # pragma: no cover
@@ -357,7 +353,9 @@ def _print_table(report: MatrixReport) -> None:
         grouped[(cell.profile, cell.op_name)].append(cell)
     for (profile, op_name), cells in grouped.items():
         by_j = {cell.judgment: cell for cell in cells if cell.tier == "primary"}
-        statuses = " ".join(f"{j.split('_')[0][0]}{j.split('_')[1][0]}={by_j[j].status}" for j in JUDGMENTS)
+        statuses = " ".join(
+            f"{j.split('_')[0][0]}{j.split('_')[1][0]}={by_j[j].status}" for j in JUDGMENTS
+        )
         sample = cells[0]
         print(
             f"{profile:<17} {op_name:<21} {sample.candidate or '-':<11} "
@@ -391,7 +389,10 @@ def main() -> None:
         _print_table(report)
     if any(cell.status == "red" for cell in report.cells):
         raise SystemExit(1)
-    if any(cell.status == "pending_hopper" for cell in report.cells) and not args.allow_pending_hopper:
+    if (
+        any(cell.status == "pending_hopper" for cell in report.cells)
+        and not args.allow_pending_hopper
+    ):
         raise SystemExit(2)
 
 
