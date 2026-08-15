@@ -58,9 +58,7 @@ def _worker(rank: int, port: int) -> None:
         timeout=timedelta(minutes=5),
     )
     try:
-        groups = {
-            tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES
-        }
+        groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
         for tp_size, group in groups.items():
             if rank < tp_size:
                 with DeterministicCollective(
@@ -81,9 +79,7 @@ def _worker(rank: int, port: int) -> None:
                             generator=generator,
                         ).to(device=device, dtype=dtype)
                         leaves = list(leaves_tensor.unbind())
-                        input = _fixed_tree_reference(
-                            leaves[start : start + leaves_per_rank]
-                        )
+                        input = _fixed_tree_reference(leaves[start : start + leaves_per_rank])
                         reduced = _fixed_tree_reference(leaves)
                         expected = reduced.chunk(tp_size, dim=0)[group_rank]
 
