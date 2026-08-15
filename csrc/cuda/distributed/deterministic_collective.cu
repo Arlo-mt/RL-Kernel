@@ -136,7 +136,7 @@ void launch_all_reduce(
   }
 }
 
-template <typename T>
+template <typename T, int WorldSize>
 __global__ void deterministic_reduce_scatter_kernel(
     PeerPointers peers,
     T* output,
@@ -147,7 +147,38 @@ __global__ void deterministic_reduce_scatter_kernel(
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   const int64_t input_offset = static_cast<int64_t>(rank) * output_element_count;
   for (int64_t index = thread_index; index < output_element_count; index += stride) {
-    output[index] = fixed_tree_reduce<T>(peers, input_offset + index);
+    output[index] = fixed_tree_reduce<T, WorldSize>(peers, input_offset + index);
+  }
+}
+
+template <typename T>
+void launch_reduce_scatter(
+    const PeerPointers& peers,
+    T* output,
+    int64_t output_element_count,
+    int rank,
+    int blocks,
+    int64_t world_size,
+    cudaStream_t stream) {
+  switch (world_size) {
+    case 1:
+      deterministic_reduce_scatter_kernel<T, 1><<<blocks, kThreads, 0, stream>>>(
+          peers, output, output_element_count, rank);
+      break;
+    case 2:
+      deterministic_reduce_scatter_kernel<T, 2><<<blocks, kThreads, 0, stream>>>(
+          peers, output, output_element_count, rank);
+      break;
+    case 4:
+      deterministic_reduce_scatter_kernel<T, 4><<<blocks, kThreads, 0, stream>>>(
+          peers, output, output_element_count, rank);
+      break;
+    case 8:
+      deterministic_reduce_scatter_kernel<T, 8><<<blocks, kThreads, 0, stream>>>(
+          peers, output, output_element_count, rank);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported deterministic collective world size ", world_size);
   }
 }
 
@@ -321,8 +352,8 @@ class DeterministicCollectiveState {
         output.scalar_type() == staged_scalar_type_,
         "reduce-scatter output dtype must match the staged input dtype");
     TORCH_CHECK(
-        output.numel() * output.element_size() * kDeterministicWorldSize == staged_bytes_,
-        "reduce-scatter output must contain one eighth of the staged input");
+        output.numel() * output.element_size() * world_size_ == staged_bytes_,
+        "reduce-scatter output must contain one world-size fraction of the staged input");
 
     const int64_t output_element_count = output.numel();
     if (output_element_count == 0) {
@@ -334,26 +365,35 @@ class DeterministicCollectiveState {
 
     switch (output.scalar_type()) {
       case at::ScalarType::Float:
-        deterministic_reduce_scatter_kernel<float><<<blocks, kThreads, 0, stream>>>(
+        launch_reduce_scatter<float>(
             peers_,
             static_cast<float*>(output.data_ptr()),
             output_element_count,
-            rank_);
+            rank_,
+            blocks,
+            world_size_,
+            stream);
         break;
       case at::ScalarType::Half:
-        deterministic_reduce_scatter_kernel<half><<<blocks, kThreads, 0, stream>>>(
+        launch_reduce_scatter<half>(
             peers_,
             static_cast<half*>(output.data_ptr()),
             output_element_count,
-            rank_);
+            rank_,
+            blocks,
+            world_size_,
+            stream);
         break;
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
       case at::ScalarType::BFloat16:
-        deterministic_reduce_scatter_kernel<nv_bfloat16><<<blocks, kThreads, 0, stream>>>(
+        launch_reduce_scatter<nv_bfloat16>(
             peers_,
             static_cast<nv_bfloat16*>(output.data_ptr()),
             output_element_count,
-            rank_);
+            rank_,
+            blocks,
+            world_size_,
+            stream);
         break;
 #endif
       default:

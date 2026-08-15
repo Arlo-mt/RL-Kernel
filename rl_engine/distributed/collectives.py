@@ -165,7 +165,11 @@ class DeterministicCollective:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fixed-tree sum followed by a rank-ordered scatter along dimension 0."""
+        """TBIK-compatible fixed-tree sum, then a rank-ordered dimension-0 scatter.
+
+        Concatenating all rank outputs is cross-TP invariant when inputs follow
+        the class-level subtree contract and the global dimension-0 size is fixed.
+        """
 
         self._check_open()
         self._validate_reduction_input(input)
@@ -173,8 +177,8 @@ class DeterministicCollective:
             raise ValueError("reduce_scatter input must have at least one dimension")
         if input.size(0) % self.world_size != 0:
             raise ValueError(
-                "reduce_scatter input.size(0) must be divisible by world_size=8; "
-                f"got {input.size(0)}"
+                "reduce_scatter input.size(0) must be divisible by "
+                f"world_size={self.world_size}; got {input.size(0)}"
             )
         output_shape = (input.size(0) // self.world_size, *input.shape[1:])
         if out is None:
