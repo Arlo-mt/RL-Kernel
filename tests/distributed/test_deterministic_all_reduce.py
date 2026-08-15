@@ -58,9 +58,7 @@ def _worker(rank: int, port: int) -> None:
         timeout=timedelta(minutes=5),
     )
     try:
-        groups = {
-            tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES
-        }
+        groups = {tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES}
         for tp_size, group in groups.items():
             if rank < tp_size:
                 with DeterministicCollective(
@@ -80,18 +78,14 @@ def _worker(rank: int, port: int) -> None:
                             generator=generator,
                         ).to(device=device, dtype=dtype)
                         leaves = list(leaves_tensor.unbind())
-                        input = _fixed_tree_reference(
-                            leaves[start : start + leaves_per_rank]
-                        )
+                        input = _fixed_tree_reference(leaves[start : start + leaves_per_rank])
                         expected = _fixed_tree_reference(leaves)
 
                         output = collective.all_reduce(input)
                         assert torch.equal(output, expected)
 
                         peer_outputs = _all_gather_tensors(output, group, tp_size)
-                        assert all(
-                            torch.equal(peer_output, output) for peer_output in peer_outputs
-                        )
+                        assert all(torch.equal(peer_output, output) for peer_output in peer_outputs)
 
                         baseline = output.clone()
                         for _ in range(3):
