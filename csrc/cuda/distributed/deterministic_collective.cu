@@ -185,8 +185,9 @@ void launch_reduce_scatter(
 __global__ void deterministic_all_gather_kernel(
     PeerPointers peers,
     uint8_t* output,
-    int64_t input_bytes) {
-  const int64_t output_bytes = input_bytes * kDeterministicWorldSize;
+    int64_t input_bytes,
+    int64_t world_size) {
+  const int64_t output_bytes = input_bytes * world_size;
   const int64_t thread_index =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -428,8 +429,8 @@ class DeterministicCollectiveState {
         "all-gather output dtype must match the staged input dtype");
     TORCH_CHECK(
         output.numel() * output.element_size() ==
-            staged_bytes_ * kDeterministicWorldSize,
-        "all-gather output must contain eight staged inputs");
+            staged_bytes_ * world_size_,
+        "all-gather output must contain one staged input per rank");
 
     const int64_t output_bytes = output.numel() * output.element_size();
     if (output_bytes == 0) {
@@ -441,7 +442,8 @@ class DeterministicCollectiveState {
     deterministic_all_gather_kernel<<<blocks, kThreads, 0, stream>>>(
         peers_,
         static_cast<uint8_t*>(output.data_ptr()),
-        staged_bytes_);
+        staged_bytes_,
+        world_size_);
     AT_CUDA_CHECK(cudaGetLastError());
   }
 

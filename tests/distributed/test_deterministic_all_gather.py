@@ -14,32 +14,46 @@ import torch.multiprocessing as mp
 
 from rl_engine.distributed import DeterministicCollective
 
-_WORLD_SIZE = 8
+_MAX_WORLD_SIZE = 8
+_TP_SIZES = (1, 2, 4, 8)
 _EXTERNAL_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 pytestmark = [
     pytest.mark.skipif(
         _EXTERNAL_WORLD_SIZE != 1,
-        reason="this TP=8 test owns its worker processes; run pytest directly",
+        reason="this cross-TP test owns its worker processes; run pytest directly",
     ),
     pytest.mark.skipif(
-        torch.cuda.device_count() < _WORLD_SIZE,
+        torch.cuda.device_count() < _MAX_WORLD_SIZE,
         reason="requires eight visible CUDA GPUs",
     ),
 ]
 
 
-def _all_gather_tensors(value: torch.Tensor) -> list[torch.Tensor]:
-    gathered = [torch.empty_like(value) for _ in range(_WORLD_SIZE)]
-    dist.all_gather(gathered, value)
+def _all_gather_tensors(
+    value: torch.Tensor,
+    group: dist.ProcessGroup,
+    world_size: int,
+) -> list[torch.Tensor]:
+    gathered = [torch.empty_like(value) for _ in range(world_size)]
+    dist.all_gather(gathered, value, group=group)
     return gathered
 
 
-def _make_input(rank: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _make_global_input(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if dtype == torch.int64:
-        return torch.arange(91, device=device, dtype=dtype).reshape(13, 7) + rank * 1000
-    generator = torch.Generator(device=device).manual_seed(20260817 + rank)
-    return torch.randn(13, 7, device=device, dtype=dtype, generator=generator)
+        return torch.arange(
+            _MAX_WORLD_SIZE * 13 * 7,
+            device=device,
+            dtype=dtype,
+        ).reshape(_MAX_WORLD_SIZE * 13, 7)
+    generator = torch.Generator().manual_seed(20260817)
+    return torch.randn(
+        _MAX_WORLD_SIZE * 13,
+        7,
+        dtype=torch.float32,
+        generator=generator,
+    ).to(device=device, dtype=dtype)
 
 
 def _worker(rank: int, port: int) -> None:
@@ -49,30 +63,43 @@ def _worker(rank: int, port: int) -> None:
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
-        world_size=_WORLD_SIZE,
-        timeout=timedelta(minutes=3),
+        world_size=_MAX_WORLD_SIZE,
+        timeout=timedelta(minutes=5),
     )
     try:
-        with DeterministicCollective(device=device, max_size_bytes=1024 * 1024) as collective:
-            for dtype in (torch.float32, torch.bfloat16, torch.int64):
-                input = _make_input(rank, device, dtype)
-                expected = torch.cat(_all_gather_tensors(input), dim=0)
+        groups = {
+            tp_size: dist.new_group(ranks=list(range(tp_size))) for tp_size in _TP_SIZES
+        }
+        for tp_size, group in groups.items():
+            if rank < tp_size:
+                with DeterministicCollective(
+                    group=group,
+                    device=device,
+                    max_size_bytes=1024 * 1024,
+                ) as collective:
+                    group_rank = dist.get_rank(group=group)
+                    for dtype in (torch.float32, torch.bfloat16, torch.int64):
+                        expected = _make_global_input(device, dtype)
+                        input = expected.chunk(tp_size, dim=0)[group_rank].contiguous()
 
-                output = collective.all_gather(input)
-                assert torch.equal(output, expected)
+                        output = collective.all_gather(input)
+                        assert torch.equal(output, expected)
 
-                peer_outputs = _all_gather_tensors(output)
-                assert all(torch.equal(peer_output, output) for peer_output in peer_outputs)
+                        peer_outputs = _all_gather_tensors(output, group, tp_size)
+                        assert all(
+                            torch.equal(peer_output, output) for peer_output in peer_outputs
+                        )
 
-                baseline = output.clone()
-                for _ in range(3):
-                    repeated = collective.all_gather(input)
-                    assert torch.equal(repeated, baseline)
+                        baseline = output.clone()
+                        for _ in range(3):
+                            repeated = collective.all_gather(input)
+                            assert torch.equal(repeated, baseline)
 
-                provided = torch.empty_like(expected)
-                returned = collective.all_gather(input, out=provided)
-                assert returned is provided
-                assert torch.equal(provided, expected)
+                        provided = torch.empty_like(expected)
+                        returned = collective.all_gather(input, out=provided)
+                        assert returned is provided
+                        assert torch.equal(provided, expected)
+            dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -83,10 +110,10 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_deterministic_all_gather_tp8_cuda() -> None:
+def test_deterministic_all_gather_cross_tp_cuda() -> None:
     mp.spawn(
         _worker,
         args=(_find_free_port(),),
-        nprocs=_WORLD_SIZE,
+        nprocs=_MAX_WORLD_SIZE,
         join=True,
     )

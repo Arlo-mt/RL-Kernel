@@ -166,7 +166,11 @@ class DeterministicCollective:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Gather rank-ordered input bit patterns along dimension 0."""
+        """Gather rank-ordered input bit patterns along dimension 0.
+
+        The result is cross-TP invariant when every TP configuration partitions
+        the same global dimension 0 into equal contiguous rank-ordered shards.
+        """
 
         self._check_open()
         self._validate_gather_input(input)
