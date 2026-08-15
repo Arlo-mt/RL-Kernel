@@ -11,18 +11,19 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-_TP8_WORLD_SIZE = 8
+_SUPPORTED_WORLD_SIZES = (1, 2, 4, 8)
 _DEFAULT_MAX_SIZE_BYTES = 64 * 1024 * 1024
 _REDUCTION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 class DeterministicCollective:
-    """Correctness-first deterministic CUDA collectives for one TP=8 node.
+    """Correctness-first TP-invariant CUDA collectives for one eight-GPU node.
 
-    The logical reduction tree is fixed to ``xor 1 -> xor 2 -> xor 4``:
-    ``((rank0 + rank1) + (rank2 + rank3)) + ((rank4 + rank5) +
-    (rank6 + rank7))``. Every node evaluates the lower logical rank before
-    the higher logical rank.
+    TP sizes 1, 2, 4, and 8 use nested prefixes of the same balanced tree.
+    A reduction is cross-TP bitwise invariant when every rank input is the
+    corresponding contiguous subtree root of one canonical finest-grained
+    reduction, as produced by a TBIK-compatible row-parallel kernel. Every
+    node evaluates the lower logical subtree before the higher one.
 
     One instance owns a symmetric CUDA IPC staging buffer. All ranks must call
     its methods in the same order with matching shapes and dtypes. Calls are
@@ -47,9 +48,10 @@ class DeterministicCollective:
         self.group = group if group is not None else dist.group.WORLD
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        if self.world_size != _TP8_WORLD_SIZE:
+        if self.world_size not in _SUPPORTED_WORLD_SIZES:
             raise ValueError(
-                f"deterministic collectives require world_size=8, got {self.world_size}"
+                "deterministic collectives require world_size in "
+                f"{_SUPPORTED_WORLD_SIZES}, got {self.world_size}"
             )
 
         if device is None:
@@ -135,10 +137,11 @@ class DeterministicCollective:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return the fixed-tree sum on every rank.
+        """Return the TBIK-compatible fixed-tree sum on every rank.
 
         Supported dtypes are float32, float16, and bfloat16. ``out`` may alias
-        ``input``; the input is staged before the output kernel starts.
+        ``input``; the input is staged before the output kernel starts. Cross-TP
+        invariance requires inputs to follow the class-level subtree contract.
         """
 
         self._check_open()

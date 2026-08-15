@@ -21,13 +21,17 @@
 
 namespace {
 
-constexpr int kDeterministicWorldSize = 8;
+constexpr int kMaxDeterministicWorldSize = 8;
 constexpr int kThreads = 256;
 constexpr int kMaxBlocks = 4096;
 
 struct PeerPointers {
-  const void* values[kDeterministicWorldSize];
+  const void* values[kMaxDeterministicWorldSize];
 };
+
+bool is_supported_world_size(int64_t world_size) {
+  return world_size == 1 || world_size == 2 || world_size == 4 || world_size == 8;
+}
 
 template <typename T>
 __device__ __forceinline__ T ordered_add(T lower, T upper);
@@ -53,27 +57,43 @@ __device__ __forceinline__ nv_bfloat16 ordered_add(
 }
 #endif
 
-template <typename T>
-__device__ __forceinline__ T fixed_tree_reduce(const PeerPointers& peers, int64_t index) {
+template <typename T, int WorldSize>
+__device__ __forceinline__ T fixed_tree_reduce(
+    const PeerPointers& peers,
+    int64_t index) {
+  static_assert(
+      WorldSize == 1 || WorldSize == 2 || WorldSize == 4 || WorldSize == 8,
+      "deterministic collectives only support TP sizes 1, 2, 4, and 8");
   const auto* rank0 = static_cast<const T*>(peers.values[0]);
-  const auto* rank1 = static_cast<const T*>(peers.values[1]);
-  const auto* rank2 = static_cast<const T*>(peers.values[2]);
-  const auto* rank3 = static_cast<const T*>(peers.values[3]);
-  const auto* rank4 = static_cast<const T*>(peers.values[4]);
-  const auto* rank5 = static_cast<const T*>(peers.values[5]);
-  const auto* rank6 = static_cast<const T*>(peers.values[6]);
-  const auto* rank7 = static_cast<const T*>(peers.values[7]);
-
-  const T sum01 = ordered_add(rank0[index], rank1[index]);
-  const T sum23 = ordered_add(rank2[index], rank3[index]);
-  const T sum45 = ordered_add(rank4[index], rank5[index]);
-  const T sum67 = ordered_add(rank6[index], rank7[index]);
-  const T sum03 = ordered_add(sum01, sum23);
-  const T sum47 = ordered_add(sum45, sum67);
-  return ordered_add(sum03, sum47);
+  if constexpr (WorldSize == 1) {
+    return rank0[index];
+  } else {
+    const auto* rank1 = static_cast<const T*>(peers.values[1]);
+    const T sum01 = ordered_add(rank0[index], rank1[index]);
+    if constexpr (WorldSize == 2) {
+      return sum01;
+    } else {
+      const auto* rank2 = static_cast<const T*>(peers.values[2]);
+      const auto* rank3 = static_cast<const T*>(peers.values[3]);
+      const T sum23 = ordered_add(rank2[index], rank3[index]);
+      const T sum03 = ordered_add(sum01, sum23);
+      if constexpr (WorldSize == 4) {
+        return sum03;
+      } else {
+        const auto* rank4 = static_cast<const T*>(peers.values[4]);
+        const auto* rank5 = static_cast<const T*>(peers.values[5]);
+        const auto* rank6 = static_cast<const T*>(peers.values[6]);
+        const auto* rank7 = static_cast<const T*>(peers.values[7]);
+        const T sum45 = ordered_add(rank4[index], rank5[index]);
+        const T sum67 = ordered_add(rank6[index], rank7[index]);
+        const T sum47 = ordered_add(sum45, sum67);
+        return ordered_add(sum03, sum47);
+      }
+    }
+  }
 }
 
-template <typename T>
+template <typename T, int WorldSize>
 __global__ void deterministic_all_reduce_kernel(
     PeerPointers peers,
     T* output,
@@ -82,7 +102,37 @@ __global__ void deterministic_all_reduce_kernel(
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t index = thread_index; index < element_count; index += stride) {
-    output[index] = fixed_tree_reduce<T>(peers, index);
+    output[index] = fixed_tree_reduce<T, WorldSize>(peers, index);
+  }
+}
+
+template <typename T>
+void launch_all_reduce(
+    const PeerPointers& peers,
+    T* output,
+    int64_t element_count,
+    int blocks,
+    int64_t world_size,
+    cudaStream_t stream) {
+  switch (world_size) {
+    case 1:
+      deterministic_all_reduce_kernel<T, 1><<<blocks, kThreads, 0, stream>>>(
+          peers, output, element_count);
+      break;
+    case 2:
+      deterministic_all_reduce_kernel<T, 2><<<blocks, kThreads, 0, stream>>>(
+          peers, output, element_count);
+      break;
+    case 4:
+      deterministic_all_reduce_kernel<T, 4><<<blocks, kThreads, 0, stream>>>(
+          peers, output, element_count);
+      break;
+    case 8:
+      deterministic_all_reduce_kernel<T, 8><<<blocks, kThreads, 0, stream>>>(
+          peers, output, element_count);
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported deterministic collective world size ", world_size);
   }
 }
 
@@ -94,6 +144,7 @@ class DeterministicCollectiveState {
       const std::vector<int64_t>& offsets,
       int64_t rank)
       : rank_(rank),
+        world_size_(handles.size()),
         device_index_(staging.get_device()),
         capacity_bytes_(staging.numel() * staging.element_size()) {
     TORCH_CHECK(staging.is_cuda(), "collective staging buffer must be CUDA");
@@ -103,21 +154,24 @@ class DeterministicCollectiveState {
         "collective staging buffer must have dtype torch.uint8");
     TORCH_CHECK(capacity_bytes_ > 0, "collective staging capacity must be positive");
     TORCH_CHECK(
-        handles.size() == kDeterministicWorldSize,
-        "deterministic collectives require exactly 8 IPC handles");
+        is_supported_world_size(world_size_),
+        "deterministic collectives require world size 1, 2, 4, or 8; got ",
+        world_size_);
     TORCH_CHECK(
-        offsets.size() == kDeterministicWorldSize,
-        "deterministic collectives require exactly 8 IPC offsets");
+        offsets.size() == handles.size(),
+        "deterministic collectives require one IPC offset per handle");
     TORCH_CHECK(
-        rank_ >= 0 && rank_ < kDeterministicWorldSize,
-        "deterministic collective rank must be in [0, 8)");
+        rank_ >= 0 && rank_ < world_size_,
+        "deterministic collective rank must be in [0, ",
+        world_size_,
+        ")");
 
     for (auto& peer : peers_.values) {
       peer = nullptr;
     }
     imported_bases_.fill(nullptr);
     try {
-      for (int peer = 0; peer < kDeterministicWorldSize; ++peer) {
+      for (int peer = 0; peer < world_size_; ++peer) {
         TORCH_CHECK(
             handles[peer].size() == sizeof(cudaIpcMemHandle_t),
             "invalid CUDA IPC handle size for rank ",
@@ -208,23 +262,32 @@ class DeterministicCollectiveState {
 
     switch (output.scalar_type()) {
       case at::ScalarType::Float:
-        deterministic_all_reduce_kernel<float><<<blocks, kThreads, 0, stream>>>(
+        launch_all_reduce<float>(
             peers_,
             static_cast<float*>(output.data_ptr()),
-            element_count);
+            element_count,
+            blocks,
+            world_size_,
+            stream);
         break;
       case at::ScalarType::Half:
-        deterministic_all_reduce_kernel<half><<<blocks, kThreads, 0, stream>>>(
+        launch_all_reduce<half>(
             peers_,
             static_cast<half*>(output.data_ptr()),
-            element_count);
+            element_count,
+            blocks,
+            world_size_,
+            stream);
         break;
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
       case at::ScalarType::BFloat16:
-        deterministic_all_reduce_kernel<nv_bfloat16><<<blocks, kThreads, 0, stream>>>(
+        launch_all_reduce<nv_bfloat16>(
             peers_,
             static_cast<nv_bfloat16*>(output.data_ptr()),
-            element_count);
+            element_count,
+            blocks,
+            world_size_,
+            stream);
         break;
 #endif
       default:
@@ -250,7 +313,7 @@ class DeterministicCollectiveState {
   }
 
   void close_imports() noexcept {
-    for (int peer = 0; peer < kDeterministicWorldSize; ++peer) {
+    for (int peer = 0; peer < world_size_; ++peer) {
       if (imported_bases_[peer] != nullptr) {
         cudaIpcCloseMemHandle(imported_bases_[peer]);
         imported_bases_[peer] = nullptr;
@@ -259,13 +322,14 @@ class DeterministicCollectiveState {
   }
 
   int64_t rank_;
+  int64_t world_size_;
   int device_index_;
   int64_t capacity_bytes_;
   int64_t staged_bytes_{0};
   at::ScalarType staged_scalar_type_{at::ScalarType::Undefined};
   bool has_staged_input_{false};
   PeerPointers peers_{};
-  std::array<void*, kDeterministicWorldSize> imported_bases_{};
+  std::array<void*, kMaxDeterministicWorldSize> imported_bases_{};
 };
 
 DeterministicCollectiveState* state_from_handle(int64_t handle) {
