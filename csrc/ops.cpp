@@ -100,6 +100,7 @@ void deterministic_collective_destroy(int64_t handle);
 void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
 void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
 void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
+void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
@@ -393,6 +394,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "deterministic_collective_reduce_scatter",
         &deterministic_collective_reduce_scatter,
         "Run the TP=8 deterministic fixed-tree reduce-scatter kernel");
+    m.def(
+        "deterministic_collective_all_gather",
+        &deterministic_collective_all_gather,
+        "Run the TP=8 deterministic rank-ordered all-gather kernel");
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");

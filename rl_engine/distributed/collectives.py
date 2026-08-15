@@ -84,6 +84,7 @@ class DeterministicCollective:
             "deterministic_collective_stage",
             "deterministic_collective_all_reduce",
             "deterministic_collective_reduce_scatter",
+            "deterministic_collective_all_gather",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -156,6 +157,29 @@ class DeterministicCollective:
             self._extension.deterministic_collective_stage(self._handle, input)
             self._synchronize_ranks()
             self._extension.deterministic_collective_all_reduce(self._handle, out)
+            self._synchronize_ranks()
+        return out
+
+    def all_gather(
+        self,
+        input: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather rank-ordered input bit patterns along dimension 0."""
+
+        self._check_open()
+        self._validate_gather_input(input)
+        output_shape = (input.size(0) * self.world_size, *input.shape[1:])
+        if out is None:
+            out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        self._validate_sharded_output(out, input, output_shape)
+
+        with self._lock:
+            self._validate_matching_signature("all_gather", input)
+            self._extension.deterministic_collective_stage(self._handle, input)
+            self._synchronize_ranks()
+            self._extension.deterministic_collective_all_gather(self._handle, out)
             self._synchronize_ranks()
         return out
 
@@ -235,6 +259,19 @@ class DeterministicCollective:
                 "deterministic reductions support float32, float16, and bfloat16; "
                 f"got {input.dtype}"
             )
+        input_bytes = input.numel() * input.element_size()
+        if input_bytes > self.max_size_bytes:
+            raise ValueError(
+                f"input requires {input_bytes} bytes but max_size_bytes={self.max_size_bytes}"
+            )
+
+    def _validate_gather_input(self, input: torch.Tensor) -> None:
+        if not input.is_cuda or input.device != self.device:
+            raise ValueError(f"input must be on {self.device}, got {input.device}")
+        if not input.is_contiguous():
+            raise ValueError("input must be contiguous")
+        if input.dim() == 0:
+            raise ValueError("all_gather input must have at least one dimension")
         input_bytes = input.numel() * input.element_size()
         if input_bytes > self.max_size_bytes:
             raise ValueError(

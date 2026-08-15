@@ -182,6 +182,21 @@ void launch_reduce_scatter(
   }
 }
 
+__global__ void deterministic_all_gather_kernel(
+    PeerPointers peers,
+    uint8_t* output,
+    int64_t input_bytes) {
+  const int64_t output_bytes = input_bytes * kDeterministicWorldSize;
+  const int64_t thread_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t index = thread_index; index < output_bytes; index += stride) {
+    const int peer = static_cast<int>(index / input_bytes);
+    const int64_t peer_offset = index - static_cast<int64_t>(peer) * input_bytes;
+    output[index] = static_cast<const uint8_t*>(peers.values[peer])[peer_offset];
+  }
+}
+
 class DeterministicCollectiveState {
  public:
   DeterministicCollectiveState(
@@ -405,6 +420,31 @@ class DeterministicCollectiveState {
     AT_CUDA_CHECK(cudaGetLastError());
   }
 
+  void all_gather(torch::Tensor& output, cudaStream_t stream) const {
+    check_tensor(output, "output");
+    TORCH_CHECK(has_staged_input_, "stage() must be called before all_gather()");
+    TORCH_CHECK(
+        output.scalar_type() == staged_scalar_type_,
+        "all-gather output dtype must match the staged input dtype");
+    TORCH_CHECK(
+        output.numel() * output.element_size() ==
+            staged_bytes_ * kDeterministicWorldSize,
+        "all-gather output must contain eight staged inputs");
+
+    const int64_t output_bytes = output.numel() * output.element_size();
+    if (output_bytes == 0) {
+      return;
+    }
+    const int blocks = static_cast<int>(std::min<int64_t>(
+        kMaxBlocks,
+        (output_bytes + kThreads - 1) / kThreads));
+    deterministic_all_gather_kernel<<<blocks, kThreads, 0, stream>>>(
+        peers_,
+        static_cast<uint8_t*>(output.data_ptr()),
+        staged_bytes_);
+    AT_CUDA_CHECK(cudaGetLastError());
+  }
+
  private:
   void check_tensor(const torch::Tensor& tensor, const char* name) const {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
@@ -521,4 +561,10 @@ void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& outp
   const c10::cuda::CUDAGuard device_guard(output.device());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   state_from_handle(handle)->reduce_scatter(output, stream);
+}
+
+void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output) {
+  const c10::cuda::CUDAGuard device_guard(output.device());
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  state_from_handle(handle)->all_gather(output, stream);
 }
