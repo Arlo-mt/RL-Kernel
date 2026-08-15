@@ -28,7 +28,7 @@ tiers, in `rl_engine/alignment/cross_config/attention_binding.py`:
 | tier | fields | rule | failure |
 | --- | --- | --- | --- |
 | `IDENTICAL` | checkpoint/model/token identity plus complete TP/CP GQA head and sequence ownership | equal bit for bit | `comparable=False`; no drift number from the pair means anything |
-| `SEMANTIC` | reduction contract, dtype, exported LSE, first-class Split-KV request, complete actual Split-KV plan sets, cross-side determinism | both sides equal **and** equal to the WS2 mandate | fail closed |
+| `SEMANTIC` | reduction contract, dtype, exported LSE, first-class Split-KV request, complete actual Split-KV plan sets, CUDA QK-Norm/RoPE identity, cross-side determinism | both sides equal **and** equal to the WS2 mandate | fail closed |
 | `RECORDED` | `mode`, `backend_id`, `reduction.engine`, RoPE materialization state and fusion boundary, KV-cache paging | free to differ | recorded into provenance and measured |
 
 Two placements are load-bearing:
@@ -48,6 +48,42 @@ Two placements are load-bearing:
 `comparable` and `passed` are separate flags. A pair with mismatched identity is not
 comparable. A pair that is comparable but violates the reduction mandate is still
 rejected -- the drift would be real but attributable to the wrong thing.
+
+## H100 Attention input boundary
+
+The strict experiment does not use the PyTorch reference operators as an
+executable option. `H100AttentionPreprocessor` applies these implementations in
+the fixed Qwen3 order:
+
+1. `RMSNormCudaOp` on Q and K (`rlkernel.cuda.rmsnorm`)
+2. `RoPESM90Op` with global `[S]` or per-batch `[B, S]` positions
+   (`rlkernel.cuda.rope_sm90`)
+
+There is no Megatron/vLLM-native fallback. The CUDA RoPE path accepts non-contiguous
+global positions, including zigzag CP ownership. The launcher passes the returned
+backend evidence into `AttentionRuntimeReadback`:
+
+```python
+from rl_engine.kernels.attention_preprocess import H100AttentionPreprocessor
+
+prepared = H100AttentionPreprocessor(device)(
+    q, k, q_norm_weight, k_norm_weight, position_ids
+)
+readback = AttentionRuntimeReadback(
+    # contract, knobs, Split-KV plan set, source, and scope fields omitted here
+    **prepared.readback_fields(),
+)
+```
+
+Strict binding rejects a missing backend ID, a runtime-native backend ID, or any
+reported fallback. Printing a configured backend without executing it is not
+accepted as evidence.
+
+The boundary starts at projected Q/K/V. Pre-attention model RMSNorm, QKV projection
+GEMM, and projection-owned TP/SP All-Gather/Reduce-Scatter are not part of the
+Attention operator experiment. The isolated H100 test must therefore capture or
+reuse identical projected Q/K/V inputs. Those upstream operators must be aligned
+separately before making an end-to-end Megatron-vLLM logprob claim.
 
 ## Determinism is not one thing
 
@@ -83,7 +119,8 @@ adapters:
   limits) and `VllmRolloutMaterializer`.
 * `AttentionRuntimeReadback` -- the explicit handoff from an executed engine. It
   carries the reconstructed actual contract, actual knob values, frozen-scope
-  verification, and the complete Split-KV runtime plan set.
+  verification, executed CUDA QK-Norm/RoPE identities and fallback state, and the
+  complete Split-KV runtime plan set.
 
 Constructing a contract is not runtime verification. Without a readback, adapter
 applications are `UNOBSERVABLE`; only matching values reconstructed from a real
@@ -107,6 +144,7 @@ collapsing them onto the supported value:
 | configured contract without runtime readback | `UNOBSERVABLE` | requested values do not prove what executed |
 | `rollout.context_parallel_size>1` with effective decode CP=1 | `ERROR`/`FALLBACK` | strict TP=2/CP=2 acceptance rejects the topology change |
 | missing/mismatched/fallback Split-KV plan set | binding failure | Split-KV provenance must cover every batch/TP/CP/owner coordinate |
+| missing/native/fallback QK-Norm or RoPE backend | binding failure | both sides must execute the RL-Kernel CUDA preprocessing path |
 
 ## Knobs
 
@@ -139,7 +177,9 @@ retired rather than rewritten.
 
 Deliberately not in this PR:
 
-* launching `torchrun`, initializing process groups, or executing attention;
+* launching `torchrun`, initializing process groups, or executing core attention;
+* pre-attention model RMSNorm, QKV projection GEMM, and projection-owned TP/SP
+  communication; isolated tests reuse identical projected Q/K/V;
 * decode-mode materialization, which needs the validated `KVCacheSpec` from #235 PR6
   and is refused with that reference rather than stubbed;
 * Transformer Engine calls of any kind (PR4's TE plan is policy and provenance only);

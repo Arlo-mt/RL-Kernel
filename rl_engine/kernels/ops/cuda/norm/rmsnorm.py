@@ -79,6 +79,21 @@ def rmsnorm_cuda(x, weight, eps=1e-6, mask=None):
 class RMSNormCudaOp:
     """CUDA RMSNorm wrapper compatible with the shared operator harness."""
 
+    backend_id = "rlkernel.cuda.rmsnorm"
+
+    def __init__(self):
+        required = (
+            "rmsnorm_forward",
+            "rmsnorm_backward_dx",
+            "rmsnorm_backward_dw",
+        )
+        missing = [name for name in required if not _EXT_AVAILABLE or not hasattr(_C, name)]
+        if missing:
+            raise RuntimeError(
+                "CUDA RMSNorm extension is incomplete; rebuild _C with rmsnorm.cu "
+                f"(missing: {', '.join(missing)})"
+            )
+
     def __call__(self, x, weight, *, eps=1e-6):
         return self.forward(x, weight, eps=eps)
 

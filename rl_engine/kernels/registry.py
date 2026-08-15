@@ -95,6 +95,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     )
 
     # RMSNorm(pre-norm / QK-Norm) - pure Pytorch reference(ws1 ground-truth)
+    CUDA_RMS_NORM = "rl_engine.kernels.ops.cuda.norm.rmsnorm.RMSNormCudaOp"
     PYTORCH_NATIVE_RMS_NORM = "rl_engine.kernels.ops.pytorch.norm.rms_norm.NativeRMSNormOp"
 
     # Generic fallback
@@ -348,7 +349,10 @@ class KernelRegistry:
                     OpBackend.TRITON_BATCH_INVARIANT_LOGP,
                     OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
                 ],
-                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "rms_norm": [
+                    OpBackend.CUDA_RMS_NORM,
+                    OpBackend.PYTORCH_NATIVE_RMS_NORM,
+                ],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [

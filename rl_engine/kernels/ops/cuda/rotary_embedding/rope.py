@@ -18,7 +18,7 @@ from rl_engine.utils.logger import logger
 
 
 def _build_cos_sin(positions: Tensor, half: int, theta: float, device: torch.device):
-    """fp32 cos/sin caches of shape [S, half], identical math to NativeRoPEOp."""
+    """fp32 cos/sin rows, identical math to NativeRoPEOp."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half))
     pos = positions.to(device=device, dtype=torch.float32).reshape(-1, 1)
     freqs = pos * inv_freq  # [S, half]
@@ -31,19 +31,39 @@ class _RoPEFunction(torch.autograd.Function):
         D = x.shape[-1]
         if D % 2 != 0:
             raise ValueError(f"RoPE head_dim must be even, got {D}")
-        if positions.dim() != 1:
-            raise NotImplementedError(
-                "CUDA RoPE currently supports 1-D positions [S] (shared across batch)."
-            )
-        S = positions.shape[0]
+        if positions.dim() not in (1, 2):
+            raise ValueError("positions must have shape [S] or [B, S]")
+        S = positions.shape[-1]
+        if S == 0:
+            raise ValueError("positions must not be empty")
+        if x.shape[-2] != S:
+            raise ValueError(f"x sequence length {x.shape[-2]} does not match positions length {S}")
         x_2d = x.contiguous().reshape(-1, D)
         n_rows = x_2d.shape[0]
-        if n_rows % S != 0:
+        if positions.dim() == 2:
+            batch = positions.shape[0]
+            if x.dim() < 3 or x.shape[0] != batch:
+                raise ValueError(
+                    f"x batch size {x.shape[0]} does not match positions batch size {batch}"
+                )
+            rows_per_token = n_rows // (batch * S)
+            if rows_per_token * batch * S != n_rows:
+                raise ValueError("x rows are incompatible with [B, S] positions")
+            # The CUDA kernel accepts one fp32 cos/sin row per flattened x row.
+            # Expanding positions preserves arbitrary global/zigzag indices while
+            # keeping the arithmetic inside the precompiled deterministic kernel.
+            kernel_positions = (
+                positions[:, None, :].expand(batch, rows_per_token, S).contiguous().reshape(-1)
+            )
+        else:
+            kernel_positions = positions
+        if n_rows % kernel_positions.numel() != 0:
             raise ValueError(
-                f"row count {n_rows} not divisible by seq length {S}; "
+                f"row count {n_rows} not divisible by position rows "
+                f"{kernel_positions.numel()}; "
                 "expected a [..., S, D] contiguous layout."
             )
-        cos, sin = _build_cos_sin(positions, D // 2, float(theta), x.device)
+        cos, sin = _build_cos_sin(kernel_positions, D // 2, float(theta), x.device)
         ctx.save_for_backward(cos, sin)
         out = _C.rope_apply_sm90(x_2d, cos, sin, 1.0)
         return out.reshape(x.shape)
@@ -70,6 +90,7 @@ class RoPESM90Op:
     """
 
     op_class = "elementwise"
+    backend_id = "rlkernel.cuda.rope_sm90"
 
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "rope_apply_sm90"):

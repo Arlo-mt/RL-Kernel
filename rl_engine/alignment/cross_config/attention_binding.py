@@ -54,6 +54,7 @@ from rl_engine.kernels.attention_contract import (
     SplitKVRuntimePlanSet,
     validate_split_kv_plan_set_alignment,
 )
+from rl_engine.kernels.attention_preprocess import MANDATED_ATTENTION_PREPROCESS_BACKENDS
 
 __all__ = [
     "ATTENTION_LSE_DOMAIN",
@@ -108,6 +109,9 @@ class BindingErrorCode(str, Enum):
     SPLIT_KV_RUNTIME_MISSING = "SPLIT_KV_RUNTIME_MISSING"
     SPLIT_KV_MISMATCH = "SPLIT_KV_MISMATCH"
     SPLIT_KV_FALLBACK = "SPLIT_KV_FALLBACK"
+    ATTENTION_PREPROCESS_MISSING = "ATTENTION_PREPROCESS_MISSING"
+    ATTENTION_PREPROCESS_MISMATCH = "ATTENTION_PREPROCESS_MISMATCH"
+    ATTENTION_PREPROCESS_FALLBACK = "ATTENTION_PREPROCESS_FALLBACK"
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,8 @@ class AttentionRuntimeReadback:
     split_kv_plan_set: SplitKVRuntimePlanSet
     source: str
     frozen_scope_verified: bool
+    preprocess_backends: Mapping[str, str] = field(default_factory=dict)
+    preprocess_fallback: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.contract, AttentionContract):
@@ -131,11 +137,25 @@ class AttentionRuntimeReadback:
             raise ValueError("runtime readback source must be a non-empty string")
         if not isinstance(self.frozen_scope_verified, bool):
             raise TypeError("frozen_scope_verified must be a bool")
+        if not isinstance(self.preprocess_backends, Mapping):
+            raise TypeError("runtime readback preprocess_backends must be a mapping")
+        for name, backend in self.preprocess_backends.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("preprocess backend names must be non-empty strings")
+            if not isinstance(backend, str) or not backend.strip():
+                raise ValueError("preprocess backend IDs must be non-empty strings")
+        if not isinstance(self.preprocess_fallback, bool):
+            raise TypeError("preprocess_fallback must be a bool")
 
         plan_error = _split_kv_plan_contract_error(self.contract, self.split_kv_plan_set)
         if plan_error is not None:
             raise ValueError(plan_error)
         object.__setattr__(self, "actual_knobs", MappingProxyType(dict(self.actual_knobs)))
+        object.__setattr__(
+            self,
+            "preprocess_backends",
+            MappingProxyType(dict(self.preprocess_backends)),
+        )
 
     @property
     def split_kv_fallback(self) -> bool:
@@ -147,6 +167,10 @@ class AttentionRuntimeReadback:
             "frozen_scope_verified": self.frozen_scope_verified,
             "contract": self.contract.to_dict(),
             "actual_knobs": dict(self.actual_knobs),
+            "attention_preprocess": {
+                "backends": dict(self.preprocess_backends),
+                "fallback": self.preprocess_fallback,
+            },
             "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
         }
 
@@ -253,6 +277,9 @@ RECORDED_FIELDS: tuple[str, ...] = (
     "rope.k_cache_state",
     "rope.cast_at",
     "rope.output_dtype",
+    "preprocess.qk_rmsnorm",
+    "preprocess.rope",
+    "preprocess.fallback",
     "kv_cache.page_size",
     "kv_cache.prefix_cache_enabled",
     "kv_cache.block_table_shape",
@@ -300,7 +327,7 @@ class AttentionBindingResult:
     binding_fingerprint: str = ""
     recorded_differences: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
-    schema_version: str = "cross_config.attention_binding.v2"
+    schema_version: str = "cross_config.attention_binding.v3"
 
     def issues_by_code(self, code: BindingErrorCode) -> tuple[BindingIssue, ...]:
         return tuple(issue for issue in self.issues if issue.code is code)
@@ -774,6 +801,22 @@ def bind_attention_contracts(
                 "lse_domain": ATTENTION_LSE_DOMAIN,
                 "rollout_backend": rollout_backend_id,
                 "training_backend": training_backend_id,
+                "attention_preprocess": {
+                    "rollout": {
+                        name: rollout_recorded.get(f"preprocess.{name}")
+                        for name in (
+                            *MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+                            "fallback",
+                        )
+                    },
+                    "training": {
+                        name: training_recorded.get(f"preprocess.{name}")
+                        for name in (
+                            *MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+                            "fallback",
+                        )
+                    },
+                },
             }
         ),
         recorded_differences=recorded_differences,
@@ -809,6 +852,7 @@ def bind_attention_runtime_readbacks(
                     message=f"{side} runtime did not verify the frozen attention scope",
                 )
             )
+        missing_scope_evidence.extend(_attention_preprocess_issues(side, readback))
     return bind_attention_contracts(
         rollout_contract=rollout.contract,
         training_contract=training.contract,
@@ -819,7 +863,66 @@ def bind_attention_runtime_readbacks(
         determinism_issues=tuple(determinism_issues) + tuple(missing_scope_evidence),
         rollout_split_kv_plan_set=rollout.split_kv_plan_set,
         training_split_kv_plan_set=training.split_kv_plan_set,
+        rollout_recorded_extra={
+            **{
+                f"preprocess.{name}": backend
+                for name, backend in rollout.preprocess_backends.items()
+            },
+            "preprocess.fallback": rollout.preprocess_fallback,
+        },
+        training_recorded_extra={
+            **{
+                f"preprocess.{name}": backend
+                for name, backend in training.preprocess_backends.items()
+            },
+            "preprocess.fallback": training.preprocess_fallback,
+        },
     )
+
+
+def _attention_preprocess_issues(
+    side: str,
+    readback: AttentionRuntimeReadback,
+) -> list[BindingIssue]:
+    issues: list[BindingIssue] = []
+    for name, mandated in MANDATED_ATTENTION_PREPROCESS_BACKENDS.items():
+        actual = readback.preprocess_backends.get(name)
+        if actual is None:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PREPROCESS_MISSING,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.preprocess.{name}",
+                    message=(
+                        f"{side} did not report the executed {name} backend; "
+                        "runtime-native execution cannot validate the Attention input boundary"
+                    ),
+                )
+            )
+        elif actual != mandated:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.preprocess.{name}",
+                    rollout=actual if side == "rollout" else None,
+                    training=actual if side == "training" else None,
+                    message=(
+                        f"{side} executed {actual!r}; "
+                        f"the H100 experiment requires {mandated!r}"
+                    ),
+                )
+            )
+    if readback.preprocess_fallback:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_PREPROCESS_FALLBACK,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.preprocess.fallback",
+                message=f"{side} reported a QK-Norm or RoPE backend fallback",
+            )
+        )
+    return issues
 
 
 def summarize_binding(result: AttentionBindingResult) -> str:

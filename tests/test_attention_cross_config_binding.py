@@ -55,6 +55,9 @@ from rl_engine.kernels.attention_contract import (
     SplitKVSpec,
     build_split_kv_runtime_plan_set,
 )
+from rl_engine.kernels.attention_preprocess import (
+    MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -626,6 +629,8 @@ def _readback(materializer, flat, *, source):
         split_kv_plan_set=_plan_set(contract, backend=source),
         source=source,
         frozen_scope_verified=True,
+        preprocess_backends=MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+        preprocess_fallback=False,
     )
 
 
@@ -683,6 +688,8 @@ def test_runtime_readback_mismatch_is_a_fallback():
         split_kv_plan_set=readback.split_kv_plan_set,
         source=readback.source,
         frozen_scope_verified=True,
+        preprocess_backends=readback.preprocess_backends,
+        preprocess_fallback=readback.preprocess_fallback,
     )
     normalized = {
         "batch": {"size": 2},
@@ -760,6 +767,58 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
     assert result.provenance["split_kv_runtime"]["rollout"]["coverage"] == (
         "complete_batch_tp_cp_owner_cartesian_product"
     )
+    assert result.provenance["rollout"]["recorded"]["preprocess.qk_rmsnorm"] == (
+        MANDATED_ATTENTION_PREPROCESS_BACKENDS["qk_rmsnorm"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("backends", "fallback", "expected_code"),
+    [
+        (
+            {"rope": MANDATED_ATTENTION_PREPROCESS_BACKENDS["rope"]},
+            False,
+            BindingErrorCode.ATTENTION_PREPROCESS_MISSING,
+        ),
+        (
+            {**MANDATED_ATTENTION_PREPROCESS_BACKENDS, "qk_rmsnorm": "vllm.native"},
+            False,
+            BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+        ),
+        (
+            dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS),
+            True,
+            BindingErrorCode.ATTENTION_PREPROCESS_FALLBACK,
+        ),
+    ],
+)
+def test_strict_runtime_readback_rejects_unverified_preprocess_backend(
+    backends, fallback, expected_code
+):
+    rollout = _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback")
+    rollout = replace(
+        rollout,
+        preprocess_backends=backends,
+        preprocess_fallback=fallback,
+    )
+    training = _readback(
+        MegatronAttentionMaterializer(),
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="rlkernel.cp_attention_reference",
+    )
+
+    assert result.comparable
+    assert not result.passed
+    assert result.issues_by_code(expected_code)
 
 
 def test_strict_runtime_readback_entrypoint_rejects_unverified_frozen_scope():
