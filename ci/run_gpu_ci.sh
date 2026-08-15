@@ -17,7 +17,7 @@ TARGET_SM="${TARGET_SM:-}"
 KERNEL_ALIGN_FORCE_SM90="${KERNEL_ALIGN_FORCE_SM90:-}"
 
 CI_IMAGE="${CI_IMAGE:-runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04}"
-DISK_GB=40
+DISK_GB="${DISK_GB:-60}"
 PR_SHA="${PR_SHA:-$(date +%s)}"
 POD_NAME="rl-kernel-ci-${PR_SHA:0:7}"
 READY_RETRIES=60
@@ -121,6 +121,8 @@ SSH_OPTIONS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogL
 TEST_SUITE="${TEST_SUITE:-full}"
 if [ "$TEST_SUITE" = "ws1-gtest" ]; then
   TEST_CMD='bash ci/run_ws1_gtest.sh'
+elif [ "$TEST_SUITE" = "ws1-chain" ]; then
+  TEST_CMD='bash ci/run_ws1_chain_gate.sh'
 elif [ "${GPU_COUNT}" -gt 1 ]; then
   TEST_CMD='"$PY" -m torch.distributed.run --nproc_per_node='"${GPU_COUNT}"' -m pytest tests/ -v'
 else
@@ -140,6 +142,7 @@ echo "[remote] Using interpreter: $PY"
 export FORCE_CUDA=1
 export MAX_JOBS=8
 export KERNEL_ALIGN_FORCE_SM90="'"${KERNEL_ALIGN_FORCE_SM90}"'"
+export WS1_TEST_SUITE="'"${TEST_SUITE}"'"
 
 # normalize_sm: compact (90) or dotted (9.0) compute cap -> torch dotted form, keeping +PTX.
 normalize_sm() {
@@ -196,6 +199,16 @@ nvidia-smi
 # Enforce _C in the pytest suite too (test_extension_smoke.py skips unless this is set).
 export RL_KERNEL_REQUIRE_EXT=1
 export WS1_C8_JSON=/tmp/ws1-c8-ci.json
+export WS1_WEIGHTS_PATH="'"${WS1_WEIGHTS_PATH:-}"'"
+if [ "$WS1_TEST_SUITE" = "ws1-chain" ]; then
+  if [ -n "$WS1_WEIGHTS_PATH" ] && [ -d "$WS1_WEIGHTS_PATH" ]; then
+    "$PY" scripts/prepare_ws1_weights.py \
+      --output "$WS1_WEIGHTS_PATH" --verify-only
+  else
+    export WS1_WEIGHTS_PATH=/workspace/models/Qwen3-8B
+    "$PY" scripts/prepare_ws1_weights.py --output "$WS1_WEIGHTS_PATH"
+  fi
+fi
 '"${TEST_CMD}"
 
 echo "[ci] Launching remote test suite on GPU pod (Distributed Execution Mode: TP=${GPU_COUNT}, suite=${TEST_SUITE})..."
@@ -211,6 +224,19 @@ if [ "$TEST_SUITE" = "ws1-gtest" ]; then
   mkdir -p artifacts
   scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c8-ci.json artifacts/ws1-c8-ci.json
   test -s artifacts/ws1-c8-ci.json
+fi
+
+if [ "$TEST_SUITE" = "ws1-chain" ]; then
+  if [ "$TEST_EXIT" -ne 0 ]; then
+    echo "[ci] Remote WS1 chain gate failed with exit code = $TEST_EXIT"
+    exit "$TEST_EXIT"
+  fi
+  echo "[ci] Fetching C10/C11 artifacts from the pod"
+  mkdir -p artifacts
+  scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c10-cuda_bf16.json artifacts/ws1-c10-cuda_bf16.json
+  scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c10-triton_cuda_bf16.json artifacts/ws1-c10-triton_cuda_bf16.json
+  test -s artifacts/ws1-c10-cuda_bf16.json
+  test -s artifacts/ws1-c10-triton_cuda_bf16.json
 fi
 
 echo "[ci] Remote execution finished with exit code = $TEST_EXIT"

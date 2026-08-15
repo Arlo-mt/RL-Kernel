@@ -1,0 +1,921 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 RL-Kernel Contributors
+
+"""Full Qwen3-8B Dense BI model (WS1 C9 / #275).
+
+Official depth/width/heads/vocab from the C2 manifest. C9 is assembly only:
+model-level EXIT is C10 + C11. Silent cuBLAS / cross-profile fallback is a
+hard fail. Concat-only NativeKVCacheAttnOp is not used on this path.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+import hashlib
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from rl_engine.kernels.gtest.gradient_adapters import resolve_profile_candidate
+from rl_engine.kernels.gtest.operator_specs import OP_SPECS, _load_object
+from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
+from rl_engine.testing.ws1_workload import (
+    WS1Manifest,
+    load_manifest,
+    weight_snapshot_hash,
+)
+
+OFFICIAL_FINGERPRINT = {
+    "num_hidden_layers": 36,
+    "hidden_size": 4096,
+    "intermediate_size": 12288,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "max_position_embeddings": 40960,
+    "rope_theta": 1000000.0,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "swiglu": True,
+    "tie_word_embeddings": False,
+    "attention_bias": False,
+    "qk_norm": True,
+}
+
+NODE_KINDS = (
+    "embedding",
+    "rms_norm",
+    "det_gemm",
+    "qk_norm",
+    "rope",
+    "attention",
+    "swiglu",
+    "lm_head",
+    "logprob",
+)
+
+
+@dataclass(frozen=True)
+class Qwen3DenseSpec:
+    """Pinned official Qwen3-8B Dense identity. Shrinking any field is forbidden."""
+
+    num_hidden_layers: int
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    max_position_embeddings: int
+    rope_theta: float
+    rms_norm_eps: float
+    hidden_act: str
+    swiglu: bool
+    tie_word_embeddings: bool
+    attention_bias: bool
+    qk_norm: bool
+    workload_id: str
+    model_id: str
+    revision: str
+    weight_content_hash: str
+    weight_index_file: str
+    weight_index_sha256: str
+    weight_shards: tuple[tuple[str, str, int], ...]
+
+    @classmethod
+    def from_manifest(cls, manifest: WS1Manifest | None = None) -> Qwen3DenseSpec:
+        m = manifest if manifest is not None else load_manifest()
+        ident = m.model_identity
+        fp = ident["config_fingerprint"]
+        for key, expected in OFFICIAL_FINGERPRINT.items():
+            got = fp.get(key)
+            if got != expected:
+                raise ValueError(
+                    f"C9 forbids architecture shrink/drift: fingerprint {key}={got!r} "
+                    f"!= official {expected!r}"
+                )
+        snap = ident["weight_snapshot"]
+        shards = tuple(
+            (
+                str(item["filename"]),
+                str(item["sha256"]),
+                int(item["size_bytes"]),
+            )
+            for item in snap["shards"]
+        )
+        return cls(
+            num_hidden_layers=int(fp["num_hidden_layers"]),
+            hidden_size=int(fp["hidden_size"]),
+            intermediate_size=int(fp["intermediate_size"]),
+            num_attention_heads=int(fp["num_attention_heads"]),
+            num_key_value_heads=int(fp["num_key_value_heads"]),
+            head_dim=int(fp["head_dim"]),
+            vocab_size=int(fp["vocab_size"]),
+            max_position_embeddings=int(fp["max_position_embeddings"]),
+            rope_theta=float(fp["rope_theta"]),
+            rms_norm_eps=float(fp["rms_norm_eps"]),
+            hidden_act=str(fp["hidden_act"]),
+            swiglu=bool(fp["swiglu"]),
+            tie_word_embeddings=bool(fp["tie_word_embeddings"]),
+            attention_bias=bool(fp["attention_bias"]),
+            qk_norm=bool(fp["qk_norm"]),
+            workload_id=m.workload_id,
+            model_id=str(ident["model_id"]),
+            revision=str(ident["revision"]),
+            weight_content_hash=str(snap["content_hash"]),
+            weight_index_file=str(snap["index_file"]),
+            weight_index_sha256=str(snap["index_sha256"]),
+            weight_shards=shards,
+        )
+
+    def node_names(self) -> tuple[str, ...]:
+        names: list[str] = ["embedding"]
+        for index in range(self.num_hidden_layers):
+            prefix = f"layers.{index}"
+            names.extend(
+                [
+                    f"{prefix}.input_layernorm",
+                    f"{prefix}.q_proj",
+                    f"{prefix}.k_proj",
+                    f"{prefix}.v_proj",
+                    f"{prefix}.q_norm",
+                    f"{prefix}.k_norm",
+                    f"{prefix}.rope_q",
+                    f"{prefix}.rope_k",
+                    f"{prefix}.attn",
+                    f"{prefix}.o_proj",
+                    f"{prefix}.residual_attn",
+                    f"{prefix}.post_attention_layernorm",
+                    f"{prefix}.gate_proj",
+                    f"{prefix}.up_proj",
+                    f"{prefix}.swiglu",
+                    f"{prefix}.down_proj",
+                    f"{prefix}.residual_mlp",
+                ]
+            )
+        names.extend(["final_layernorm", "lm_head", "logprob", "loss"])
+        return tuple(names)
+
+    def node_kind(self, node_name: str) -> str:
+        if node_name == "embedding":
+            return "embedding"
+        if node_name in {"final_layernorm"} or node_name.endswith("layernorm"):
+            return "rms_norm"
+        if node_name.endswith((".q_norm", ".k_norm")):
+            return "qk_norm"
+        if node_name.endswith((".rope_q", ".rope_k")):
+            return "rope"
+        if node_name.endswith(".attn"):
+            return "attention"
+        if node_name.endswith(".swiglu"):
+            return "swiglu"
+        if node_name.endswith(
+            (
+                ".q_proj",
+                ".k_proj",
+                ".v_proj",
+                ".o_proj",
+                ".gate_proj",
+                ".up_proj",
+                ".down_proj",
+            )
+        ):
+            return "det_gemm"
+        if node_name.endswith((".residual_attn", ".residual_mlp")):
+            return "residual_add"
+        if node_name == "lm_head":
+            return "lm_head"
+        if node_name == "logprob":
+            return "logprob"
+        if node_name == "loss":
+            return "masked_loss"
+        raise KeyError(f"unknown node {node_name!r}")
+
+
+@dataclass
+class ProfileOps:
+    """Resolved per-kind operators for one backend profile."""
+
+    backend_profile: str
+    ops: dict[str, Any]
+    provenance: dict[str, dict[str, str]]
+    observations: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def get(self, kind: str) -> Any:
+        if kind in {"residual_add", "masked_loss"}:
+            return None
+        if kind not in self.ops:
+            raise RuntimeError(
+                f"profile {self.backend_profile!r} missing op for node kind {kind!r}"
+            )
+        return self.ops[kind]
+
+    def observe(self, kind: str, output: torch.Tensor) -> None:
+        """Record the candidate object that actually produced a model tensor."""
+
+        op = self.get(kind)
+        actual_path = _object_path(op)
+        declared = self.provenance[kind]
+        expected_path = declared["candidate_path"]
+        if actual_path != expected_path:
+            raise RuntimeError(
+                f"profile {self.backend_profile!r} node {kind!r} executed "
+                f"{actual_path!r}, expected {expected_path!r}"
+            )
+        if not isinstance(output, torch.Tensor):
+            raise TypeError(f"profile node {kind!r} did not return a Tensor")
+        if declared["status"] != "gold_reference" and output.device.type != "cuda":
+            raise RuntimeError(
+                f"profile {self.backend_profile!r} node {kind!r} returned "
+                f"non-CUDA output on {output.device}"
+            )
+        previous = self.observations.get(kind)
+        count = 1 if previous is None else int(previous["execution_count"]) + 1
+        self.observations[kind] = {
+            "requested_backend": declared["requested_backend"],
+            "actual_backend": declared["actual_backend"],
+            "expected_kernel_id": expected_path,
+            "observed_kernel_id": actual_path,
+            "execution_count": count,
+            "output_device": str(output.device),
+            "output_dtype": str(output.dtype).removeprefix("torch."),
+            "fallback_observed": False,
+        }
+
+    def validated_runtime_observations(self) -> dict[str, dict[str, Any]]:
+        """Return complete model-level observations, failing closed if any are absent."""
+
+        missing = sorted(set(NODE_KINDS) - set(self.observations))
+        if missing:
+            raise RuntimeError(
+                f"profile {self.backend_profile!r} has no runtime observation for {missing}"
+            )
+        for kind, observation in self.observations.items():
+            if observation["execution_count"] <= 0:
+                raise RuntimeError(f"profile node {kind!r} was not executed")
+            if observation["observed_kernel_id"] != observation["expected_kernel_id"]:
+                raise RuntimeError(f"profile node {kind!r} used an unexpected candidate")
+            if observation["fallback_observed"]:
+                raise RuntimeError(f"profile node {kind!r} reported a fallback")
+        return {kind: dict(value) for kind, value in self.observations.items()}
+
+
+def load_profile_ops(
+    backend_profile: str,
+    manifest: WS1Manifest | None = None,
+    *,
+    allow_pytorch_gold: bool = False,
+) -> ProfileOps:
+    """Load C2-declared candidates. Missing required nodes are red, not N/A."""
+
+    m = manifest if manifest is not None else load_manifest()
+    if backend_profile not in m.backend_profiles:
+        raise ValueError(f"unknown backend_profile {backend_profile!r}")
+    family = str(m.backend_profiles[backend_profile]["backend_family"])
+    ops: dict[str, Any] = {}
+    provenance: dict[str, dict[str, str]] = {}
+    kind_to_adapter = {
+        "embedding": "embedding",
+        "rms_norm": "rms_norm",
+        "det_gemm": "det_gemm",
+        "qk_norm": "qk_norm",
+        "rope": "rope",
+        "attention": "attention",
+        "swiglu": "swiglu",
+        "lm_head": "lm_head",
+        "logprob": "logp",
+    }
+    for kind, adapter_name in kind_to_adapter.items():
+        if allow_pytorch_gold:
+            spec = OP_SPECS[adapter_name]
+            ops[kind] = _load_object(spec.gold_path)()
+            provenance[kind] = {
+                "requested_backend": "pytorch",
+                "actual_backend": "pytorch",
+                "candidate_path": spec.gold_path,
+                "status": "gold_reference",
+            }
+            continue
+        resolved = resolve_profile_candidate(
+            _adapter_stub(adapter_name, kind if kind != "logprob" else "logprob"),
+            backend_profile,
+            m,
+        )
+        status = str(resolved["status"])
+        if status == "missing_required":
+            raise RuntimeError(
+                f"profile {backend_profile!r} node {kind!r} is missing_required; "
+                "C9 treats a missing Triton/CUDA node as red"
+            )
+        expected = resolved.get("expected_backend_id")
+        path = resolved.get("candidate_path")
+        if not expected or not path:
+            raise RuntimeError(
+                f"profile {backend_profile!r} node {kind!r} has no declared candidate path"
+            )
+        if _family(str(expected)) != family:
+            raise RuntimeError(
+                f"profile {backend_profile!r} node {kind!r} candidate {expected!r} "
+                f"is not family {family!r}"
+            )
+        ops[kind] = _load_object(str(path))()
+        provenance[kind] = {
+            "requested_backend": str(expected),
+            "actual_backend": str(expected),
+            "candidate_path": str(path),
+            "status": status,
+        }
+    return ProfileOps(backend_profile=backend_profile, ops=ops, provenance=provenance)
+
+
+def _adapter_stub(op_name: str, chain_node: str) -> Any:
+    from rl_engine.kernels.gtest.gradient_adapters import get_adapter
+
+    adapter = get_adapter(op_name)
+    if adapter.chain_node != chain_node and op_name != "logp":
+        # logp adapter chain_node is "logprob"
+        pass
+    return adapter
+
+
+def _family(candidate: str) -> str:
+    if candidate.startswith("cuda"):
+        return "cuda"
+    if candidate == "triton":
+        return "triton"
+    return candidate
+
+
+def _object_path(value: Any) -> str:
+    cls = value.__class__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+class Qwen3DenseWeights:
+    """Official-shape parameter bag. Not allocated in ordinary CPU tests."""
+
+    def __init__(self, tensors: dict[str, torch.Tensor], source: str, content_hash: str):
+        self.tensors = tensors
+        self.source = source
+        self.content_hash = content_hash
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self.tensors[key]
+
+    @classmethod
+    def synthetic(
+        cls,
+        spec: Qwen3DenseSpec,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        seed: int,
+    ) -> Qwen3DenseWeights:
+        """Official shapes, seeded values. Valid for C9 wiring, not C10/C11 EXIT."""
+
+        dev = torch.device(device)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(seed))
+        tensors: dict[str, torch.Tensor] = {}
+
+        def randn(name: str, shape: tuple[int, ...]) -> None:
+            cpu = torch.randn(shape, generator=gen, dtype=torch.float32)
+            tensors[name] = cpu.to(device=dev, dtype=dtype)
+
+        def ones(name: str, shape: tuple[int, ...]) -> None:
+            tensors[name] = torch.ones(shape, device=dev, dtype=dtype)
+
+        randn("embed_tokens.weight", (spec.vocab_size, spec.hidden_size))
+        for index in range(spec.num_hidden_layers):
+            p = f"layers.{index}"
+            ones(f"{p}.input_layernorm.weight", (spec.hidden_size,))
+            randn(f"{p}.self_attn.q_proj.weight", (spec.hidden_size, spec.hidden_size))
+            randn(
+                f"{p}.self_attn.k_proj.weight",
+                (spec.num_key_value_heads * spec.head_dim, spec.hidden_size),
+            )
+            randn(
+                f"{p}.self_attn.v_proj.weight",
+                (spec.num_key_value_heads * spec.head_dim, spec.hidden_size),
+            )
+            randn(f"{p}.self_attn.o_proj.weight", (spec.hidden_size, spec.hidden_size))
+            ones(f"{p}.self_attn.q_norm.weight", (spec.head_dim,))
+            ones(f"{p}.self_attn.k_norm.weight", (spec.head_dim,))
+            ones(f"{p}.post_attention_layernorm.weight", (spec.hidden_size,))
+            randn(f"{p}.mlp.gate_proj.weight", (spec.intermediate_size, spec.hidden_size))
+            randn(f"{p}.mlp.up_proj.weight", (spec.intermediate_size, spec.hidden_size))
+            randn(f"{p}.mlp.down_proj.weight", (spec.hidden_size, spec.intermediate_size))
+        ones("norm.weight", (spec.hidden_size,))
+        randn("lm_head.weight", (spec.vocab_size, spec.hidden_size))
+        return cls(tensors, source="synthetic_official_shape", content_hash="synthetic")
+
+    @classmethod
+    def from_hf(
+        cls,
+        spec: Qwen3DenseSpec,
+        source: str | Path,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> Qwen3DenseWeights:
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("safetensors is required to load pinned Qwen3-8B weights") from exc
+
+        path = Path(source)
+        if not path.is_dir():
+            raise FileNotFoundError(f"weight path does not exist: {path}")
+        files = verify_hf_weight_snapshot(spec, path)
+
+        raw: dict[str, torch.Tensor] = {}
+        for shard in files:
+            with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    raw[key] = handle.get_tensor(key)
+
+        mapped = _map_hf_keys(raw)
+        required = _required_weight_keys(spec)
+        missing = [key for key in required if key not in mapped]
+        if missing:
+            raise RuntimeError(f"HF snapshot missing required tensors (first 8): {missing[:8]}")
+        dev = torch.device(device)
+        tensors = {key: mapped[key].to(device=dev, dtype=dtype) for key in required}
+        return cls(tensors, source=f"hf:{path}", content_hash=spec.weight_content_hash)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_hf_weight_snapshot(spec: Qwen3DenseSpec, source: str | Path) -> list[Path]:
+    """Verify the pinned index and every shard before loading any tensor."""
+
+    path = Path(source)
+    if not path.is_dir():
+        raise FileNotFoundError(f"weight snapshot directory does not exist: {path}")
+
+    index_path = path / spec.weight_index_file
+    if not index_path.is_file():
+        raise FileNotFoundError(f"pinned weight index is missing: {index_path}")
+    actual_index_hash = _sha256_file(index_path)
+    if actual_index_hash != spec.weight_index_sha256:
+        raise RuntimeError(
+            f"weight index SHA-256 mismatch: {actual_index_hash} " f"!= {spec.weight_index_sha256}"
+        )
+
+    observed_records: list[dict[str, Any]] = []
+    files: list[Path] = []
+    for filename, expected_hash, expected_size in spec.weight_shards:
+        shard = path / filename
+        if not shard.is_file():
+            raise FileNotFoundError(f"pinned weight shard is missing: {shard}")
+        actual_size = shard.stat().st_size
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"weight shard size mismatch for {filename}: " f"{actual_size} != {expected_size}"
+            )
+        actual_hash = _sha256_file(shard)
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                f"weight shard SHA-256 mismatch for {filename}: "
+                f"{actual_hash} != {expected_hash}"
+            )
+        observed_records.append(
+            {"filename": filename, "sha256": actual_hash, "size_bytes": actual_size}
+        )
+        files.append(shard)
+
+    observed_content_hash = weight_snapshot_hash(observed_records)
+    if observed_content_hash != spec.weight_content_hash:
+        raise RuntimeError(
+            f"weight snapshot content hash mismatch: {observed_content_hash} "
+            f"!= {spec.weight_content_hash}"
+        )
+    return files
+
+
+def _required_weight_keys(spec: Qwen3DenseSpec) -> list[str]:
+    keys = ["embed_tokens.weight", "norm.weight", "lm_head.weight"]
+    for index in range(spec.num_hidden_layers):
+        p = f"layers.{index}"
+        keys.extend(
+            [
+                f"{p}.input_layernorm.weight",
+                f"{p}.self_attn.q_proj.weight",
+                f"{p}.self_attn.k_proj.weight",
+                f"{p}.self_attn.v_proj.weight",
+                f"{p}.self_attn.o_proj.weight",
+                f"{p}.self_attn.q_norm.weight",
+                f"{p}.self_attn.k_norm.weight",
+                f"{p}.post_attention_layernorm.weight",
+                f"{p}.mlp.gate_proj.weight",
+                f"{p}.mlp.up_proj.weight",
+                f"{p}.mlp.down_proj.weight",
+            ]
+        )
+    return keys
+
+
+def _map_hf_keys(raw: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    mapped: dict[str, torch.Tensor] = {}
+    for key, value in raw.items():
+        name = key
+        if name.startswith("model."):
+            name = name[len("model.") :]
+        mapped[name] = value
+    if "lm_head.weight" not in mapped and "embed_tokens.weight" in mapped:
+        # Official Qwen3-8B is untied; refuse to silently tie.
+        raise RuntimeError("HF snapshot has no lm_head.weight; refusing to tie embeddings")
+    return mapped
+
+
+class Qwen3DenseBIModel:
+    """Full official Qwen3-8B Dense topology on the in-repo BI operator stack."""
+
+    def __init__(
+        self,
+        spec: Qwen3DenseSpec,
+        weights: Qwen3DenseWeights,
+        profile_ops: ProfileOps,
+        *,
+        execution_dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.spec = spec
+        self.weights = weights
+        self.profile_ops = profile_ops
+        self.execution_dtype = execution_dtype
+        self._last_node_outputs: dict[str, torch.Tensor] = {}
+        self._capture_nodes = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = False
+
+    @property
+    def backend_profile(self) -> str:
+        return self.profile_ops.backend_profile
+
+    def node_names(self) -> tuple[str, ...]:
+        return self.spec.node_names()
+
+    def allocate_cache(self, batch: int, max_seq_len: int, device: torch.device) -> StatefulKVCache:
+        return StatefulKVCache.allocate(
+            n_layers=self.spec.num_hidden_layers,
+            batch=batch,
+            n_kv_heads=self.spec.num_key_value_heads,
+            max_seq_len=max_seq_len,
+            head_dim=self.spec.head_dim,
+            dtype=self.execution_dtype,
+            device=device,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        target_ids: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
+        kv_cache: StatefulKVCache | None = None,
+        capture_nodes: bool = False,
+        segment_lengths: Sequence[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Teacher-forcing prefill (or one decode step when ``input_ids`` is length 1)."""
+
+        self._capture_nodes = capture_nodes
+        self._last_node_outputs = {}
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
+        batch, seq = input_ids.shape
+        device = input_ids.device
+        if position_ids is None:
+            position_ids = torch.arange(seq, device=device).unsqueeze(0).expand(batch, seq)
+        if attention_mask is None:
+            attention_mask = torch.ones((batch, seq), device=device, dtype=torch.bool)
+        else:
+            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+        if segment_lengths is not None:
+            if batch != 1:
+                raise ValueError("packed segment_lengths require B=1")
+            if int(sum(int(x) for x in segment_lengths)) != seq:
+                raise ValueError(f"segment_lengths sum {sum(segment_lengths)} != seq {seq}")
+
+        hidden = self._embed(input_ids)
+        for layer in range(self.spec.num_hidden_layers):
+            hidden = self._decoder_layer(
+                hidden,
+                position_ids,
+                attention_mask,
+                layer=layer,
+                kv_cache=kv_cache,
+                segment_lengths=segment_lengths,
+            )
+        hidden = self._rms(hidden, self.weights["norm.weight"], node="final_layernorm")
+        lm_head_op = self.profile_ops.get("lm_head")
+        logits = lm_head_op.forward(hidden, self.weights["lm_head.weight"], bias=None)
+        self.profile_ops.observe("lm_head", logits)
+        logits = self._record("lm_head", logits)
+        result: dict[str, torch.Tensor] = {"logits": logits, "hidden": hidden}
+        if target_ids is not None:
+            score_logits = logits
+            score_targets = target_ids
+            score_mask = loss_mask
+            if target_ids.shape == input_ids.shape:
+                if input_ids.shape[1] < 2:
+                    raise ValueError("causal selected-logprob requires sequence length >= 2")
+                score_logits = logits[:, :-1]
+                score_targets = target_ids[:, 1:]
+                score_mask = None if loss_mask is None else loss_mask[:, 1:]
+            logp = self._record(
+                "logprob", self._selected_logp(score_logits, score_targets)
+            )
+            result["selected_logp"] = logp
+            if score_mask is not None:
+                result["loss"] = self._masked_loss(logp, score_mask)
+        return result
+
+    def decode_step(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: StatefulKVCache,
+        *,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if input_ids.shape[1] != 1:
+            raise ValueError("decode_step expects a single new token [B, 1]")
+        return self.forward(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            kv_cache=kv_cache,
+        )
+
+    def selected_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+        loss_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Teacher-forcing selected logprob of tokens[1:] from logits[:-1]."""
+
+        outputs = self.forward(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        logits = outputs["logits"][:, :-1, :]
+        targets = input_ids[:, 1:]
+        logp = self._selected_logp(logits, targets)
+        if loss_mask is None:
+            return logp
+        return logp.masked_fill(~loss_mask[:, 1:].to(dtype=torch.bool), 0.0)
+
+    def captured_node_outputs(self) -> dict[str, torch.Tensor]:
+        return dict(self._last_node_outputs)
+
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        op = self.profile_ops.get("embedding")
+        out = op.forward(input_ids, self.weights["embed_tokens.weight"])
+        self.profile_ops.observe("embedding", out)
+        return self._record("embedding", out)
+
+    def _decoder_layer(
+        self,
+        hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        layer: int,
+        kv_cache: StatefulKVCache | None,
+        segment_lengths: Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        prefix = f"layers.{layer}"
+        normed = self._rms(
+            hidden,
+            self.weights[f"{prefix}.input_layernorm.weight"],
+            node=f"{prefix}.input_layernorm",
+        )
+        q = self._linear(
+            normed,
+            self.weights[f"{prefix}.self_attn.q_proj.weight"],
+            node=f"{prefix}.q_proj",
+        )
+        k = self._linear(
+            normed,
+            self.weights[f"{prefix}.self_attn.k_proj.weight"],
+            node=f"{prefix}.k_proj",
+        )
+        v = self._linear(
+            normed,
+            self.weights[f"{prefix}.self_attn.v_proj.weight"],
+            node=f"{prefix}.v_proj",
+        )
+        q = self._to_heads(q, self.spec.num_attention_heads)
+        k = self._to_heads(k, self.spec.num_key_value_heads)
+        v = self._to_heads(v, self.spec.num_key_value_heads)
+        q = self._qk_norm(
+            q,
+            self.weights[f"{prefix}.self_attn.q_norm.weight"],
+            node=f"{prefix}.q_norm",
+        )
+        k = self._qk_norm(
+            k,
+            self.weights[f"{prefix}.self_attn.k_norm.weight"],
+            node=f"{prefix}.k_norm",
+        )
+        q = self._rope(q, position_ids, node=f"{prefix}.rope_q")
+        k = self._rope(k, position_ids, node=f"{prefix}.rope_k")
+        key_mask = self._key_padding_mask(attention_mask, kv_cache, layer=layer, new_len=q.shape[2])
+        if kv_cache is not None:
+            kv_cache.write(k, v, layer=layer, valid_mask=attention_mask)
+            k, v, _length = kv_cache.read(layer=layer)
+        attn = self._attn(
+            q,
+            k,
+            v,
+            key_mask,
+            node=f"{prefix}.attn",
+            segment_lengths=segment_lengths,
+        )
+        attn_merged = (
+            attn.transpose(1, 2)
+            .contiguous()
+            .reshape(hidden.shape[0], q.shape[2], self.spec.hidden_size)
+        )
+        projected = self._linear(
+            attn_merged,
+            self.weights[f"{prefix}.self_attn.o_proj.weight"],
+            node=f"{prefix}.o_proj",
+        )
+        hidden = self._record(f"{prefix}.residual_attn", hidden + projected)
+        mlp_in = self._rms(
+            hidden,
+            self.weights[f"{prefix}.post_attention_layernorm.weight"],
+            node=f"{prefix}.post_attention_layernorm",
+        )
+        gate = self._linear(
+            mlp_in,
+            self.weights[f"{prefix}.mlp.gate_proj.weight"],
+            node=f"{prefix}.gate_proj",
+        )
+        up = self._linear(
+            mlp_in,
+            self.weights[f"{prefix}.mlp.up_proj.weight"],
+            node=f"{prefix}.up_proj",
+        )
+        swiglu_op = self.profile_ops.get("swiglu")
+        swiglu = swiglu_op.forward(gate, up)
+        self.profile_ops.observe("swiglu", swiglu)
+        swiglu = self._record(f"{prefix}.swiglu", swiglu)
+        down = self._linear(
+            swiglu,
+            self.weights[f"{prefix}.mlp.down_proj.weight"],
+            node=f"{prefix}.down_proj",
+        )
+        return self._record(f"{prefix}.residual_mlp", hidden + down)
+
+    def _linear(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
+        flat = x.reshape(-1, x.shape[-1])
+        # HF Linear is x @ W.T with W stored [out, in]. det_gemm is a @ b.
+        op = self.profile_ops.get("det_gemm")
+        out = op(flat, weight.t().contiguous())
+        self.profile_ops.observe("det_gemm", out)
+        return self._record(node, out.reshape(*x.shape[:-1], weight.shape[0]))
+
+    def _rms(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
+        op = self.profile_ops.get("rms_norm")
+        out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
+        self.profile_ops.observe("rms_norm", out)
+        return self._record(node, out)
+
+    def _qk_norm(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
+        # x: [B, H, S, D] -> RMS over D
+        batch, heads, seq, dim = x.shape
+        flat = x.permute(0, 2, 1, 3).reshape(batch, seq * heads, dim)
+        op = self.profile_ops.get("qk_norm")
+        out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)
+        self.profile_ops.observe("qk_norm", out)
+        return self._record(
+            node, out.reshape(batch, seq, heads, dim).permute(0, 2, 1, 3).contiguous()
+        )
+
+    def _rope(self, x: torch.Tensor, position_ids: torch.Tensor, *, node: str) -> torch.Tensor:
+        op = self.profile_ops.get("rope")
+        out = op.forward(x, position_ids, theta=self.spec.rope_theta)
+        self.profile_ops.observe("rope", out)
+        return self._record(node, out)
+
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_mask: torch.Tensor | None,
+        *,
+        node: str,
+        segment_lengths: Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        op = self.profile_ops.get("attention")
+        if segment_lengths:
+            pieces: list[torch.Tensor] = []
+            start = 0
+            for length in segment_lengths:
+                end = start + int(length)
+                mask_s = key_mask[:, start:end] if key_mask is not None else None
+                pieces.append(
+                    op.forward(
+                        q[:, :, start:end, :],
+                        k[:, :, start:end, :],
+                        v[:, :, start:end, :],
+                        causal=True,
+                        key_padding_mask=mask_s,
+                    )
+                )
+                start = end
+            out = torch.cat(pieces, dim=2)
+        else:
+            out = op.forward(q, k, v, causal=True, key_padding_mask=key_mask)
+        self.profile_ops.observe("attention", out)
+        return self._record(node, out)
+
+    def _selected_logp(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        op = self.profile_ops.get("logprob")
+        if hasattr(op, "forward"):
+            out = op.forward(logits, token_ids)
+        else:
+            out = op(logits, token_ids)
+        self.profile_ops.observe("logprob", out)
+        return out
+
+    def _masked_loss(self, logp: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+        mask = loss_mask.to(dtype=torch.bool, device=logp.device)
+        if mask.shape != logp.shape:
+            raise ValueError(f"loss_mask {tuple(mask.shape)} != logp {tuple(logp.shape)}")
+        active = mask.sum().clamp_min(1)
+        loss = -(logp.float().masked_fill(~mask, 0.0).sum() / active.float())
+        return self._record("loss", loss)
+
+    def _to_heads(self, x: torch.Tensor, n_heads: int) -> torch.Tensor:
+        batch, seq, hidden = x.shape
+        return x.reshape(batch, seq, n_heads, self.spec.head_dim).transpose(1, 2).contiguous()
+
+    def _key_padding_mask(
+        self,
+        attention_mask: torch.Tensor,
+        kv_cache: StatefulKVCache | None,
+        *,
+        layer: int,
+        new_len: int,
+    ) -> torch.Tensor:
+        if kv_cache is None:
+            return attention_mask
+        _k, _v, length = kv_cache.read(layer=layer)
+        # This is called before the current K/V append, so ``length`` is the
+        # complete cached prefix. Callers pass only the new-token mask.
+        if attention_mask.shape[1] != new_len:
+            raise ValueError(
+                f"new-token attention mask width {attention_mask.shape[1]} " f"!= new_len {new_len}"
+            )
+        prefix = length
+        prefix_mask = kv_cache.read_valid_mask(layer=layer)
+        if prefix_mask.shape != (attention_mask.shape[0], prefix):
+            raise RuntimeError(
+                f"cache validity mask shape {tuple(prefix_mask.shape)} "
+                f"!= expected {(attention_mask.shape[0], prefix)}"
+            )
+        return torch.cat([prefix_mask, attention_mask], dim=1)
+
+    def _record(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        if self._capture_nodes:
+            self._last_node_outputs[name] = value.detach()
+        return value
+
+
+def iter_parameter_tensors(
+    weights: Qwen3DenseWeights,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    yield from weights.tensors.items()
+
+
+__all__ = [
+    "OFFICIAL_FINGERPRINT",
+    "NODE_KINDS",
+    "ProfileOps",
+    "Qwen3DenseBIModel",
+    "Qwen3DenseSpec",
+    "Qwen3DenseWeights",
+    "iter_parameter_tensors",
+    "load_profile_ops",
+    "verify_hf_weight_snapshot",
+]

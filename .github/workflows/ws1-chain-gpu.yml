@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+# WS1 C10/C11 full Qwen3-8B Dense model-level gate (CUDA BF16 + Triton-on-CUDA BF16).
+# Required check: no skip / xfail / synthetic weights / silent fallback.
+# Security: do not use pull_request_target. Fork PRs never see RunPod secrets.
+
+name: WS1-chain-GPU
+
+on:
+  pull_request:
+    branches: [ main, test ]
+  push:
+    branches: [ main, test ]
+  workflow_dispatch:
+
+concurrency:
+  group: ws1-chain-gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ws1-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gpu_id: "NVIDIA H100 80GB HBM3", target_sm: "9.0", force_sm90: "1", name: "sm90-c10-c11" }
+    steps:
+      - name: Require a trusted branch for secret-backed GPU execution
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "WS1-chain-GPU cannot expose RunPod credentials to fork code."
+          echo "A maintainer must push the commit to a trusted repository branch."
+          exit 1
+
+      - name: Checkout the commit under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install runpodctl
+        run: |
+          wget -qO runpodctl https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
+          chmod +x runpodctl
+          sudo mv runpodctl /usr/local/bin/runpodctl
+
+      - name: Configure runpodctl
+        run: runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Run WS1 full-model C10/C11 on RunPod H100/H20-class
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || github.event.repository.clone_url }}
+          PR_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GPU_ID: ${{ matrix.gpu_id }}
+          GPU_COUNT: "1"
+          TARGET_SM: ${{ matrix.target_sm }}
+          KERNEL_ALIGN_FORCE_SM90: ${{ matrix.force_sm90 }}
+          TEST_SUITE: ws1-chain
+          WS1_WEIGHTS_PATH: ""
+        run: bash ci/run_gpu_ci.sh
+
+      - name: Upload C10/C11 JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ws1-c10-${{ matrix.name }}
+          path: artifacts/ws1-c10-*.json
+          if-no-files-found: error

@@ -314,6 +314,7 @@ def _validate_model_identity(identity: Mapping[str, Any]) -> None:
         "pin_method",
         "total_size_bytes",
         "index_file",
+        "index_sha256",
         "content_hash_algorithm",
         "content_hash",
         "shards",
@@ -324,12 +325,18 @@ def _validate_model_identity(identity: Mapping[str, Any]) -> None:
     shards = weight["shards"]
     if not isinstance(shards, list) or not shards:
         raise WorkloadError("weight_snapshot.shards must be a non-empty list")
+    filenames = [str(shard.get("filename", "")) for shard in shards]
+    if len(set(filenames)) != len(filenames) or any(not name for name in filenames):
+        raise WorkloadError("weight_snapshot shard filenames must be unique and non-empty")
     if int(weight["weight_files_total_size_bytes"]) != sum(int(s["size_bytes"]) for s in shards):
         raise WorkloadError("weight_snapshot file total does not match shard sizes")
     for shard in shards:
         digest = str(shard.get("sha256", ""))
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise WorkloadError("every weight shard must pin a lowercase SHA-256")
+    index_digest = str(weight["index_sha256"])
+    if len(index_digest) != 64 or any(c not in "0123456789abcdef" for c in index_digest):
+        raise WorkloadError("weight_snapshot.index_sha256 must be a lowercase SHA-256")
     expected_content_hash = weight_snapshot_hash(shards)
     if weight["content_hash_algorithm"] != "sha256-of-sorted-shard-records-v1":
         raise WorkloadError("unsupported weight_snapshot content_hash_algorithm")

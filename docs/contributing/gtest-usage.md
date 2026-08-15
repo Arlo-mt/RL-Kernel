@@ -59,6 +59,13 @@ The CLI primarily covers **accuracy** (candidate vs gold).
 | `rl_engine/kernels/gtest/elementwise_inventory.py` | C5 elementwise / RoPE inventory |
 | `rl_engine/kernels/gtest/four_judgment_matrix.py` | C8 four-judgment matrix schema |
 | `scripts/check_gradient_invariance.py` | C4 GPU evidence CLI |
+| `rl_engine/kernels/gtest/kv_consistency.py` | C6/C7 decode–prefill + stateful KV |
+| `rl_engine/alignment/qwen3_dense.py` | C9 full Qwen3-8B Dense BI model |
+| `rl_engine/kernels/gtest/chain_gate.py` | C10 model-level #150 + train/infer gate |
+| `scripts/check_decode_prefill.py` | C6 GPU CLI |
+| `scripts/check_stateful_kv.py` | C7 GPU CLI |
+| `scripts/ws1_chain_fwd_bwd.py` | C9 one-command fwd+bwd (assembly only) |
+| `scripts/ws1_chain_gate.py` | C10/C11 full-model required gate |
 
 ---
 
@@ -154,6 +161,52 @@ S ∈ {1, 31, 33, 127, 129, 255, 256, 257, 512, 1024, 4096, 8192}
 ```
 
 Prefer short `S` when VRAM is tight; full-model gates are owned by #266 / C2.
+
+---
+
+## 8. C6–C11 closeout commands
+
+C6 (direct decode, both profiles; chunked-prefill is not a substitute):
+
+```bash
+python scripts/check_decode_prefill.py --backend-profile cuda_bf16
+python scripts/check_decode_prefill.py --backend-profile triton_cuda_bf16
+```
+
+C7 (B1 stateful allocate→write→read→decode + generate-rescore). Concat-only
+`NativeKVCacheAttnOp` is not B1. B2 is explicitly `absent`.
+
+```bash
+python scripts/check_stateful_kv.py --backend-profile cuda_bf16
+python scripts/check_stateful_kv.py --backend-profile triton_cuda_bf16
+```
+
+C9 (assembly only; not EXIT). Official 36-layer Qwen3-8B Dense, pinned weights:
+
+```bash
+python scripts/prepare_ws1_weights.py --output "$QWEN3_8B" --verify-only
+python scripts/ws1_chain_fwd_bwd.py --backend-profile cuda_bf16 --weights hf --weights-path $QWEN3_8B
+python scripts/ws1_chain_fwd_bwd.py --backend-profile triton_cuda_bf16 --weights hf --weights-path $QWEN3_8B
+```
+
+C10/C11 required full-model gate (H20; no skip / xfail / synthetic-as-pass):
+
+```bash
+python scripts/ws1_chain_gate.py --backend-profile cuda_bf16 --model qwen3-8b-dense --dtype bfloat16 --weights required --weights-path $QWEN3_8B --json
+python scripts/ws1_chain_gate.py --backend-profile triton_cuda_bf16 --model qwen3-8b-dense --dtype bfloat16 --weights required --weights-path $QWEN3_8B --json
+```
+
+Omitting `--seed` uses the manifest-pinned execution seed. A supplied seed is
+applied to both PyTorch and CUDA and recorded separately from `workload_seed`.
+The weight loader verifies the pinned index SHA-256, every shard size/SHA-256,
+and the aggregate content hash before allocating the 8B model.
+
+The C10 backward result is intentionally a representative subset
+(`norm.weight`, `lm_head.weight`, and
+`layers.0.input_layernorm.weight`), recorded as
+`gradient_scope=representative_parameter_subset` with
+`all_parameter_gradients=false`. It is not an all-parameter 8B training or
+bitwise-gradient claim.
 
 ---
 
