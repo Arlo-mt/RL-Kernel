@@ -88,6 +88,18 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
+// Single-node TP=8 deterministic collectives.
+std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
+    torch::Tensor& tensor);
+int64_t deterministic_collective_create(
+    torch::Tensor& staging,
+    const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<int64_t>& offsets,
+    int64_t rank);
+void deterministic_collective_destroy(int64_t handle);
+void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
+void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
+
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
@@ -354,6 +366,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_fp32", &deterministic_logp_forward_fp32, "Batch-invariant deterministic logp fp32");
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
+
+    // Single-node TP=8 fixed-tree collectives.
+    m.def(
+        "deterministic_collective_ipc_meta",
+        &deterministic_collective_ipc_meta,
+        "Export a CUDA allocation for deterministic collectives");
+    m.def(
+        "deterministic_collective_create",
+        &deterministic_collective_create,
+        "Create a single-node TP=8 deterministic collective state");
+    m.def(
+        "deterministic_collective_destroy",
+        &deterministic_collective_destroy,
+        "Destroy a deterministic collective state");
+    m.def(
+        "deterministic_collective_stage",
+        &deterministic_collective_stage,
+        "Stage one rank's input in symmetric CUDA IPC memory");
+    m.def(
+        "deterministic_collective_all_reduce",
+        &deterministic_collective_all_reduce,
+        "Run the TP=8 deterministic fixed-tree all-reduce kernel");
 
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
