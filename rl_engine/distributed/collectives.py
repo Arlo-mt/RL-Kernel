@@ -83,6 +83,7 @@ class DeterministicCollective:
             "deterministic_collective_destroy",
             "deterministic_collective_stage",
             "deterministic_collective_all_reduce",
+            "deterministic_collective_reduce_scatter",
         )
         missing = [name for name in required_symbols if not hasattr(_C, name)]
         if missing:
@@ -158,6 +159,36 @@ class DeterministicCollective:
             self._synchronize_ranks()
         return out
 
+    def reduce_scatter(
+        self,
+        input: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fixed-tree sum followed by a rank-ordered scatter along dimension 0."""
+
+        self._check_open()
+        self._validate_reduction_input(input)
+        if input.dim() == 0:
+            raise ValueError("reduce_scatter input must have at least one dimension")
+        if input.size(0) % self.world_size != 0:
+            raise ValueError(
+                "reduce_scatter input.size(0) must be divisible by world_size=8; "
+                f"got {input.size(0)}"
+            )
+        output_shape = (input.size(0) // self.world_size, *input.shape[1:])
+        if out is None:
+            out = torch.empty(output_shape, dtype=input.dtype, device=input.device)
+        self._validate_sharded_output(out, input, output_shape)
+
+        with self._lock:
+            self._validate_matching_signature("reduce_scatter", input)
+            self._extension.deterministic_collective_stage(self._handle, input)
+            self._synchronize_ranks()
+            self._extension.deterministic_collective_reduce_scatter(self._handle, out)
+            self._synchronize_ranks()
+        return out
+
     def close(self) -> None:
         """Release imported CUDA IPC mappings after the last collective call."""
 
@@ -213,6 +244,21 @@ class DeterministicCollective:
             raise TypeError("out must have the same dtype as input")
         if output.shape != input.shape:
             raise ValueError("out must have the same shape as input")
+        if not output.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    def _validate_sharded_output(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_shape: tuple[int, ...],
+    ) -> None:
+        if output.device != input.device:
+            raise ValueError("out must be on the same device as input")
+        if output.dtype != input.dtype:
+            raise TypeError("out must have the same dtype as input")
+        if output.shape != output_shape:
+            raise ValueError(f"out must have shape {output_shape}, got {tuple(output.shape)}")
         if not output.is_contiguous():
             raise ValueError("out must be contiguous")
 
