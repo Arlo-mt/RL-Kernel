@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -303,6 +304,220 @@ def materialize_flashinfer_paged_kv_cache(
     return k_pages, v_pages
 
 
+class _NativeFlashInferRuntimeAdapter:
+    """Expose strict provenance from FlashInfer's materialized FA2 plan.
+
+    Upstream FlashInfer does not provide the RL-Kernel provenance callbacks.
+    Its FA2 scheduler does, however, materialize the request/tile schedule and
+    the token chunk size into the wrapper's caller-owned workspace. Read that
+    schedule after plan() so strict acceptance describes the kernel plan that
+    will actually run instead of merely echoing requested knobs.
+    """
+
+    def __init__(self, wrapper: Any, cfg: FlashInferPagedAttentionConfig) -> None:
+        self._wrapper = wrapper
+        self._cfg = cfg
+        self._plan_kwargs: dict[str, Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapper, name)
+
+    def plan(self, *args: Any, **kwargs: Any) -> Any:
+        result = self._wrapper.plan(*args, **kwargs)
+        self._plan_kwargs = dict(kwargs)
+        self._validate_materialized_plan()
+        return result
+
+    def get_actual_split_kv_plan(self) -> list[dict[str, Any]]:
+        seq_lens, page_size, fixed_split_pages = self._runtime_split_layout()
+        result = []
+        for seq_len in seq_lens:
+            if fixed_split_pages is None:
+                boundaries = [(0, (seq_len + page_size - 1) // page_size)]
+                mode = SplitKVMode.DISABLED.value
+            else:
+                page_count = (seq_len + page_size - 1) // page_size
+                boundaries = [
+                    (start, min(start + fixed_split_pages, page_count))
+                    for start in range(0, page_count, fixed_split_pages)
+                ]
+                mode = SplitKVMode.FIXED.value
+            result.append(
+                {
+                    "mode": mode,
+                    "split_size": fixed_split_pages,
+                    "split_size_unit": "pages",
+                    "boundary_unit": "pages",
+                    "boundaries": boundaries,
+                    "fallback": False,
+                    "fallback_reason": None,
+                }
+            )
+        return result
+
+    def get_actual_split_kv_plan_set(self) -> dict[str, Any]:
+        seq_lens, page_size, fixed_split_pages = self._runtime_split_layout()
+        parallel = self._cfg.cp_comm_plan.parallel
+        entries = []
+        for batch_index, total in enumerate(seq_lens):
+            owner_ranges = _balanced_token_ranges(total, parallel.cp_world_size)
+            for tp_rank in range(parallel.tp_world_size):
+                for cp_rank in range(parallel.cp_world_size):
+                    for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                        if owner_start % page_size or owner_end % page_size:
+                            raise FlashInferUnavailable(
+                                "strict FlashInfer CP owner ranges must align to KV pages"
+                            )
+                        owner_pages = (owner_end - owner_start) // page_size
+                        if fixed_split_pages is None:
+                            boundaries = [(0, owner_pages)]
+                            mode = SplitKVMode.DISABLED.value
+                        else:
+                            boundaries = [
+                                (start, min(start + fixed_split_pages, owner_pages))
+                                for start in range(0, owner_pages, fixed_split_pages)
+                            ]
+                            mode = SplitKVMode.FIXED.value
+                        entries.append(
+                            {
+                                "batch_index": batch_index,
+                                "tp_rank": tp_rank,
+                                "cp_rank": cp_rank,
+                                "owner_cp_rank": owner_cp_rank,
+                                "expected_kv_range": [owner_start, owner_end],
+                                "mode": mode,
+                                "split_size": fixed_split_pages,
+                                "split_size_unit": "pages",
+                                "boundary_unit": "pages",
+                                "boundaries": boundaries,
+                                "merge_order": "global_block_index",
+                                "accum_dtype": "fp32",
+                                "downcast_at": "final_write",
+                                "fallback": False,
+                                "fallback_reason": None,
+                            }
+                        )
+        return {
+            "batch_size": len(seq_lens),
+            "tp_world_size": parallel.tp_world_size,
+            "cp_world_size": parallel.cp_world_size,
+            "total_kv_tokens": list(seq_lens),
+            "entries": entries,
+        }
+
+    def get_attention_arithmetic_provenance(self) -> dict[str, str]:
+        self._validate_materialized_plan()
+        return {
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "lse_dtype": "fp32",
+            "backend_lse_log_base": "2",
+            "export_lse_log_base": "e",
+            "source": "flashinfer_fa2_materialized_plan",
+        }
+
+    @staticmethod
+    def normalize_lse(lse: torch.Tensor) -> torch.Tensor:
+        """Convert FlashInfer FA2's log2 LSE to the natural-log contract."""
+
+        return lse * math.log(2.0)
+
+    def _runtime_split_layout(self) -> tuple[tuple[int, ...], int, int | None]:
+        self._validate_materialized_plan()
+        assert self._plan_kwargs is not None
+        seq_lens_raw = self._plan_kwargs.get("seq_lens")
+        if not isinstance(seq_lens_raw, torch.Tensor):
+            raise FlashInferUnavailable("native FlashInfer provenance requires explicit seq_lens")
+        seq_lens = tuple(int(value) for value in seq_lens_raw.detach().cpu().tolist())
+        page_size = int(self._plan_kwargs["page_size"])
+        disabled = bool(self._plan_kwargs.get("disable_split_kv", False))
+        fixed_split_pages_raw = self._plan_kwargs.get("fixed_split_size")
+        fixed_split_pages = (
+            None if disabled or fixed_split_pages_raw is None else int(fixed_split_pages_raw)
+        )
+        return seq_lens, page_size, fixed_split_pages
+
+    def _validate_materialized_plan(self) -> None:
+        if self._plan_kwargs is None:
+            raise FlashInferUnavailable("FlashInfer plan() has not materialized a runtime plan")
+        if getattr(self._wrapper, "_backend", None) != "fa2":
+            raise FlashInferUnavailable(
+                "strict native FlashInfer provenance currently requires the FA2 backend"
+            )
+        plan_info = getattr(self._wrapper, "_plan_info", None)
+        if plan_info is None or not hasattr(plan_info, "__getitem__") or len(plan_info) != 15:
+            raise FlashInferUnavailable(
+                "native FlashInfer FA2 did not expose the expected PrefillPlanInfo"
+            )
+        seq_lens_raw = self._plan_kwargs.get("seq_lens")
+        if not isinstance(seq_lens_raw, torch.Tensor):
+            raise FlashInferUnavailable("native FlashInfer provenance requires explicit seq_lens")
+        seq_lens = tuple(int(value) for value in seq_lens_raw.detach().cpu().tolist())
+        page_size = int(self._plan_kwargs["page_size"])
+        disabled = bool(self._plan_kwargs.get("disable_split_kv", False))
+        fixed_split_pages_raw = self._plan_kwargs.get("fixed_split_size")
+        fixed_split_pages = (
+            None if disabled or fixed_split_pages_raw is None else int(fixed_split_pages_raw)
+        )
+        runtime_split = bool(plan_info[14])
+        if disabled and runtime_split:
+            raise FlashInferUnavailable(
+                "FlashInfer materialized split-KV despite disable_split_kv=True"
+            )
+        if fixed_split_pages is not None:
+            expected_chunk_tokens = fixed_split_pages * page_size
+            actual_chunk_tokens = self._workspace_i32(int(plan_info[9]), 1)[0]
+            if actual_chunk_tokens != expected_chunk_tokens:
+                raise FlashInferUnavailable(
+                    "FlashInfer materialized KV chunk differs from fixed_split_size"
+                )
+            expected_runtime_split = any(seq_len > expected_chunk_tokens for seq_len in seq_lens)
+            if runtime_split != expected_runtime_split:
+                raise FlashInferUnavailable(
+                    "FlashInfer materialized split flag differs from fixed Split-KV plan"
+                )
+        padded_batch_size = int(plan_info[0])
+        request_indices = self._workspace_i32(int(plan_info[4]), padded_batch_size)
+        kv_tile_indices = self._workspace_i32(int(plan_info[6]), padded_batch_size)
+        actual_tiles = set(zip(request_indices, kv_tile_indices, strict=True))
+        expected_tiles = {
+            (batch_index, tile_index)
+            for batch_index, seq_len in enumerate(seq_lens)
+            for tile_index in range(
+                1
+                if fixed_split_pages is None
+                else (
+                    (seq_len + fixed_split_pages * page_size - 1) // (fixed_split_pages * page_size)
+                )
+            )
+        }
+        if actual_tiles != expected_tiles:
+            raise FlashInferUnavailable(
+                "FlashInfer materialized request/KV-tile schedule differs from the strict plan"
+            )
+
+    def _workspace_i32(self, byte_offset: int, count: int) -> tuple[int, ...]:
+        workspace = getattr(self._wrapper, "_pin_memory_int_workspace_buffer", None)
+        if not isinstance(workspace, torch.Tensor) or workspace.device.type != "cpu":
+            raise FlashInferUnavailable(
+                "native FlashInfer did not expose its materialized host plan workspace"
+            )
+        byte_count = count * torch.tensor([], dtype=torch.int32).element_size()
+        values = workspace.narrow(0, byte_offset, byte_count).view(torch.int32)
+        return tuple(int(value) for value in values.tolist())
+
+
+def _balanced_token_ranges(total: int, parts: int) -> tuple[tuple[int, int], ...]:
+    base, extra = divmod(total, parts)
+    ranges = []
+    start = 0
+    for index in range(parts):
+        end = start + base + (1 if index < extra else 0)
+        ranges.append((start, end))
+        start = end
+    return tuple(ranges)
+
+
 class FlashInferQwen3PagedAttentionOp:
     """Opt-in FlashInfer paged attention backend candidate for #235 PR7."""
 
@@ -468,9 +683,7 @@ class FlashInferQwen3PagedAttentionOp:
         cp_plan = cfg.cp_comm_plan
         total_query_tokens = cp_plan.query_token_ranges[-1][1]
         if q.size(2) != total_query_tokens:
-            raise ValueError(
-                "strict CP fallback expects the complete logical Q sequence before AG"
-            )
+            raise ValueError("strict CP fallback expects the complete logical Q sequence before AG")
         kv_seq_lens = tuple(int(value) for value in paged_plan.kv_seq_lens.tolist())
         if len(set(kv_seq_lens)) != 1:
             raise ValueError(
@@ -478,9 +691,7 @@ class FlashInferQwen3PagedAttentionOp:
             )
         total_kv_tokens = kv_seq_lens[0]
         if cp_plan.expected_kv_token_range != (0, total_kv_tokens):
-            raise ValueError(
-                "CP block manifest must cover the complete logical KV token range"
-            )
+            raise ValueError("CP block manifest must cover the complete logical KV token range")
 
         query_start, query_end = cp_plan.query_token_ranges[cp_plan.parallel.cp_rank]
         local_q = q[:, :, query_start:query_end, :].contiguous()
@@ -563,9 +774,7 @@ class FlashInferQwen3PagedAttentionOp:
         )
 
         kv_chunk_size = (
-            cfg.split_kv.fixed_split_size
-            if cfg.split_kv.mode is SplitKVMode.FIXED
-            else None
+            cfg.split_kv.fixed_split_size if cfg.split_kv.mode is SplitKVMode.FIXED else None
         )
         runtime_plan_set = build_reference_split_kv_runtime_plan_set(
             kv_seq_lens,
@@ -647,15 +856,28 @@ class FlashInferQwen3PagedAttentionOp:
             raise FlashInferUnavailable(f"flashinfer.{namespace_name}.{class_name} is unavailable")
 
         workspace = torch.zeros(cfg.workspace_size_bytes, dtype=torch.uint8, device=q.device)
+        constructor_kwargs = {"kv_layout": cfg.kv_layout}
+        if cfg.mode == "decode":
+            constructor_kwargs["use_tensor_cores"] = True
         try:
-            return wrapper_cls(workspace, kv_layout=cfg.kv_layout)
+            wrapper = wrapper_cls(workspace, **constructor_kwargs)
         except TypeError:
             try:
-                return wrapper_cls(float_workspace_buffer=workspace, kv_layout=cfg.kv_layout)
-            except TypeError as exc:
-                raise FlashInferUnavailable(
-                    f"could not instantiate flashinfer.{namespace_name}.{class_name}"
-                ) from exc
+                wrapper = wrapper_cls(
+                    float_workspace_buffer=workspace,
+                    **constructor_kwargs,
+                )
+            except TypeError:
+                constructor_kwargs.pop("use_tensor_cores", None)
+                try:
+                    wrapper = wrapper_cls(workspace, **constructor_kwargs)
+                except TypeError as exc:
+                    raise FlashInferUnavailable(
+                        f"could not instantiate flashinfer.{namespace_name}.{class_name}"
+                    ) from exc
+        if type(wrapper).__module__.startswith("flashinfer."):
+            return _NativeFlashInferRuntimeAdapter(wrapper, cfg)
+        return wrapper
 
     @staticmethod
     def _plan_wrapper(
@@ -670,33 +892,41 @@ class FlashInferQwen3PagedAttentionOp:
         query_len: int,
     ) -> dict[str, Any]:
         plan_kwargs = {
-            "qo_indptr": plan.qo_indptr,
-            "paged_kv_indptr": plan.paged_kv_indptr,
-            "paged_kv_indices": plan.paged_kv_indices,
-            "paged_kv_last_page_len": plan.paged_kv_last_page_len,
-            "indptr": plan.paged_kv_indptr,
-            "indices": plan.paged_kv_indices,
-            "last_page_len": plan.paged_kv_last_page_len,
             "num_qo_heads": q_heads,
             "num_kv_heads": kv_heads,
-            "head_dim": head_dim,
-            "head_dim_qk": head_dim,
             "page_size": plan.page_size,
-            "causal": cfg.causal,
             "pos_encoding_mode": cfg.rope.pos_encoding_mode,
             "rope_scale": float(cfg.rope.rope_scale),
             "rope_theta": float(cfg.rope.rope_theta),
             "q_data_type": q_dtype,
             "kv_data_type": q_dtype,
             "o_data_type": torch.float32 if cfg.require_cp_comm else q_dtype,
-            "data_type": q_dtype,
             "seq_lens": plan.kv_seq_lens,
-            "seq_lens_q": plan.seq_lens_q,
-            "q_len_per_req": query_len,
         }
+        if cfg.mode == "decode":
+            plan_kwargs.update(
+                {
+                    "indptr": plan.paged_kv_indptr,
+                    "indices": plan.paged_kv_indices,
+                    "last_page_len": plan.paged_kv_last_page_len,
+                    "head_dim": head_dim,
+                    "q_len_per_req": query_len,
+                }
+            )
+        else:
+            plan_kwargs.update(
+                {
+                    "qo_indptr": plan.qo_indptr,
+                    "paged_kv_indptr": plan.paged_kv_indptr,
+                    "paged_kv_indices": plan.paged_kv_indices,
+                    "paged_kv_last_page_len": plan.paged_kv_last_page_len,
+                    "head_dim_qk": head_dim,
+                    "causal": cfg.causal,
+                    "seq_lens_q": plan.seq_lens_q,
+                }
+            )
         scale = cfg.softmax_scale
         if scale is not None:
-            plan_kwargs["softmax_scale"] = float(scale)
             plan_kwargs["sm_scale"] = float(scale)
         plan_kwargs.update(
             _flashinfer_split_kv_plan_kwargs(
@@ -958,11 +1188,15 @@ class FlashInferQwen3PagedAttentionOp:
                 "FlashInfer runtime arithmetic semantics do not satisfy the strict "
                 "attention contract: " + ", ".join(mismatches)
             )
-        return {
+        result = {
             **required,
             "arithmetic_plan_source": source,
             "arithmetic_semantics_verified": True,
         }
+        for key in ("backend_lse_log_base", "export_lse_log_base"):
+            if key in raw:
+                result[key] = raw[key]
+        return result
 
     @staticmethod
     def _run_wrapper(
@@ -981,6 +1215,9 @@ class FlashInferQwen3PagedAttentionOp:
         if not isinstance(result, tuple) or len(result) != 2:
             raise FlashInferUnavailable("FlashInfer PR7 candidate must return (out, lse)")
         out_flat, lse_flat = result
+        normalize_lse = getattr(wrapper, "normalize_lse", None)
+        if callable(normalize_lse):
+            lse_flat = normalize_lse(lse_flat)
         return out_flat, lse_flat
 
     @staticmethod
@@ -1283,7 +1520,7 @@ def _restore_lse(
     if lse_flat.shape == (q_heads, expected_tokens):
         return lse_flat.transpose(0, 1).reshape(batch_size, query_len, q_heads).transpose(1, 2)
     raise FlashInferUnavailable(
-        "FlashInfer LSE must have shape [B*Sq, Hq] or [Hq, B*Sq]; " f"got {tuple(lse_flat.shape)}"
+        f"FlashInfer LSE must have shape [B*Sq, Hq] or [Hq, B*Sq]; got {tuple(lse_flat.shape)}"
     )
 
 

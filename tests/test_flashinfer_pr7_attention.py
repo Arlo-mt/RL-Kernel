@@ -27,6 +27,7 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     FlashInferQwen3PagedAttentionOp,
     FlashInferRoPEFusionConfig,
     FlashInferUnavailable,
+    _NativeFlashInferRuntimeAdapter,
     build_flashinfer_paged_kv_plan,
     flashinfer_prefix_cache_fingerprint,
     materialize_flashinfer_paged_kv_cache,
@@ -153,6 +154,38 @@ class _FakeFlashInferWrapper:
             "total_kv_tokens": seq_lens,
             "entries": entries,
         }
+
+
+def test_native_flashinfer_adapter_reads_materialized_plan_and_normalizes_lse():
+    class _NativeWrapper:
+        def __init__(self):
+            self._backend = "fa2"
+            self._plan_info = (2, 2, 0, 16, 0, 16, 32, 0, 48, 60, 0, 0, 0, 0, 0)
+            self._pin_memory_int_workspace_buffer = torch.zeros(64, dtype=torch.uint8)
+            self._pin_memory_int_workspace_buffer[0:8].view(torch.int32).copy_(
+                torch.tensor([0, 1], dtype=torch.int32)
+            )
+            self._pin_memory_int_workspace_buffer[32:40].view(torch.int32).zero_()
+
+        def plan(self, **kwargs):
+            return None
+
+    adapter = _NativeFlashInferRuntimeAdapter(
+        _NativeWrapper(),
+        FlashInferPagedAttentionConfig(workspace_size_bytes=1024),
+    )
+    adapter.plan(
+        seq_lens=torch.tensor([16, 16], dtype=torch.int32),
+        page_size=4,
+        disable_split_kv=True,
+    )
+
+    assert adapter.get_actual_split_kv_plan()[0]["boundaries"] == [(0, 4)]
+    plan_set = adapter.get_actual_split_kv_plan_set()
+    assert len(plan_set["entries"]) == 16
+    assert plan_set["entries"][1]["expected_kv_range"] == [8, 16]
+    normalized = adapter.normalize_lse(torch.ones(1))
+    assert torch.allclose(normalized, torch.log(torch.tensor([2.0])))
 
 
 def _fake_flashinfer():
