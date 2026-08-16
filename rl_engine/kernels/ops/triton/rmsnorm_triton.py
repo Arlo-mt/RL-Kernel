@@ -1,54 +1,81 @@
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
 
 from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.vjp_fp32 import reduce_rows_fp32
 
+if _TRITON_AVAILABLE:
 
-@triton.jit
-def _rmsnorm_fwd_kernel(
-    X, W, Y, RSTD, T: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr, BLOCK_H: tl.constexpr
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
+    @triton.jit
+    def _rmsnorm_fwd_kernel(
+        X,
+        W,
+        Y,
+        RSTD,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        EPS: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_H)
+        mask = offs < H
 
-    x = tl.load(X + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(X + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
 
-    ss = tl.sum(x * x, axis=0)
-    rstd = tl.rsqrt(ss / H + EPS)
-    y = x * rstd * w
+        ss = tl.sum(x * x, axis=0)
+        rstd = tl.rsqrt(ss / H + EPS)
+        y = x * rstd * w
 
-    tl.store(Y + row * H + offs, y, mask=mask)
-    tl.store(RSTD + row, rstd)
+        tl.store(Y + row * H + offs, y, mask=mask)
+        tl.store(RSTD + row, rstd)
+
+    @triton.jit
+    def _rmsnorm_bwd_dx_kernel(
+        DY,
+        X,
+        W,
+        RSTD,
+        DX,
+        PARTIAL_DW,
+        T: tl.constexpr,
+        H: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_H)
+        mask = offs < H
+
+        dy = tl.load(DY + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(X + row * H + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
+        rstd = tl.load(RSTD + row).to(tl.float32)
+
+        gw = dy * w
+        dot = tl.sum(gw * x, axis=0)
+        dx = rstd * gw - x * rstd * rstd * rstd * dot / H
+
+        pdw = dy * x * rstd
+
+        tl.store(DX + row * H + offs, dx, mask=mask)
+        tl.store(PARTIAL_DW + row * H + offs, pdw, mask=mask)
 
 
-@triton.jit
-def _rmsnorm_bwd_dx_kernel(
-    DY, X, W, RSTD, DX, PARTIAL_DW, T: tl.constexpr, H: tl.constexpr, BLOCK_H: tl.constexpr
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < H
-
-    dy = tl.load(DY + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(X + row * H + offs, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.load(RSTD + row).to(tl.float32)
-
-    gw = dy * w
-    dot = tl.sum(gw * x, axis=0)
-    dx = rstd * gw - x * rstd * rstd * rstd * dot / H
-
-    pdw = dy * x * rstd
-
-    tl.store(DX + row * H + offs, dx, mask=mask)
-    tl.store(PARTIAL_DW + row * H + offs, pdw, mask=mask)
+def _require_triton():
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is not available for RMSNorm")
 
 
 def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
+    _require_triton()
     assert x.is_cuda and weight.is_cuda
     assert x.dim() == 2 and weight.dim() == 1
     rows, hidden = x.shape
@@ -63,6 +90,7 @@ def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
 
 
 def rmsnorm_triton_backward_rows(grad_out, x, weight, rstd):
+    _require_triton()
     rows, hidden = x.shape
     dx = torch.empty_like(x)
     partial_dw = torch.empty((rows, hidden), device=x.device, dtype=torch.float32)
@@ -116,6 +144,9 @@ def rmsnorm_triton(x, weight, eps: float = 1e-6):
 
 class RMSNormTritonOp:
     """Triton RMSNorm wrapper compatible with the shared operator harness."""
+
+    def __init__(self):
+        _require_triton()
 
     backward_impl = "triton_rmsnorm_dx_declared_fp32_rowfold_dw"
 
