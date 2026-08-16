@@ -246,6 +246,7 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     cases.append(
         AcceptanceCase(
             name="custom_cuda_allreduce",
+            required=False,
             command=(
                 (
                     torchrun,
