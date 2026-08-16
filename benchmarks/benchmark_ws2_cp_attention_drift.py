@@ -397,7 +397,7 @@ def _run_case(
     )
     dlogp_report = _dlogp_report(
         candidate_dtype_out,
-        reference_out,
+        reference_out.to(dtype),
         batch=args.batch,
         seq_len=seq_len,
         local_hidden=local_hq * QWEN3_8B_HEAD_DIM,
@@ -960,8 +960,9 @@ def _dlogp_report(
     """Run the selected-token log-probability leg on the attention outputs.
 
     The benchmark intentionally uses a small deterministic synthetic projection,
-    but performs both logits and log-softmax in FP32 so the reported value isolates
-    attention drift instead of a second dtype/reduction difference in the checker.
+    but performs both logits and log-softmax in FP32.  The reference is first cast
+    to the candidate's final-write dtype, so this gate compares the same BF16 cast
+    boundary and does not mislabel the expected FP32-to-BF16 write as CP drift.
     """
 
     if not enabled:
@@ -1002,6 +1003,7 @@ def _dlogp_report(
     return {
         "status": "available",
         "projection": "synthetic_fp32_lm_head_projection",
+        "reference_cast_dtype": str(reference_out.dtype).removeprefix("torch."),
         "vocab_size": vocab_size,
         "active_token_count": int(active_mask.sum().item()),
         "drift": _drift_stats(

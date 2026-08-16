@@ -52,6 +52,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--head-sha", default=os.environ.get("GITHUB_SHA"))
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--collective-world-size",
+        type=int,
+        choices=(2, 4, 8),
+        default=8,
+        help="rank count for the self-owned AG/RS/AllReduce probe",
+    )
     parser.add_argument("--out-atol", type=float, default=2.0e-4)
     parser.add_argument("--lse-atol", type=float, default=2.0e-4)
     parser.add_argument("--dlogp-atol", type=float, default=1.0e-4)
@@ -76,6 +83,12 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     pr7_script = REPO_ROOT / "scripts" / "ws2_pr7_flashinfer_attention_check.py"
     pr7_available = pr7_script.is_file()
     pr7_unavailable = None if pr7_available else "PR7 validation script is absent; integrate #279"
+    collective_script = REPO_ROOT / "scripts" / "ws2_deterministic_collective_attention_check.py"
+    collective_report = artifact_dir / "ws2-self-owned-attention-collectives.json"
+    collective_available = collective_script.is_file()
+    collective_unavailable = (
+        None if collective_available else "self-owned deterministic collective check is absent"
+    )
 
     cases: list[AcceptanceCase] = [
         AcceptanceCase(
@@ -151,10 +164,35 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     cases.append(
         AcceptanceCase(
             name="custom_cuda_ag_rs",
-            command=None,
-            unavailable_reason=(
-                "self-owned CUDA AllGather/ReduceScatter operators are still interface-only"
+            command=(
+                torchrun,
+                "--standalone",
+                f"--nproc-per-node={args.collective_world_size}",
+                str(collective_script),
+                "--output",
+                str(collective_report),
+            ) if collective_available else None,
+            report_path=collective_report,
+            validator=lambda report: validate_collective_report(report, args, operation="ag_rs"),
+            unavailable_reason=collective_unavailable,
+        )
+    )
+    cases.append(
+        AcceptanceCase(
+            name="custom_cuda_allreduce",
+            command=(
+                torchrun,
+                "--standalone",
+                f"--nproc-per-node={args.collective_world_size}",
+                str(collective_script),
+                "--output",
+                str(collective_report),
+            ) if collective_available else None,
+            report_path=collective_report,
+            validator=lambda report: validate_collective_report(
+                report, args, operation="allreduce"
             ),
+            unavailable_reason=collective_unavailable,
         )
     )
     return tuple(cases)
@@ -204,7 +242,11 @@ def run_acceptance(
                 "prefix_cache_identity",
                 "global_block_merge_order",
             ],
-            "communication": ["p2p_nccl_reference", "self_owned_cuda_ag_rs"],
+            "communication": [
+                "p2p_nccl_reference",
+                "self_owned_cuda_ag_rs",
+                "self_owned_cuda_allreduce",
+            ],
         },
         "cases": rows,
     }
@@ -464,6 +506,10 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             errors.append(f"P2P rank {index} world size is not 2")
         if row.get("transport") != "p2p_nccl_reference":
             errors.append(f"P2P rank {index} did not use the NCCL reference transport")
+        if row.get("query_ag") != "p2p_nccl_reference":
+            errors.append(f"P2P rank {index} did not execute the Q AllGather reference")
+        if row.get("query_ag_max_abs") != 0.0:
+            errors.append(f"P2P rank {index} Q AllGather was not bitwise exact")
         if row.get("dtype") != "bf16" or row.get("accum_dtype") != "fp32":
             errors.append(f"P2P rank {index} arithmetic provenance is invalid")
         if row.get("downcast_at") != "final_write":
@@ -519,6 +565,50 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
         errors.append("P2P query ownership ranges are not canonical and contiguous")
     if len(gathered_manifests) == 2 and gathered_manifests[0] != gathered_manifests[1]:
         errors.append("P2P ranks gathered different logical block manifests")
+    return errors
+
+
+def validate_collective_report(
+    report: Mapping[str, Any],
+    args: argparse.Namespace,
+    *,
+    operation: str,
+) -> list[str]:
+    """Validate executed PR310/311/312 evidence, never configured-only claims."""
+
+    errors: list[str] = []
+    if report.get("schema_version") != "ws2_deterministic_attention_collectives/v1":
+        errors.append("self-owned collective report schema is invalid")
+    if report.get("world_size") != args.collective_world_size:
+        errors.append("self-owned collective report world size differs from the requested size")
+    if report.get("transport") != "self_owned_cuda_ag_rs":
+        errors.append("self-owned report did not execute the CUDA AG/RS backend")
+    if report.get("allreduce_transport") != "self_owned_cuda_allreduce":
+        errors.append("self-owned report did not execute the CUDA AllReduce backend")
+    if report.get("global_failure_count") != 0 or report.get("passed") is not True:
+        errors.append("self-owned collective report contains rank failures")
+    ranks = report.get("ranks")
+    if not isinstance(ranks, list) or len(ranks) != args.collective_world_size:
+        errors.append("self-owned collective report must contain every rank")
+        return errors
+    required = {
+        "ag_rs": ("all_gather_q", "reduce_scatter_out_lse"),
+        "allreduce": ("all_reduce_o_proj",),
+    }[operation]
+    for index, row in enumerate(ranks):
+        if not isinstance(row, Mapping):
+            errors.append(f"self-owned rank {index} report is invalid")
+            continue
+        if row.get("passed") is not True:
+            errors.append(f"self-owned rank {index} did not pass")
+        operations = row.get("operations")
+        if not isinstance(operations, Mapping):
+            errors.append(f"self-owned rank {index} operation evidence is missing")
+            continue
+        for name in required:
+            evidence = operations.get(name)
+            if not isinstance(evidence, Mapping) or evidence.get("passed") is not True:
+                errors.append(f"self-owned rank {index} {name} evidence did not pass")
     return errors
 
 

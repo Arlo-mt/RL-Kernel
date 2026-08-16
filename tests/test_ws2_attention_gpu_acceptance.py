@@ -212,6 +212,8 @@ def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
             "passed": True,
             "global_failure_count": 0,
             "transport": "p2p_nccl_reference",
+            "query_ag": "p2p_nccl_reference",
+            "query_ag_max_abs": 0.0,
             "device": f"cuda:{rank}",
             "dtype": "bf16",
             "accum_dtype": "fp32",
