@@ -12,7 +12,6 @@ from typing import Callable, Iterator
 
 import torch
 
-
 WeightReducer = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
@@ -23,7 +22,6 @@ class _Use:
     grads: torch.Tensor | None = None
 
 
-
 @dataclass
 class CanonicalBackwardSession:
     """Collect a graph's row-local parameter VJPs in logical-key order."""
@@ -31,6 +29,7 @@ class CanonicalBackwardSession:
     uses: dict[str, list[_Use]] = field(default_factory=dict)
     received: dict[str, int] = field(default_factory=dict)
     backward_started: bool = False
+
     def register(self, parameter_id: str, keys: torch.Tensor) -> int:
         if self.backward_started:
             raise RuntimeError("cannot register canonical rows after backward started")

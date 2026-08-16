@@ -13,7 +13,6 @@ from collections.abc import Mapping
 
 import torch
 
-
 BACKWARD_IMPL = "row_local_fp32_vjp"
 
 
@@ -37,9 +36,7 @@ def row_local_linear_dw_fp32(grad_output: torch.Tensor, hidden: torch.Tensor) ->
     grad_rows = grad_output.reshape(-1, grad_output.size(-1)).float()
     hidden_rows = hidden.reshape(-1, hidden.size(-1)).float()
     if grad_rows.shape[0] != hidden_rows.shape[0]:
-        raise ValueError(
-            f"grad rows {grad_rows.shape[0]} != hidden rows {hidden_rows.shape[0]}"
-        )
+        raise ValueError(f"grad rows {grad_rows.shape[0]} != hidden rows {hidden_rows.shape[0]}")
     dweight = torch.zeros(
         (grad_rows.shape[1], hidden_rows.shape[1]),
         device=grad_rows.device,

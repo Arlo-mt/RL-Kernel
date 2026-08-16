@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.backward_runtime import record_backward
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.canonical_backward import active_session
 from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_gemm
 
@@ -32,9 +32,7 @@ class _CanonicalLinearFn(torch.autograd.Function):
         ctx.parameter_id = str(parameter_id)
         ctx.family = str(family)
         ctx.slot = session.register(ctx.parameter_id, logical_keys)
-        return _gemm_fp32(
-            a.float(), weight.float().t().contiguous(), ctx.family
-        )
+        return _gemm_fp32(a.float(), weight.float().t().contiguous(), ctx.family)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -46,14 +44,13 @@ class _CanonicalLinearFn(torch.autograd.Function):
 
         dweight = None
         if ctx.needs_input_grad[1]:
-            def reducer(rows, grads):
-                return _gemm_fp32(
-                    grads.float().t().contiguous(), rows.float(), ctx.family
-                ).to(weight.dtype)
 
-            dweight = ctx.session.submit_linear(
-                ctx.parameter_id, ctx.slot, a, grad_out, reducer
-            )
+            def reducer(rows, grads):
+                return _gemm_fp32(grads.float().t().contiguous(), rows.float(), ctx.family).to(
+                    weight.dtype
+                )
+
+            dweight = ctx.session.submit_linear(ctx.parameter_id, ctx.slot, a, grad_out, reducer)
         if ctx.family == "triton":
             record_backward(
                 "det_gemm",

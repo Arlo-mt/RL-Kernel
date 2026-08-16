@@ -94,7 +94,10 @@ class _SM90EmbeddingFunction(torch.autograd.Function):
             )
         record_backward(
             "embedding",
-            kernel_id="rl_engine.kernels.ops.cuda.linear.embedding._deterministic_embedding_grad_weight",
+            kernel_id=(
+                "rl_engine.kernels.ops.cuda.linear.embedding."
+                "_deterministic_embedding_grad_weight"
+            ),
             impl="cuda_sorted_segment_dweight",
             family="cuda",
         )

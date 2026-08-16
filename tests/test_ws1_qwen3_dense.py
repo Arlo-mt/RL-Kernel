@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
+from dataclasses import replace
 
 import pytest
 import torch
@@ -208,9 +208,7 @@ def test_c9_chunked_attention_uses_real_chunks_and_canonical_backward():
     q_ref = q.detach().requires_grad_(True)
     k_ref = k.detach().requires_grad_(True)
     v_ref = v.detach().requires_grad_(True)
-    full = NativeAttentionOp().forward_fp32(
-        q_ref, k_ref, v_ref, causal=True, key_padding_mask=mask
-    )
+    full = NativeAttentionOp().forward_fp32(q_ref, k_ref, v_ref, causal=True, key_padding_mask=mask)
     full.backward(grad_out)
 
     assert op.calls == [(3, 3), (3, 6), (1, 7), (7, 7)]

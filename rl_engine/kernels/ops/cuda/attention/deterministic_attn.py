@@ -41,13 +41,9 @@ class _DeterministicAttentionFn(Function):
         mask_c = key_padding_mask.contiguous() if key_padding_mask is not None else None
 
         results = (
-            _C.deterministic_attention_forward_fp32(
-                q_c, k_c, v_c, causal, float(scale), mask_c
-            )
+            _C.deterministic_attention_forward_fp32(q_c, k_c, v_c, causal, float(scale), mask_c)
             if output_fp32
-            else _C.deterministic_attention_forward(
-                q_c, k_c, v_c, causal, float(scale), mask_c
-            )
+            else _C.deterministic_attention_forward(q_c, k_c, v_c, causal, float(scale), mask_c)
         )
         out, lse, P = results[0], results[1], results[2]
 

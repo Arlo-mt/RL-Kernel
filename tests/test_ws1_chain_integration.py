@@ -23,8 +23,8 @@ from rl_engine.kernels.gtest.chain_gate import (
     _configure_required_gradients,
     _logp_aggregate_verdict,
     _node_token_fingerprints,
-    _representative_case_ids,
     _release_parameter_grads,
+    _representative_case_ids,
 )
 from rl_engine.kernels.gtest.tolerance import load_contract
 from rl_engine.kernels.ops.vjp_fp32 import (

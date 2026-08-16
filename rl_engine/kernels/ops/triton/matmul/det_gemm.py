@@ -80,7 +80,9 @@ def _triton_gemm(a, b, *, output_dtype=None):
         (M, N), device=a.device, dtype=a.dtype if output_dtype is None else output_dtype
     )
     grid = (triton.cdiv(M, _BLOCK_M), triton.cdiv(N, _BLOCK_N))
-    promote_inputs = output_dtype == torch.float32 or a.dtype == torch.float32 or b.dtype == torch.float32
+    promote_inputs = (
+        output_dtype == torch.float32 or a.dtype == torch.float32 or b.dtype == torch.float32
+    )
     _det_gemm_kernel[grid](
         a,
         b,
@@ -121,9 +123,7 @@ class _TritonDetGemmFn(torch.autograd.Function):
             else None
         )
         db = (
-            _triton_gemm(
-                a.t().contiguous(), grad_out, output_dtype=torch.float32
-            ).to(b.dtype)
+            _triton_gemm(a.t().contiguous(), grad_out, output_dtype=torch.float32).to(b.dtype)
             if ctx.needs_input_grad[1]
             else None
         )

@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.backward_runtime import record_backward
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.canonical_backward import active_session
 from rl_engine.kernels.ops.triton.rmsnorm_triton import (
     rmsnorm_triton_backward_rows,
@@ -79,9 +79,7 @@ class _CanonicalRowRMSNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         x, weight, rstd = ctx.saved_tensors
-        dx, rows = rmsnorm_triton_backward_rows(
-            grad_out.contiguous(), x, weight, rstd
-        )
+        dx, rows = rmsnorm_triton_backward_rows(grad_out.contiguous(), x, weight, rstd)
         dw = ctx.session.submit_rows(
             ctx.parameter_id,
             ctx.slot,
@@ -109,6 +107,4 @@ def canonical_row_rmsnorm(
     parameter_id: str,
     forward_op,
 ) -> torch.Tensor:
-    return _CanonicalRowRMSNorm.apply(
-        x, weight, eps, logical_keys, parameter_id, forward_op
-    )
+    return _CanonicalRowRMSNorm.apply(x, weight, eps, logical_keys, parameter_id, forward_op)

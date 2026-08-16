@@ -2,6 +2,7 @@
 # WS1 C10/C11 full Qwen3-8B Dense model-level gate (CUDA BF16 + Triton-on-CUDA BF16).
 # Required check: no skip / xfail / synthetic weights / silent fallback.
 # Security: do not use pull_request_target. Fork PRs never see RunPod secrets.
+# Fork commits require an explicit maintainer workflow_dispatch from a trusted branch.
 
 name: WS1-chain-GPU
 
@@ -11,6 +12,16 @@ on:
   push:
     branches: [ main, test ]
   workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "Public repository containing the reviewed commit (owner/name)"
+        required: true
+        default: "RL-Align/RL-Kernel"
+        type: string
+      source_sha:
+        description: "Exact reviewed 40-character commit SHA to execute on the GPU pod"
+        required: true
+        type: string
 
 concurrency:
   group: ws1-chain-gpu-${{ github.ref }}
@@ -20,7 +31,19 @@ permissions:
   contents: read
 
 jobs:
+  fork-pr-notice:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report required trusted execution
+        run: |
+          echo "Fork code cannot receive RunPod credentials."
+          echo "A maintainer must dispatch this workflow from a trusted upstream branch."
+          echo "source_repository=${{ github.event.pull_request.head.repo.full_name }}"
+          echo "source_sha=${{ github.event.pull_request.head.sha }}"
+
   ws1-chain:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -29,17 +52,19 @@ jobs:
         include:
           - { gpu_id: "NVIDIA H100 80GB HBM3", target_sm: "9.0", force_sm90: "1", name: "sm90-c10-c11" }
     steps:
-      - name: Require a trusted branch for secret-backed GPU execution
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      - name: Validate trusted dispatch target
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
-          echo "WS1-chain-GPU cannot expose RunPod credentials to fork code."
-          echo "A maintainer must push the commit to a trusted repository branch."
-          exit 1
+          [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
 
-      - name: Checkout the commit under test
+      - name: Checkout trusted GPU orchestrator
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install runpodctl
@@ -60,8 +85,8 @@ jobs:
       - name: Run WS1 full-model C10/C11 on RunPod H100/H20-class
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          PR_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || github.event.repository.clone_url }}
-          PR_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_REPO_URL: ${{ github.event_name == 'workflow_dispatch' && format('https://github.com/{0}.git', inputs.source_repository) || github.event.pull_request.head.repo.clone_url || github.event.repository.clone_url }}
+          PR_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
           GPU_ID: ${{ matrix.gpu_id }}
           GPU_COUNT: "1"
           TARGET_SM: ${{ matrix.target_sm }}

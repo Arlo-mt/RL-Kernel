@@ -7,17 +7,14 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.alignment.qwen3_dense import (  # noqa: E402
-    Qwen3DenseSpec,
-    verify_hf_weight_snapshot,
-)
+from rl_engine.alignment.qwen3_dense import Qwen3DenseSpec, verify_hf_weight_snapshot  # noqa: E402
 from rl_engine.testing.ws1_workload import load_manifest  # noqa: E402
 
 

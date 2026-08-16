@@ -58,24 +58,18 @@ class _DetGemmAccumFn(torch.autograd.Function):
         a_fp32 = a.contiguous().float()
         b_fp32 = b.contiguous().float()
         da = (
-            _C.det_gemm_rowwise_fwd_fp32(
-                grad_fp32, b_fp32.t().contiguous()
-            ).to(a.dtype)
+            _C.det_gemm_rowwise_fwd_fp32(grad_fp32, b_fp32.t().contiguous()).to(a.dtype)
             if ctx.needs_input_grad[0]
             else None
         )
         db = (
-            _C.det_gemm_rowwise_fwd_fp32(
-                a_fp32.t().contiguous(), grad_fp32
-            ).to(b.dtype)
+            _C.det_gemm_rowwise_fwd_fp32(a_fp32.t().contiguous(), grad_fp32).to(b.dtype)
             if ctx.needs_input_grad[1]
             else None
         )
         record_backward(
             "det_gemm",
-            kernel_id=(
-                "rl_engine._C.det_gemm_rowwise_fwd_fp32"
-            ),
+            kernel_id=("rl_engine._C.det_gemm_rowwise_fwd_fp32"),
             impl="cuda_rowwise_fp32_accum_det_gemm",
             family="cuda",
         )

@@ -12,12 +12,12 @@ C9 assembly alone is not EXIT.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
 import contextlib
 import hashlib
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +29,7 @@ from rl_engine.alignment.qwen3_dense import (
     Qwen3DenseWeights,
     load_profile_ops,
 )
-from rl_engine.kernels.gtest.chain_gradients import (
-    GRADIENT_SCOPE,
-    REQUIRED_GRAD_NAMES,
-)
-from rl_engine.kernels.ops.canonical_backward import active_session, canonical_backward_session
-from rl_engine.kernels.ops.backward_runtime import (
-    reset_backward_runtime,
-    snapshot_backward_runtime,
-)
+from rl_engine.kernels.gtest.chain_gradients import GRADIENT_SCOPE, REQUIRED_GRAD_NAMES
 from rl_engine.kernels.gtest.forward_invariance import (
     TensorComparisonDetail,
     _compare_logical_tensors,
@@ -54,6 +46,8 @@ from rl_engine.kernels.gtest.tolerance import (
     resolve_dtype_policy,
     resolve_tolerance,
 )
+from rl_engine.kernels.ops.backward_runtime import reset_backward_runtime, snapshot_backward_runtime
+from rl_engine.kernels.ops.canonical_backward import active_session, canonical_backward_session
 from rl_engine.testing.ws1_workload import (
     LogicalBatch,
     LogicalSample,
@@ -815,25 +809,39 @@ def _run_singleton_cell(
     def _collect(cell: CellOutput) -> None:
         nonlocal loss_acc
         merged.update(cell.selected_logp)
+        if cell.loss is None:
+            raise RuntimeError("singleton cell produced no loss")
         loss_acc = cell.loss if loss_acc is None else loss_acc + cell.loss
         _merge_node_token_digests(node_token_digests, cell.node_token_digests)
 
-    sample_rank = {sample.sample_id: index for index, sample in enumerate(sorted(batch.samples, key=lambda item: item.sample_id))}
+    sample_rank = {
+        sample.sample_id: index
+        for index, sample in enumerate(sorted(batch.samples, key=lambda item: item.sample_id))
+    }
     if run_backward:
         for name in REQUIRED_GRAD_NAMES:
             model.weights.tensors[name].grad = None
         with canonical_backward_session() as session:
             for sample in batch.samples:
                 single = LogicalBatch(
-                    workload_id=batch.workload_id, seed=batch.seed,
-                    samples=(sample,), cell_id=cell_id,
+                    workload_id=batch.workload_id,
+                    seed=batch.seed,
+                    samples=(sample,),
+                    cell_id=cell_id,
                 )
-                _collect(_run_padded_cell(
-                    model, single, cell_id=cell_id, pad_side="right",
-                    manifest=manifest, run_backward=False, defer_backward=True,
-                    logical_sample_rank=sample_rank,
-                    active_token_denominator=active_token_denominator,
-                ))
+                _collect(
+                    _run_padded_cell(
+                        model,
+                        single,
+                        cell_id=cell_id,
+                        pad_side="right",
+                        manifest=manifest,
+                        run_backward=False,
+                        defer_backward=True,
+                        logical_sample_rank=sample_rank,
+                        active_token_denominator=active_token_denominator,
+                    )
+                )
             if loss_acc is None:
                 raise RuntimeError("singleton aggregate produced no loss")
             loss_acc.backward()
@@ -842,20 +850,31 @@ def _run_singleton_cell(
     else:
         for sample in batch.samples:
             single = LogicalBatch(
-                workload_id=batch.workload_id, seed=batch.seed,
-                samples=(sample,), cell_id=cell_id,
+                workload_id=batch.workload_id,
+                seed=batch.seed,
+                samples=(sample,),
+                cell_id=cell_id,
             )
-            _collect(_run_padded_cell(
-                model, single, cell_id=cell_id, pad_side="right",
-                manifest=manifest, run_backward=False,
-                logical_sample_rank=sample_rank,
-                active_token_denominator=active_token_denominator,
-            ))
+            _collect(
+                _run_padded_cell(
+                    model,
+                    single,
+                    cell_id=cell_id,
+                    pad_side="right",
+                    manifest=manifest,
+                    run_backward=False,
+                    logical_sample_rank=sample_rank,
+                    active_token_denominator=active_token_denominator,
+                )
+            )
 
     return CellOutput(
-        cell_id=cell_id, selected_logp=merged,
-        loss=None if loss_acc is None else loss_acc.detach(), grads=grads,
-        first_drift_node=None, node_digests=_combined_node_digests(node_token_digests),
+        cell_id=cell_id,
+        selected_logp=merged,
+        loss=None if loss_acc is None else loss_acc.detach(),
+        grads=grads,
+        first_drift_node=None,
+        node_digests=_combined_node_digests(node_token_digests),
         requested_backend=model.profile_ops.provenance["attention"]["requested_backend"],
         actual_backend=model.profile_ops.provenance["attention"]["actual_backend"],
         node_token_digests=node_token_digests,
@@ -875,14 +894,22 @@ def _run_chunked_cell(
 ) -> CellOutput:
     if not run_backward and not defer_backward:
         return _run_chunked_cell_impl(
-            model, batch, cell_id=cell_id, manifest=manifest,
-            defer_backward=False, logical_sample_rank=logical_sample_rank,
+            model,
+            batch,
+            cell_id=cell_id,
+            manifest=manifest,
+            defer_backward=False,
+            logical_sample_rank=logical_sample_rank,
             active_token_denominator=active_token_denominator,
         )
     if active_session() is not None:
         return _run_chunked_cell_impl(
-            model, batch, cell_id=cell_id, manifest=manifest,
-            defer_backward=True, logical_sample_rank=logical_sample_rank,
+            model,
+            batch,
+            cell_id=cell_id,
+            manifest=manifest,
+            defer_backward=True,
+            logical_sample_rank=logical_sample_rank,
             active_token_denominator=active_token_denominator,
         )
     if defer_backward:
@@ -891,8 +918,12 @@ def _run_chunked_cell(
         model.weights.tensors[name].grad = None
     with canonical_backward_session() as session:
         cell = _run_chunked_cell_impl(
-            model, batch, cell_id=cell_id, manifest=manifest,
-            defer_backward=True, logical_sample_rank=logical_sample_rank,
+            model,
+            batch,
+            cell_id=cell_id,
+            manifest=manifest,
+            defer_backward=True,
+            logical_sample_rank=logical_sample_rank,
             active_token_denominator=active_token_denominator,
         )
         if cell.loss is None:
@@ -900,11 +931,14 @@ def _run_chunked_cell(
         cell.loss.backward()
         session.validate_complete()
     return CellOutput(
-        cell_id=cell.cell_id, selected_logp=cell.selected_logp,
+        cell_id=cell.cell_id,
+        selected_logp=cell.selected_logp,
         loss=None if cell.loss is None else cell.loss.detach(),
         grads=_collect_parameter_grads(model, cell_id=cell_id),
-        first_drift_node=cell.first_drift_node, node_digests=cell.node_digests,
-        requested_backend=cell.requested_backend, actual_backend=cell.actual_backend,
+        first_drift_node=cell.first_drift_node,
+        node_digests=cell.node_digests,
+        requested_backend=cell.requested_backend,
+        actual_backend=cell.actual_backend,
         node_token_digests=cell.node_token_digests,
     )
 
@@ -939,8 +973,11 @@ def _run_chunked_cell_impl(
         for start in range(0, seq, plan.chunk_size):
             end = min(start + plan.chunk_size, seq)
             step = model.forward(
-                input_ids[:, start:end], attention_mask=attn[:, start:end],
-                position_ids=pos[:, start:end], kv_cache=cache, capture_nodes=True,
+                input_ids[:, start:end],
+                attention_mask=attn[:, start:end],
+                position_ids=pos[:, start:end],
+                kv_cache=cache,
+                capture_nodes=True,
                 logical_keys=(logical_keys[:, start:end] if active_session() is not None else None),
             )
             logits_parts.append(step["logits"])
@@ -967,17 +1004,31 @@ def _run_chunked_cell_impl(
             raise RuntimeError("chunked training score logits differ from stateful chunked prefill")
         del observed_logits, observed_score_logits
         return _finish_cell(
-            model, chunked["logits"], input_ids, loss_mask,
-            restore=padded.restore_map, score_logits=chunked.get("score_logits"),
-            restores=tuple(restores), cell_id=cell_id, run_backward=False,
-            retain_loss=True, active_token_denominator=active_token_denominator,
+            model,
+            chunked["logits"],
+            input_ids,
+            loss_mask,
+            restore=padded.restore_map,
+            score_logits=chunked.get("score_logits"),
+            restores=tuple(restores),
+            cell_id=cell_id,
+            run_backward=False,
+            retain_loss=True,
+            active_token_denominator=active_token_denominator,
             node_token_digests=node_token_digests,
         )
     return _finish_cell(
-        model, torch.cat(logits_parts, dim=1), input_ids, loss_mask,
-        restore=padded.restore_map, score_logits=torch.cat(score_logits_parts, dim=1),
-        restores=tuple(restores), cell_id=cell_id, run_backward=False,
-        retain_loss=defer_backward, active_token_denominator=active_token_denominator,
+        model,
+        torch.cat(logits_parts, dim=1),
+        input_ids,
+        loss_mask,
+        restore=padded.restore_map,
+        score_logits=torch.cat(score_logits_parts, dim=1),
+        restores=tuple(restores),
+        cell_id=cell_id,
+        run_backward=False,
+        retain_loss=defer_backward,
+        active_token_denominator=active_token_denominator,
         node_token_digests=node_token_digests,
     )
 
@@ -994,11 +1045,16 @@ def _run_singleton_chunked_cell(
     merged: dict[tuple[str, int], torch.Tensor] = {}
     node_token_digests: dict[str, dict[str, str]] = {}
     loss_acc: torch.Tensor | None = None
-    sample_rank = {sample.sample_id: index for index, sample in enumerate(sorted(batch.samples, key=lambda item: item.sample_id))}
+    sample_rank = {
+        sample.sample_id: index
+        for index, sample in enumerate(sorted(batch.samples, key=lambda item: item.sample_id))
+    }
 
     def _collect(cell: CellOutput) -> None:
         nonlocal loss_acc
         merged.update(cell.selected_logp)
+        if cell.loss is None:
+            raise RuntimeError("singleton chunked cell produced no loss")
         loss_acc = cell.loss if loss_acc is None else loss_acc + cell.loss
         _merge_node_token_digests(node_token_digests, cell.node_token_digests)
 
@@ -1007,12 +1063,24 @@ def _run_singleton_chunked_cell(
             model.weights.tensors[name].grad = None
         with canonical_backward_session() as session:
             for sample in batch.samples:
-                single = LogicalBatch(workload_id=batch.workload_id, seed=batch.seed, samples=(sample,), cell_id=cell_id)
-                _collect(_run_chunked_cell(
-                    model, single, cell_id=cell_id, manifest=manifest, run_backward=False,
-                    defer_backward=True, logical_sample_rank=sample_rank,
-                    active_token_denominator=active_token_denominator,
-                ))
+                single = LogicalBatch(
+                    workload_id=batch.workload_id,
+                    seed=batch.seed,
+                    samples=(sample,),
+                    cell_id=cell_id,
+                )
+                _collect(
+                    _run_chunked_cell(
+                        model,
+                        single,
+                        cell_id=cell_id,
+                        manifest=manifest,
+                        run_backward=False,
+                        defer_backward=True,
+                        logical_sample_rank=sample_rank,
+                        active_token_denominator=active_token_denominator,
+                    )
+                )
             if loss_acc is None:
                 raise RuntimeError("singleton chunked aggregate produced no loss")
             loss_acc.backward()
@@ -1020,16 +1088,28 @@ def _run_singleton_chunked_cell(
         grads = _collect_parameter_grads(model, cell_id=cell_id)
     else:
         for sample in batch.samples:
-            single = LogicalBatch(workload_id=batch.workload_id, seed=batch.seed, samples=(sample,), cell_id=cell_id)
-            _collect(_run_chunked_cell(
-                model, single, cell_id=cell_id, manifest=manifest, run_backward=False,
-                logical_sample_rank=sample_rank, active_token_denominator=active_token_denominator,
-            ))
+            single = LogicalBatch(
+                workload_id=batch.workload_id, seed=batch.seed, samples=(sample,), cell_id=cell_id
+            )
+            _collect(
+                _run_chunked_cell(
+                    model,
+                    single,
+                    cell_id=cell_id,
+                    manifest=manifest,
+                    run_backward=False,
+                    logical_sample_rank=sample_rank,
+                    active_token_denominator=active_token_denominator,
+                )
+            )
         grads = {}
     return CellOutput(
-        cell_id=cell_id, selected_logp=merged,
-        loss=None if loss_acc is None else loss_acc.detach(), grads=grads,
-        first_drift_node=None, node_digests=_combined_node_digests(node_token_digests),
+        cell_id=cell_id,
+        selected_logp=merged,
+        loss=None if loss_acc is None else loss_acc.detach(),
+        grads=grads,
+        first_drift_node=None,
+        node_digests=_combined_node_digests(node_token_digests),
         requested_backend=model.profile_ops.provenance["attention"]["requested_backend"],
         actual_backend=model.profile_ops.provenance["attention"]["actual_backend"],
         node_token_digests=node_token_digests,
@@ -1083,25 +1163,43 @@ def _forward_cell(
         )
         node_token_digests = _node_token_fingerprints(model, restore)
         return _finish_cell(
-            model, out["logits"], input_ids, loss_mask, restore=restore,
-            restores=restores, score_logits=out.get("score_logits"),
-            cell_id=cell_id, run_backward=False,
+            model,
+            out["logits"],
+            input_ids,
+            loss_mask,
+            restore=restore,
+            restores=restores,
+            score_logits=out.get("score_logits"),
+            cell_id=cell_id,
+            run_backward=False,
             active_token_denominator=active_token_denominator,
             node_token_digests=node_token_digests,
         )
 
-    logical_keys = _logical_key_tensor(restore, device=input_ids.device, sample_rank=logical_sample_rank)
+    logical_keys = _logical_key_tensor(
+        restore, device=input_ids.device, sample_rank=logical_sample_rank
+    )
     session = active_session()
     if session is not None:
         out = model.forward(
-            input_ids, attention_mask=attn, position_ids=pos, capture_nodes=True,
+            input_ids,
+            attention_mask=attn,
+            position_ids=pos,
+            capture_nodes=True,
             logical_keys=logical_keys,
         )
         node_token_digests = _node_token_fingerprints(model, restore)
         return _finish_cell(
-            model, out["logits"], input_ids, loss_mask, restore=restore,
-            restores=restores, score_logits=out.get("score_logits"),
-            cell_id=cell_id, run_backward=False, retain_loss=defer_backward,
+            model,
+            out["logits"],
+            input_ids,
+            loss_mask,
+            restore=restore,
+            restores=restores,
+            score_logits=out.get("score_logits"),
+            cell_id=cell_id,
+            run_backward=False,
+            retain_loss=defer_backward,
             active_token_denominator=active_token_denominator,
             node_token_digests=node_token_digests,
         )
@@ -1109,14 +1207,23 @@ def _forward_cell(
         raise RuntimeError("deferred backward requires an active canonical session")
     with canonical_backward_session() as session:
         out = model.forward(
-            input_ids, attention_mask=attn, position_ids=pos, capture_nodes=True,
+            input_ids,
+            attention_mask=attn,
+            position_ids=pos,
+            capture_nodes=True,
             logical_keys=logical_keys,
         )
         node_token_digests = _node_token_fingerprints(model, restore)
         cell = _finish_cell(
-            model, out["logits"], input_ids, loss_mask, restore=restore,
-            restores=restores, score_logits=out.get("score_logits"),
-            cell_id=cell_id, run_backward=True,
+            model,
+            out["logits"],
+            input_ids,
+            loss_mask,
+            restore=restore,
+            restores=restores,
+            score_logits=out.get("score_logits"),
+            cell_id=cell_id,
+            run_backward=True,
             active_token_denominator=active_token_denominator,
             node_token_digests=node_token_digests,
         )
@@ -1229,7 +1336,9 @@ def _train_infer_parity(
             kv_cache=cache,
         )
         # logits[prompt-1] predicts token[prompt] (first completion).
-        first = model._selected_logp(_scoring_logits(prefill)[:, -1:, :], tokens[:, prompt : prompt + 1])
+        first = model._selected_logp(
+            _scoring_logits(prefill)[:, -1:, :], tokens[:, prompt : prompt + 1]
+        )
         infer[:, prompt - 1] = first[:, 0]
         for phys in range(prompt, sample.seq_len - 1):
             step = model.decode_step(
@@ -1398,7 +1507,9 @@ def _decode_prefill_batch(
             position_ids=pos[:, phys : phys + 1],
             attention_mask=attn[:, phys : phys + 1],
         )
-        infer[:, phys] = model._selected_logp(_scoring_logits(step), tokens[:, phys + 1 : phys + 2])[:, 0]
+        infer[:, phys] = model._selected_logp(
+            _scoring_logits(step), tokens[:, phys + 1 : phys + 2]
+        )[:, 0]
     active = loss_mask[:, 1:]
     roles = resolve_comparison_roles(contract, _TRAIN_INFER_KIND)
     aggregates = compute_logprob_aggregates(
@@ -1490,9 +1601,7 @@ def _workflow_url() -> str | None:
 
 
 def _c8_evidence_path() -> str:
-    return os.environ.get(
-        "WS1_C8_EVIDENCE_PATH", "docs/design/ws1-c8-execute.json"
-    )
+    return os.environ.get("WS1_C8_EVIDENCE_PATH", "docs/design/ws1-c8-execute.json")
 
 
 def _c8_source_commit() -> str | None:

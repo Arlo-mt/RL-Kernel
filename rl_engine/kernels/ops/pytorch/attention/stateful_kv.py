@@ -68,9 +68,7 @@ class StatefulKVCache:
             k=zeros,
             v=zeros.clone(),
             lengths=torch.zeros((n_layers, batch), device=dev, dtype=torch.int64),
-            valid=torch.zeros(
-                (n_layers, batch, max_seq_len), device=dev, dtype=torch.bool
-            ),
+            valid=torch.zeros((n_layers, batch, max_seq_len), device=dev, dtype=torch.bool),
         )
 
     def reset(self) -> None:
@@ -129,7 +127,7 @@ class StatefulKVCache:
         if valid_mask is not None:
             if valid_mask.shape != (batch, s_new):
                 raise ValueError(
-                    f"valid_mask must be [B, S_new]={ (batch, s_new) }, "
+                    f"valid_mask must be [B, S_new]={(batch, s_new)}, "
                     f"got {tuple(valid_mask.shape)}"
                 )
             keep = valid_mask.to(device=self.device, dtype=torch.bool)[:, None, :, None]
@@ -137,9 +135,7 @@ class StatefulKVCache:
             v_store = torch.where(keep, v_new, torch.zeros_like(v_new))
             valid_store = valid_mask.to(device=self.device, dtype=torch.bool)
         else:
-            valid_store = torch.ones(
-                (batch, s_new), device=self.device, dtype=torch.bool
-            )
+            valid_store = torch.ones((batch, s_new), device=self.device, dtype=torch.bool)
         self.k[layer, :, :, start:end, :].copy_(k_store)
         self.v[layer, :, :, start:end, :].copy_(v_store)
         self.valid[layer, :, start:end].copy_(valid_store)

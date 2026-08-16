@@ -10,9 +10,9 @@ hard fail. Concat-only NativeKVCacheAttnOp is not used on this path.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -26,16 +26,9 @@ from rl_engine.kernels.ops.canonical_lm_head import (
     canonical_cuda_lm_head_fp32,
     canonical_row_lm_head,
 )
-from rl_engine.kernels.ops.canonical_rmsnorm import (
-    canonical_cuda_rmsnorm,
-    canonical_row_rmsnorm,
-)
+from rl_engine.kernels.ops.canonical_rmsnorm import canonical_cuda_rmsnorm, canonical_row_rmsnorm
 from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
-from rl_engine.testing.ws1_workload import (
-    WS1Manifest,
-    load_manifest,
-    weight_snapshot_hash,
-)
+from rl_engine.testing.ws1_workload import WS1Manifest, load_manifest, weight_snapshot_hash
 
 OFFICIAL_FINGERPRINT = {
     "num_hidden_layers": 36,
@@ -704,13 +697,23 @@ class Qwen3DenseBIModel:
         lm_head_op = self.profile_ops.get("lm_head")
         keys = getattr(self, "_current_logical_keys", None)
         lm_family = self.profile_ops.provenance["lm_head"]["actual_backend"]
-        if torch.is_grad_enabled() and active_session() is not None and keys is not None and lm_family.startswith("cuda"):
+        if (
+            torch.is_grad_enabled()
+            and active_session() is not None
+            and keys is not None
+            and lm_family.startswith("cuda")
+        ):
             score_logits = canonical_cuda_lm_head_fp32(
                 hidden,
                 self.weights["lm_head.weight"],
                 keys.reshape(-1, 2),
             )
-        elif torch.is_grad_enabled() and active_session() is not None and keys is not None and lm_family == "triton":
+        elif (
+            torch.is_grad_enabled()
+            and active_session() is not None
+            and keys is not None
+            and lm_family == "triton"
+        ):
             score_logits = canonical_row_lm_head(
                 hidden,
                 self.weights["lm_head.weight"],
@@ -731,7 +734,9 @@ class Qwen3DenseBIModel:
         )
         logits = self._record("lm_head", logits)
         result: dict[str, torch.Tensor] = {
-            "logits": logits, "score_logits": score_logits, "hidden": hidden
+            "logits": logits,
+            "score_logits": score_logits,
+            "hidden": hidden,
         }
         if target_ids is not None:
             loss_logits = score_logits
@@ -743,9 +748,7 @@ class Qwen3DenseBIModel:
                 loss_logits = score_logits[:, :-1]
                 score_targets = target_ids[:, 1:]
                 score_mask = None if loss_mask is None else loss_mask[:, 1:]
-            logp = self._record(
-                "logprob", self._selected_logp(loss_logits, score_targets)
-            )
+            logp = self._record("logprob", self._selected_logp(loss_logits, score_targets))
             result["selected_logp"] = logp
             if score_mask is not None:
                 result["loss"] = self._masked_loss(logp, score_mask)
@@ -777,8 +780,7 @@ class Qwen3DenseBIModel:
         self._capture_nodes = False
         self._last_node_outputs = {}
         chunks = tuple(
-            (start, min(start + int(chunk_size), seq))
-            for start in range(0, seq, int(chunk_size))
+            (start, min(start + int(chunk_size), seq)) for start in range(0, seq, int(chunk_size))
         )
         hidden_parts: list[torch.Tensor] = []
         for start, end in chunks:
@@ -826,12 +828,8 @@ class Qwen3DenseBIModel:
                     self.weights[f"{prefix}.self_attn.k_norm.weight"],
                     node=f"{prefix}.k_norm",
                 )
-                q_parts.append(
-                    self._rope(q, position_ids[:, start:end], node=f"{prefix}.rope_q")
-                )
-                k_parts.append(
-                    self._rope(k, position_ids[:, start:end], node=f"{prefix}.rope_k")
-                )
+                q_parts.append(self._rope(q, position_ids[:, start:end], node=f"{prefix}.rope_q"))
+                k_parts.append(self._rope(k, position_ids[:, start:end], node=f"{prefix}.rope_k"))
                 v_parts.append(v)
 
             attn_all = _CanonicalChunkedAttentionFn.apply(
@@ -1201,11 +1199,7 @@ class Qwen3DenseBIModel:
         keys = getattr(self, "_current_logical_keys", None)
         family = self.profile_ops.provenance["qk_norm"]["actual_backend"]
         if torch.is_grad_enabled() and active_session() is not None and keys is not None:
-            head_keys = (
-                keys[:, :, None, :]
-                .expand(batch, seq, heads, 2)
-                .reshape(-1, 2)
-            )
+            head_keys = keys[:, :, None, :].expand(batch, seq, heads, 2).reshape(-1, 2)
             flat_rows = flat.contiguous().view(-1, dim)
             if family == "cuda":
                 out = canonical_cuda_rmsnorm(

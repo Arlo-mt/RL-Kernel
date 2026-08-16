@@ -58,9 +58,7 @@ def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     block_hidden = triton.next_power_of_2(hidden)
     assert block_hidden <= 131072, "H too large for this simple Triton kernel"
-    _rmsnorm_fwd_kernel[(rows,)](
-        x, weight, output, rstd, rows, hidden, eps, BLOCK_H=block_hidden
-    )
+    _rmsnorm_fwd_kernel[(rows,)](x, weight, output, rstd, rows, hidden, eps, BLOCK_H=block_hidden)
     return output, rstd
 
 
@@ -98,9 +96,7 @@ class RMSNormTriton(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         x, weight, rstd = ctx.saved_tensors
-        dx, partial_dw = rmsnorm_triton_backward_rows(
-            grad_out, x, weight, rstd
-        )
+        dx, partial_dw = rmsnorm_triton_backward_rows(grad_out, x, weight, rstd)
         dw = reduce_rows_fp32(partial_dw)
         record_backward(
             "rms_norm",

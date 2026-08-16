@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.backward_runtime import record_backward
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.canonical_backward import active_session
 
 
@@ -29,14 +29,16 @@ class _CanonicalCudaLMHead(torch.autograd.Function):
         hidden, weight = ctx.saved_tensors
         grad_rows = grad_out.reshape(-1, grad_out.shape[-1]).float()
         hidden_rows = hidden.reshape(-1, hidden.shape[-1])
-        grad_hidden = _C.det_gemm_rowwise_fwd_fp32(
-            grad_rows, weight.float()
-        ).reshape_as(hidden).to(hidden.dtype)
+        grad_hidden = (
+            _C.det_gemm_rowwise_fwd_fp32(grad_rows, weight.float())
+            .reshape_as(hidden)
+            .to(hidden.dtype)
+        )
 
         def reducer(rows, grads):
-            return _C.det_gemm_rowwise_fwd_fp32(
-                grads.float().t().contiguous(), rows.float()
-            ).to(weight.dtype)
+            return _C.det_gemm_rowwise_fwd_fp32(grads.float().t().contiguous(), rows.float()).to(
+                weight.dtype
+            )
 
         grad_weight = ctx.session.submit_linear(
             ctx.parameter_id, ctx.slot, hidden_rows, grad_rows, reducer
@@ -77,9 +79,9 @@ class _CanonicalRowLMHead(torch.autograd.Function):
         hidden, weight = ctx.saved_tensors
         grad_rows = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
         hidden_rows = hidden.reshape(-1, hidden.shape[-1]).contiguous()
-        grad_hidden = ctx.matmul_op(
-            grad_rows.to(weight.dtype), weight
-        ).reshape_as(hidden).to(hidden.dtype)
+        grad_hidden = (
+            ctx.matmul_op(grad_rows.to(weight.dtype), weight).reshape_as(hidden).to(hidden.dtype)
+        )
 
         def reducer(rows, grads):
             return ctx.matmul_op(
