@@ -6,9 +6,9 @@ import pytest
 import torch
 
 from rl_engine.kernels.attention_projection import (
-    AttentionProjectionOp,
     O_PROJ_COLLECTIVE_CONTRACT,
     QKV_COLLECTIVE_CONTRACT,
+    AttentionProjectionOp,
     split_qkv,
 )
 
@@ -63,9 +63,9 @@ def test_projection_rejects_native_drift_and_records_reason():
     def drifting_native(a, b):
         return (_deterministic(a, b).float() + 1.0).to(torch.bfloat16)
 
-    result = AttentionProjectionOp(
-        "o_proj", native=drifting_native, deterministic=_deterministic
-    )(x, weight)
+    result = AttentionProjectionOp("o_proj", native=drifting_native, deterministic=_deterministic)(
+        x, weight
+    )
 
     assert result.plan.fallback is True
     assert result.plan.fallback_reason == "native_projection_bitwise_probe_failed"

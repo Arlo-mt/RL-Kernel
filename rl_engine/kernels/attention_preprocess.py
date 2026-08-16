@@ -12,15 +12,14 @@ was taken.  The caller must pass this readback to the cross-config binder.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 import torch
 from torch import Tensor
-
 
 QK_RMSNORM_BACKEND_ID = "rlkernel.cuda.rmsnorm"
 ROPE_BACKEND_ID = "rlkernel.cuda.rope_sm90"
@@ -171,9 +170,12 @@ class H100AttentionPreprocessor:
                 q_native = self.native_rope(q_norm_native, positions, theta=theta)
                 k_native = self.native_rope(k_norm_native, positions, theta=theta)
                 probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
-                if torch.equal(q_norm_native, q_norm_det) and torch.equal(
-                    k_norm_native, k_norm_det
-                ) and torch.equal(q_native, q_det) and torch.equal(k_native, k_det):
+                if (
+                    torch.equal(q_norm_native, q_norm_det)
+                    and torch.equal(k_norm_native, k_norm_det)
+                    and torch.equal(q_native, q_det)
+                    and torch.equal(k_native, k_det)
+                ):
                     return AttentionPreprocessResult(
                         q=q_native,
                         k=k_native,

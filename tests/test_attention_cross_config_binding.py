@@ -55,13 +55,11 @@ from rl_engine.kernels.attention_contract import (
     SplitKVSpec,
     build_split_kv_runtime_plan_set,
 )
-from rl_engine.kernels.attention_preprocess import (
-    MANDATED_ATTENTION_PREPROCESS_BACKENDS,
-)
+from rl_engine.kernels.attention_preprocess import MANDATED_ATTENTION_PREPROCESS_BACKENDS
 from rl_engine.kernels.attention_projection import (
     O_PROJ_COLLECTIVE_CONTRACT,
-    ProjectionPlan,
     QKV_COLLECTIVE_CONTRACT,
+    ProjectionPlan,
 )
 
 pytestmark = pytest.mark.unit

@@ -948,21 +948,20 @@ def bind_attention_runtime_readbacks(
                     rollout=rollout_fallback,
                     training=training_fallback,
                     message=(
-                        "QKV/o_proj must use the same native-or-deterministic "
-                        "path on both sides"
+                        "QKV/o_proj must use the same native-or-deterministic " "path on both sides"
                     ),
                 )
             )
         if rollout_fallback and training_fallback:
-            for field in ("backend_id", "policy_id", "split_k", "reduction_order"):
-                if rollout_plan.get(field) != training_plan.get(field):
+            for field_name in ("backend_id", "policy_id", "split_k", "reduction_order"):
+                if rollout_plan.get(field_name) != training_plan.get(field_name):
                     missing_scope_evidence.append(
                         BindingIssue(
                             code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
                             tier=BindingTier.SEMANTIC,
-                            field=f"projection.{projection}.{field}",
-                            rollout=rollout_plan.get(field),
-                            training=training_plan.get(field),
+                            field=f"projection.{projection}.{field_name}",
+                            rollout=rollout_plan.get(field_name),
+                            training=training_plan.get(field_name),
                             message=(
                                 "deterministic projection fallback evidence differs "
                                 "between sides"
@@ -1091,17 +1090,17 @@ def _attention_projection_issues(
                 )
             )
             continue
-        for field, expected in fixed_fields.items():
-            actual = plan.get(field)
+        for field_name, expected in fixed_fields.items():
+            actual = plan.get(field_name)
             if actual != expected:
                 issues.append(
                     BindingIssue(
                         code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
                         tier=BindingTier.SEMANTIC,
-                        field=f"{side}.projection.{projection}.{field}",
+                        field=f"{side}.projection.{projection}.{field_name}",
                         rollout=actual if side == "rollout" else None,
                         training=actual if side == "training" else None,
-                        message=f"{side} {projection} {field} must be {expected!r}",
+                        message=f"{side} {projection} {field_name} must be {expected!r}",
                     )
                 )
         collective = plan.get("collective")

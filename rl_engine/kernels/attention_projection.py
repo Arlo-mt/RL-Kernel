@@ -215,9 +215,7 @@ def split_qkv(
     kv_width = kv_heads * head_dim
     expected = q_width + kv_width + kv_width
     if projected_qkv.shape[-1] != expected:
-        raise ValueError(
-            f"projected QKV width must be {expected}, got {projected_qkv.shape[-1]}"
-        )
+        raise ValueError(f"projected QKV width must be {expected}, got {projected_qkv.shape[-1]}")
     q, k, v = projected_qkv.split((q_width, kv_width, kv_width), dim=-1)
     return q, k, v
 
