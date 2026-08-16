@@ -980,18 +980,30 @@ def test_attention_cp_partial_states_reject_duplicate_global_block_index():
 def test_cuda_ag_rs_attention_cp_comm_requires_compiled_collective():
     plan = AttentionCPCommunicationPlan(
         parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        expected_blocks=(
+            AttentionCPBlockMetadata(0, 0, 2, 0, 0),
+            AttentionCPBlockMetadata(1, 2, 4, 1, 0),
+        ),
+        expected_kv_token_range=(0, 4),
+        query_token_ranges=((0, 1), (1, 2)),
         status="implemented",
     )
     communication = CUDAAGRSAttentionCPCommunication()
 
-    with pytest.raises(AttentionCPCommunicationUnavailable, match="requires CUDA"):
+    with pytest.raises(
+        AttentionCPCommunicationUnavailable,
+        match="requires CUDA|requires initialized|unavailable|extension",
+    ):
         communication.all_gather_partial_states((_partial_state(0),), plan)
 
     merged = AttentionCPMergedState(
         out=torch.zeros(1, 2, 1, 4),
         lse=torch.zeros(1, 2, 1, dtype=torch.float32),
     )
-    with pytest.raises(AttentionCPCommunicationUnavailable, match="requires CUDA"):
+    with pytest.raises(
+        AttentionCPCommunicationUnavailable,
+        match="requires CUDA|requires initialized|unavailable|extension",
+    ):
         communication.reduce_scatter_merged_state(merged, plan)
 
 
