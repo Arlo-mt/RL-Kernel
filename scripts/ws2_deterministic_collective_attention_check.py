@@ -90,9 +90,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _check_all_gather(collective, rank: int, world_size: int, rows: int, device: torch.device):
-    local = torch.arange(
-        rows * 8, device=device, dtype=torch.bfloat16
-    ).reshape(rows, 8) + rank * 100
+    local = (
+        torch.arange(rows * 8, device=device, dtype=torch.bfloat16).reshape(rows, 8) + rank * 100
+    )
     expected = torch.cat(
         [
             torch.arange(rows * 8, device=device, dtype=torch.bfloat16).reshape(rows, 8)

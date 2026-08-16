@@ -157,25 +157,27 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
             # self-owned AG/RS acceptance path.
             required=False,
             command=(
-                python,
-                str(te_compare_script),
-                "--teacher-script",
-                str(args.megatron_te_script),
-                "--model",
-                str(args.megatron_model),
-                "--token-artifact",
-                str(args.megatron_token_artifact),
-                "--output-dir",
-                str(artifact_dir / "megatron-te-cp-runs"),
-                "--output",
-                str(te_report),
-                "--python",
-                str(args.megatron_python),
-                "--cp-comm-type",
-                "p2p",
-            )
-            if te_available
-            else None,
+                (
+                    python,
+                    str(te_compare_script),
+                    "--teacher-script",
+                    str(args.megatron_te_script),
+                    "--model",
+                    str(args.megatron_model),
+                    "--token-artifact",
+                    str(args.megatron_token_artifact),
+                    "--output-dir",
+                    str(artifact_dir / "megatron-te-cp-runs"),
+                    "--output",
+                    str(te_report),
+                    "--python",
+                    str(args.megatron_python),
+                    "--cp-comm-type",
+                    "p2p",
+                )
+                if te_available
+                else None
+            ),
             report_path=te_report,
             validator=lambda report: validate_native_te_report(report, args),
             unavailable_reason=te_unavailable,
@@ -221,15 +223,17 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
         AcceptanceCase(
             name="custom_cuda_ag_rs",
             command=(
-                torchrun,
-                "--standalone",
-                f"--nproc-per-node={args.collective_world_size}",
-                str(collective_script),
-                "--output",
-                str(collective_report),
-            )
-            if collective_available
-            else None,
+                (
+                    torchrun,
+                    "--standalone",
+                    f"--nproc-per-node={args.collective_world_size}",
+                    str(collective_script),
+                    "--output",
+                    str(collective_report),
+                )
+                if collective_available
+                else None
+            ),
             report_path=collective_report,
             validator=lambda report: validate_collective_report(report, args, operation="ag_rs"),
             unavailable_reason=collective_unavailable,
@@ -239,15 +243,17 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
         AcceptanceCase(
             name="custom_cuda_allreduce",
             command=(
-                torchrun,
-                "--standalone",
-                f"--nproc-per-node={args.collective_world_size}",
-                str(collective_script),
-                "--output",
-                str(collective_report),
-            )
-            if collective_available
-            else None,
+                (
+                    torchrun,
+                    "--standalone",
+                    f"--nproc-per-node={args.collective_world_size}",
+                    str(collective_script),
+                    "--output",
+                    str(collective_report),
+                )
+                if collective_available
+                else None
+            ),
             report_path=collective_report,
             validator=lambda report: validate_collective_report(
                 report, args, operation="allreduce"
