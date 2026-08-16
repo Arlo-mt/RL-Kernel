@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Strict H100 QK-Norm and RoPE handoff for WS2 Attention.
+"""Bitwise-bound QK-Norm and RoPE handoff for WS2 Attention.
 
-This module intentionally has no runtime-native fallback.  A caller either runs
-the RL-Kernel CUDA operators and records their identities, or the experiment
-fails before Attention executes.
+Megatron/TE and vLLM/FlashInfer remain the first-choice implementations.  They
+are admitted only after the same-input H100 probe is bitwise identical to the
+deterministic RL-Kernel path.  A failed probe (or an unavailable native backend)
+selects the common RL-Kernel path for both sides and records why the fallback
+was taken.  The caller must pass this readback to the cross-config binder.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 from torch import Tensor
@@ -20,6 +24,9 @@ from torch import Tensor
 
 QK_RMSNORM_BACKEND_ID = "rlkernel.cuda.rmsnorm"
 ROPE_BACKEND_ID = "rlkernel.cuda.rope_sm90"
+NATIVE_QK_RMSNORM_BACKEND_ID = "native.qk_rmsnorm"
+NATIVE_ROPE_BACKEND_ID = "native.rope"
+PREPROCESS_POLICY_ID = "ws2.attention.preprocess.v2"
 MANDATED_ATTENTION_PREPROCESS_BACKENDS: Mapping[str, str] = MappingProxyType(
     {
         "qk_rmsnorm": QK_RMSNORM_BACKEND_ID,
@@ -37,6 +44,9 @@ class AttentionPreprocessResult:
     backend_ids: Mapping[str, str]
     fallback: bool
     device_capability: tuple[int, int]
+    fallback_reason: str | None = None
+    probe_id: str = ""
+    policy_id: str = PREPROCESS_POLICY_ID
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "backend_ids", MappingProxyType(dict(self.backend_ids)))
@@ -54,13 +64,31 @@ class AttentionPreprocessResult:
         return {
             "preprocess_backends": dict(self.backend_ids),
             "preprocess_fallback": self.fallback,
+            "preprocess_fallback_reason": self.fallback_reason,
+            "preprocess_probe_id": self.probe_id,
+            "preprocess_policy_id": self.policy_id,
         }
 
 
 class H100AttentionPreprocessor:
-    """Apply RL-Kernel CUDA QK-Norm then RoPE without silent fallback."""
+    """Apply native QK-Norm/RoPE when the H100 probe passes.
 
-    def __init__(self, device: torch.device | str | int | None = None) -> None:
+    ``native_qk_norm`` and ``native_rope`` are framework-owned callables.  They
+    are intentionally injected instead of importing TE/vLLM here, so the same
+    policy can be used by both runtimes.  The deterministic callables default to
+    RL-Kernel's CUDA operators and are always run to establish the probe oracle.
+    """
+
+    def __init__(
+        self,
+        device: torch.device | str | int | None = None,
+        *,
+        native_qk_norm: Callable[..., Tensor] | None = None,
+        native_rope: Callable[..., Tensor] | None = None,
+        native_qk_norm_backend_id: str = NATIVE_QK_RMSNORM_BACKEND_ID,
+        native_rope_backend_id: str = NATIVE_ROPE_BACKEND_ID,
+        policy_id: str = PREPROCESS_POLICY_ID,
+    ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("H100AttentionPreprocessor requires an available CUDA runtime")
 
@@ -89,13 +117,13 @@ class H100AttentionPreprocessor:
 
         self.rmsnorm = RMSNormCudaOp()
         self.rope = RoPESM90Op()
-        actual_backends = {
-            "qk_rmsnorm": self.rmsnorm.backend_id,
-            "rope": self.rope.backend_id,
-        }
-        if actual_backends != dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS):
-            raise RuntimeError(f"unexpected Attention preprocess backends: {actual_backends}")
-        self.backend_ids = MappingProxyType(actual_backends)
+        if not isinstance(policy_id, str) or not policy_id.strip():
+            raise ValueError("policy_id must be a non-empty string")
+        self.native_qk_norm = native_qk_norm
+        self.native_rope = native_rope
+        self.native_qk_norm_backend_id = native_qk_norm_backend_id
+        self.native_rope_backend_id = native_rope_backend_id
+        self.policy_id = policy_id
 
     def __call__(
         self,
@@ -130,15 +158,76 @@ class H100AttentionPreprocessor:
         theta: float = 1_000_000.0,
     ) -> AttentionPreprocessResult:
         _validate_inputs(q, k, q_weight, k_weight, positions, self.device)
-        q_norm = self.rmsnorm(q, q_weight, eps=eps)
-        k_norm = self.rmsnorm(k, k_weight, eps=eps)
+        q_norm_det = self.rmsnorm(q, q_weight, eps=eps)
+        k_norm_det = self.rmsnorm(k, k_weight, eps=eps)
+        q_det = self.rope(q_norm_det, positions, theta=theta)
+        k_det = self.rope(k_norm_det, positions, theta=theta)
+
+        native_available = self.native_qk_norm is not None and self.native_rope is not None
+        if native_available:
+            try:
+                q_norm_native = self.native_qk_norm(q, q_weight, eps=eps)
+                k_norm_native = self.native_qk_norm(k, k_weight, eps=eps)
+                q_native = self.native_rope(q_norm_native, positions, theta=theta)
+                k_native = self.native_rope(k_norm_native, positions, theta=theta)
+                probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
+                if torch.equal(q_norm_native, q_norm_det) and torch.equal(
+                    k_norm_native, k_norm_det
+                ) and torch.equal(q_native, q_det) and torch.equal(k_native, k_det):
+                    return AttentionPreprocessResult(
+                        q=q_native,
+                        k=k_native,
+                        backend_ids=MappingProxyType(
+                            {
+                                "qk_rmsnorm": self.native_qk_norm_backend_id,
+                                "rope": self.native_rope_backend_id,
+                            }
+                        ),
+                        fallback=False,
+                        device_capability=self.device_capability,
+                        probe_id=probe_id,
+                        policy_id=self.policy_id,
+                    )
+                fallback_reason = "native_preprocess_bitwise_probe_failed"
+            except Exception as exc:  # framework backend failures must fail over together
+                fallback_reason = f"native_preprocess_unavailable:{type(exc).__name__}"
+                probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
+        else:
+            fallback_reason = "native_preprocess_not_supplied"
+            probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
         return AttentionPreprocessResult(
-            q=self.rope(q_norm, positions, theta=theta),
-            k=self.rope(k_norm, positions, theta=theta),
-            backend_ids=self.backend_ids,
-            fallback=False,
+            q=q_det,
+            k=k_det,
+            backend_ids=MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+            fallback=True,
             device_capability=self.device_capability,
+            fallback_reason=fallback_reason,
+            probe_id=probe_id,
+            policy_id=self.policy_id,
         )
+
+
+def _probe_id(
+    q: Tensor,
+    k: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    positions: Tensor,
+    eps: float,
+    theta: float,
+) -> str:
+    payload = {
+        "q_shape": list(q.shape),
+        "k_shape": list(k.shape),
+        "q_dtype": str(q.dtype),
+        "k_dtype": str(k.dtype),
+        "weight_dtype": str(q_weight.dtype),
+        "positions_shape": list(positions.shape),
+        "positions_sha256": hashlib.sha256(positions.detach().cpu().numpy().tobytes()).hexdigest(),
+        "eps": float(eps),
+        "theta": float(theta),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
 def _validate_inputs(
@@ -177,4 +266,7 @@ __all__ = [
     "MANDATED_ATTENTION_PREPROCESS_BACKENDS",
     "QK_RMSNORM_BACKEND_ID",
     "ROPE_BACKEND_ID",
+    "NATIVE_QK_RMSNORM_BACKEND_ID",
+    "NATIVE_ROPE_BACKEND_ID",
+    "PREPROCESS_POLICY_ID",
 ]

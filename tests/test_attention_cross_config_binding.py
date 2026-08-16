@@ -58,6 +58,11 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.attention_preprocess import (
     MANDATED_ATTENTION_PREPROCESS_BACKENDS,
 )
+from rl_engine.kernels.attention_projection import (
+    O_PROJ_COLLECTIVE_CONTRACT,
+    ProjectionPlan,
+    QKV_COLLECTIVE_CONTRACT,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -623,6 +628,20 @@ def _statuses(materialization, path):
 
 def _readback(materializer, flat, *, source):
     contract = materializer.build_contract(flat)
+    projection_plans = {
+        name: ProjectionPlan(
+            projection=name,
+            backend_id="rlkernel.cuda.det_gemm",
+            fallback=True,
+            fallback_reason="native projection probe failed",
+            probe_id=f"{source}-{name}",
+            collective=collective.to_dict(),
+        ).to_dict()
+        for name, collective in (
+            ("qkv", QKV_COLLECTIVE_CONTRACT),
+            ("o_proj", O_PROJ_COLLECTIVE_CONTRACT),
+        )
+    }
     return AttentionRuntimeReadback(
         contract=contract,
         actual_knobs=dict(flat),
@@ -631,6 +650,7 @@ def _readback(materializer, flat, *, source):
         frozen_scope_verified=True,
         preprocess_backends=MANDATED_ATTENTION_PREPROCESS_BACKENDS,
         preprocess_fallback=False,
+        projection_plans=projection_plans,
     )
 
 
@@ -772,6 +792,60 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
     )
 
 
+def test_strict_runtime_readback_accepts_common_deterministic_preprocess_fallback():
+    rollout = replace(
+        _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
+        preprocess_fallback=True,
+        preprocess_fallback_reason="native probe failed",
+        preprocess_probe_id="rollout-probe",
+    )
+    training = replace(
+        _readback(
+            MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
+        ),
+        preprocess_fallback=True,
+        preprocess_fallback_reason="native probe failed",
+        preprocess_probe_id="training-probe",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="rlkernel.cp_attention_reference",
+    )
+
+    assert result.passed
+
+
+def test_strict_runtime_readback_accepts_distinct_verified_native_preprocess_backends():
+    rollout = replace(
+        _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
+        preprocess_backends={"qk_rmsnorm": "native.vllm.rmsnorm", "rope": "native.vllm.rope"},
+        preprocess_probe_id="rollout-probe",
+    )
+    training = replace(
+        _readback(
+            MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
+        ),
+        preprocess_backends={"qk_rmsnorm": "native.te.rmsnorm", "rope": "native.te.rope"},
+        preprocess_probe_id="training-probe",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="megatron.te",
+    )
+
+    assert result.passed
+
+
 @pytest.mark.parametrize(
     ("backends", "fallback", "expected_code"),
     [
@@ -781,14 +855,14 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
             BindingErrorCode.ATTENTION_PREPROCESS_MISSING,
         ),
         (
-            {**MANDATED_ATTENTION_PREPROCESS_BACKENDS, "qk_rmsnorm": "vllm.native"},
+            {**MANDATED_ATTENTION_PREPROCESS_BACKENDS, "qk_rmsnorm": "unknown.backend"},
             False,
             BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
         ),
         (
             dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS),
             True,
-            BindingErrorCode.ATTENTION_PREPROCESS_FALLBACK,
+            BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
         ),
     ],
 )
@@ -800,6 +874,7 @@ def test_strict_runtime_readback_rejects_unverified_preprocess_backend(
         rollout,
         preprocess_backends=backends,
         preprocess_fallback=fallback,
+        preprocess_fallback_reason=("test fallback" if fallback else None),
     )
     training = _readback(
         MegatronAttentionMaterializer(),
@@ -819,6 +894,30 @@ def test_strict_runtime_readback_rejects_unverified_preprocess_backend(
     assert result.comparable
     assert not result.passed
     assert result.issues_by_code(expected_code)
+
+
+def test_strict_runtime_readback_rejects_projection_split_k_or_missing_plan():
+    rollout = _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback")
+    plans = {name: dict(plan) for name, plan in rollout.projection_plans.items()}
+    plans["qkv"]["split_k"] = True
+    plans.pop("o_proj")
+    rollout = replace(rollout, projection_plans=plans)
+    training = _readback(
+        MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="vllm.flash_attn",
+        training_backend_id="megatron.te",
+    )
+
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.ATTENTION_PROJECTION_MISMATCH)
+    assert result.issues_by_code(BindingErrorCode.ATTENTION_PROJECTION_MISSING)
 
 
 def test_strict_runtime_readback_entrypoint_rejects_unverified_frozen_scope():

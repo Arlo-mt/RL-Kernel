@@ -37,7 +37,7 @@ requires_h100_preprocess = pytest.mark.skipif(
 )
 
 
-def test_h100_preprocessor_has_no_native_backend_option():
+def test_h100_preprocessor_uses_common_backend_ids_for_fallback():
     assert dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS) == {
         "qk_rmsnorm": "rlkernel.cuda.rmsnorm",
         "rope": "rlkernel.cuda.rope_sm90",
@@ -83,11 +83,16 @@ def test_h100_preprocessor_executes_cuda_qk_norm_and_zigzag_rope():
     q_ref = rope(norm(q, q_weight), positions)
     k_ref = rope(norm(k, k_weight), positions)
 
-    assert result.fallback is False
+    assert result.fallback is True
     assert dict(result.backend_ids) == dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS)
+    assert result.fallback_reason == "native_preprocess_not_supplied"
+    assert result.probe_id
     assert result.readback_fields() == {
         "preprocess_backends": dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS),
-        "preprocess_fallback": False,
+        "preprocess_fallback": True,
+        "preprocess_fallback_reason": "native_preprocess_not_supplied",
+        "preprocess_probe_id": result.probe_id,
+        "preprocess_policy_id": result.policy_id,
     }
     torch.testing.assert_close(result.q.float(), q_ref.float(), atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(result.k.float(), k_ref.float(), atol=2e-2, rtol=2e-2)

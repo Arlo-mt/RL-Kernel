@@ -54,7 +54,15 @@ from rl_engine.kernels.attention_contract import (
     SplitKVRuntimePlanSet,
     validate_split_kv_plan_set_alignment,
 )
-from rl_engine.kernels.attention_preprocess import MANDATED_ATTENTION_PREPROCESS_BACKENDS
+from rl_engine.kernels.attention_preprocess import (
+    MANDATED_ATTENTION_PREPROCESS_BACKENDS,
+    PREPROCESS_POLICY_ID,
+)
+from rl_engine.kernels.attention_projection import (
+    O_PROJ_COLLECTIVE_CONTRACT,
+    PROJECTION_POLICY_ID,
+    QKV_COLLECTIVE_CONTRACT,
+)
 
 __all__ = [
     "ATTENTION_LSE_DOMAIN",
@@ -112,6 +120,8 @@ class BindingErrorCode(str, Enum):
     ATTENTION_PREPROCESS_MISSING = "ATTENTION_PREPROCESS_MISSING"
     ATTENTION_PREPROCESS_MISMATCH = "ATTENTION_PREPROCESS_MISMATCH"
     ATTENTION_PREPROCESS_FALLBACK = "ATTENTION_PREPROCESS_FALLBACK"
+    ATTENTION_PROJECTION_MISSING = "ATTENTION_PROJECTION_MISSING"
+    ATTENTION_PROJECTION_MISMATCH = "ATTENTION_PROJECTION_MISMATCH"
 
 
 @dataclass(frozen=True)
@@ -125,6 +135,10 @@ class AttentionRuntimeReadback:
     frozen_scope_verified: bool
     preprocess_backends: Mapping[str, str] = field(default_factory=dict)
     preprocess_fallback: bool = False
+    preprocess_fallback_reason: str | None = None
+    preprocess_probe_id: str = ""
+    preprocess_policy_id: str = PREPROCESS_POLICY_ID
+    projection_plans: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.contract, AttentionContract):
@@ -146,6 +160,21 @@ class AttentionRuntimeReadback:
                 raise ValueError("preprocess backend IDs must be non-empty strings")
         if not isinstance(self.preprocess_fallback, bool):
             raise TypeError("preprocess_fallback must be a bool")
+        if self.preprocess_fallback and not self.preprocess_fallback_reason:
+            raise ValueError(
+                "preprocess_fallback_reason is required when preprocess_fallback is true"
+            )
+        if not isinstance(self.preprocess_probe_id, str):
+            raise TypeError("preprocess_probe_id must be a string")
+        if not isinstance(self.preprocess_policy_id, str) or not self.preprocess_policy_id.strip():
+            raise ValueError("preprocess_policy_id must be a non-empty string")
+        if not isinstance(self.projection_plans, Mapping):
+            raise TypeError("projection_plans must be a mapping")
+        normalized_projection_plans: dict[str, Mapping[str, Any]] = {}
+        for name, plan in self.projection_plans.items():
+            if not isinstance(name, str) or not isinstance(plan, Mapping):
+                raise TypeError("projection_plans must map projection names to mappings")
+            normalized_projection_plans[name] = MappingProxyType(dict(plan))
 
         plan_error = _split_kv_plan_contract_error(self.contract, self.split_kv_plan_set)
         if plan_error is not None:
@@ -155,6 +184,11 @@ class AttentionRuntimeReadback:
             self,
             "preprocess_backends",
             MappingProxyType(dict(self.preprocess_backends)),
+        )
+        object.__setattr__(
+            self,
+            "projection_plans",
+            MappingProxyType(normalized_projection_plans),
         )
 
     @property
@@ -170,6 +204,12 @@ class AttentionRuntimeReadback:
             "attention_preprocess": {
                 "backends": dict(self.preprocess_backends),
                 "fallback": self.preprocess_fallback,
+                "fallback_reason": self.preprocess_fallback_reason,
+                "probe_id": self.preprocess_probe_id,
+                "policy_id": self.preprocess_policy_id,
+            },
+            "attention_projections": {
+                name: dict(plan) for name, plan in self.projection_plans.items()
             },
             "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
         }
@@ -853,6 +893,82 @@ def bind_attention_runtime_readbacks(
                 )
             )
         missing_scope_evidence.extend(_attention_preprocess_issues(side, readback))
+        missing_scope_evidence.extend(_attention_projection_issues(side, readback))
+    if rollout.preprocess_fallback != training.preprocess_fallback:
+        missing_scope_evidence.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="preprocess.fallback",
+                rollout=rollout.preprocess_fallback,
+                training=training.preprocess_fallback,
+                message=(
+                    "both runtimes must either pass the native H100 bitwise probe or "
+                    "use the same deterministic preprocess fallback"
+                ),
+            )
+        )
+    if rollout.preprocess_policy_id != training.preprocess_policy_id:
+        missing_scope_evidence.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="preprocess.policy_id",
+                rollout=rollout.preprocess_policy_id,
+                training=training.preprocess_policy_id,
+                message="QK-Norm/RoPE policy IDs differ between runtimes",
+            )
+        )
+    if rollout.preprocess_fallback and training.preprocess_fallback:
+        for name in MANDATED_ATTENTION_PREPROCESS_BACKENDS:
+            rollout_backend = rollout.preprocess_backends.get(name)
+            training_backend = training.preprocess_backends.get(name)
+            if rollout_backend != training_backend:
+                missing_scope_evidence.append(
+                    BindingIssue(
+                        code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+                        tier=BindingTier.SEMANTIC,
+                        field=f"preprocess.{name}",
+                        rollout=rollout_backend,
+                        training=training_backend,
+                        message="fallback sides must use the same deterministic preprocess backend",
+                    )
+                )
+    for projection in ("qkv", "o_proj"):
+        rollout_plan = rollout.projection_plans.get(projection, {})
+        training_plan = training.projection_plans.get(projection, {})
+        rollout_fallback = bool(rollout_plan.get("fallback", False))
+        training_fallback = bool(training_plan.get("fallback", False))
+        if rollout_fallback != training_fallback:
+            missing_scope_evidence.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"projection.{projection}.fallback",
+                    rollout=rollout_fallback,
+                    training=training_fallback,
+                    message=(
+                        "QKV/o_proj must use the same native-or-deterministic "
+                        "path on both sides"
+                    ),
+                )
+            )
+        if rollout_fallback and training_fallback:
+            for field in ("backend_id", "policy_id", "split_k", "reduction_order"):
+                if rollout_plan.get(field) != training_plan.get(field):
+                    missing_scope_evidence.append(
+                        BindingIssue(
+                            code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                            tier=BindingTier.SEMANTIC,
+                            field=f"projection.{projection}.{field}",
+                            rollout=rollout_plan.get(field),
+                            training=training_plan.get(field),
+                            message=(
+                                "deterministic projection fallback evidence differs "
+                                "between sides"
+                            ),
+                        )
+                    )
     return bind_attention_contracts(
         rollout_contract=rollout.contract,
         training_contract=training.contract,
@@ -869,6 +985,13 @@ def bind_attention_runtime_readbacks(
                 for name, backend in rollout.preprocess_backends.items()
             },
             "preprocess.fallback": rollout.preprocess_fallback,
+            "preprocess.fallback_reason": rollout.preprocess_fallback_reason,
+            "preprocess.probe_id": rollout.preprocess_probe_id,
+            "preprocess.policy_id": rollout.preprocess_policy_id,
+            **{
+                f"projection.{projection}": dict(plan)
+                for projection, plan in rollout.projection_plans.items()
+            },
         },
         training_recorded_extra={
             **{
@@ -876,6 +999,13 @@ def bind_attention_runtime_readbacks(
                 for name, backend in training.preprocess_backends.items()
             },
             "preprocess.fallback": training.preprocess_fallback,
+            "preprocess.fallback_reason": training.preprocess_fallback_reason,
+            "preprocess.probe_id": training.preprocess_probe_id,
+            "preprocess.policy_id": training.preprocess_policy_id,
+            **{
+                f"projection.{projection}": dict(plan)
+                for projection, plan in training.projection_plans.items()
+            },
         },
     )
 
@@ -899,7 +1029,7 @@ def _attention_preprocess_issues(
                     ),
                 )
             )
-        elif actual != mandated:
+        elif actual != mandated and not actual.startswith("native."):
             issues.append(
                 BindingIssue(
                     code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
@@ -909,19 +1039,112 @@ def _attention_preprocess_issues(
                     training=actual if side == "training" else None,
                     message=(
                         f"{side} executed {actual!r}; "
-                        f"the H100 experiment requires {mandated!r}"
+                        f"the H100 experiment requires {mandated!r} or a verified native backend"
                     ),
                 )
             )
-    if readback.preprocess_fallback:
+    if readback.preprocess_fallback and any(
+        readback.preprocess_backends.get(name) != mandated
+        for name, mandated in MANDATED_ATTENTION_PREPROCESS_BACKENDS.items()
+    ):
         issues.append(
             BindingIssue(
                 code=BindingErrorCode.ATTENTION_PREPROCESS_FALLBACK,
                 tier=BindingTier.SEMANTIC,
                 field=f"{side}.preprocess.fallback",
-                message=f"{side} reported a QK-Norm or RoPE backend fallback",
+                message=(
+                    f"{side} reported a fallback but did not use the common deterministic "
+                    "QK-Norm/RoPE backends"
+                ),
             )
         )
+    return issues
+
+
+def _attention_projection_issues(
+    side: str,
+    readback: AttentionRuntimeReadback,
+) -> list[BindingIssue]:
+    issues: list[BindingIssue] = []
+    expected_collectives = {
+        "qkv": QKV_COLLECTIVE_CONTRACT.to_dict(),
+        "o_proj": O_PROJ_COLLECTIVE_CONTRACT.to_dict(),
+    }
+    fixed_fields = {
+        "input_dtype": "torch.bfloat16",
+        "weight_dtype": "torch.bfloat16",
+        "output_dtype": "torch.bfloat16",
+        "accumulation_dtype": "torch.float32",
+        "reduction_order": "k_ascending",
+        "split_k": False,
+        "policy_id": PROJECTION_POLICY_ID,
+    }
+    for projection, expected_collective in expected_collectives.items():
+        plan = readback.projection_plans.get(projection)
+        if plan is None:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PROJECTION_MISSING,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.projection.{projection}",
+                    message=f"{side} did not report the executed {projection} projection plan",
+                )
+            )
+            continue
+        for field, expected in fixed_fields.items():
+            actual = plan.get(field)
+            if actual != expected:
+                issues.append(
+                    BindingIssue(
+                        code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                        tier=BindingTier.SEMANTIC,
+                        field=f"{side}.projection.{projection}.{field}",
+                        rollout=actual if side == "rollout" else None,
+                        training=actual if side == "training" else None,
+                        message=f"{side} {projection} {field} must be {expected!r}",
+                    )
+                )
+        collective = plan.get("collective")
+        if not isinstance(collective, Mapping) or dict(collective) != expected_collective:
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.projection.{projection}.collective",
+                    message=f"{side} {projection} TP/SP collective directions are invalid",
+                )
+            )
+        backend_id = plan.get("backend_id")
+        if not isinstance(backend_id, str) or not backend_id.strip():
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PROJECTION_MISSING,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.projection.{projection}.backend_id",
+                    message=f"{side} {projection} backend identity is missing",
+                )
+            )
+        if not isinstance(plan.get("probe_id"), str) or not plan.get("probe_id"):
+            issues.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PROJECTION_MISSING,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"{side}.projection.{projection}.probe_id",
+                    message=f"{side} {projection} bitwise probe identity is missing",
+                )
+            )
+        if plan.get("fallback"):
+            if backend_id != "rlkernel.cuda.det_gemm" or not plan.get("fallback_reason"):
+                issues.append(
+                    BindingIssue(
+                        code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                        tier=BindingTier.SEMANTIC,
+                        field=f"{side}.projection.{projection}.fallback",
+                        message=(
+                            f"{side} {projection} fallback must execute DetGemmOp and record why"
+                        ),
+                    )
+                )
     return issues
 
 

@@ -49,18 +49,13 @@ Two placements are load-bearing:
 comparable. A pair that is comparable but violates the reduction mandate is still
 rejected -- the drift would be real but attributable to the wrong thing.
 
-## H100 Attention input boundary
+## H100 Attention input and projection boundary
 
-The strict experiment does not use the PyTorch reference operators as an
-executable option. `H100AttentionPreprocessor` applies these implementations in
-the fixed Qwen3 order:
-
-1. `RMSNormCudaOp` on Q and K (`rlkernel.cuda.rmsnorm`)
-2. `RoPESM90Op` with global `[S]` or per-batch `[B, S]` positions
-   (`rlkernel.cuda.rope_sm90`)
-
-There is no Megatron/vLLM-native fallback. The CUDA RoPE path accepts non-contiguous
-global positions, including zigzag CP ownership. The launcher passes the returned
+Megatron/TE and vLLM/FlashInfer are the first-choice implementations.
+`H100AttentionPreprocessor` runs a same-input H100 bitwise probe against the
+deterministic RL-Kernel path. An unavailable native callable, a native exception,
+or a failed probe switches both sides to `RMSNormCudaOp` + `RoPESM90Op` and
+records the fallback reason and probe ID. The launcher passes the returned
 backend evidence into `AttentionRuntimeReadback`:
 
 ```python
@@ -75,15 +70,20 @@ readback = AttentionRuntimeReadback(
 )
 ```
 
-Strict binding rejects a missing backend ID, a runtime-native backend ID, or any
-reported fallback. Printing a configured backend without executing it is not
-accepted as evidence.
+Strict binding rejects a missing or unknown backend and rejects mixed native /
+fallback execution. If both sides fall back, they must report the same deterministic
+backend IDs and policy ID. Printing a configured backend without executing the
+probe is not evidence.
 
-The boundary starts at projected Q/K/V. Pre-attention model RMSNorm, QKV projection
-GEMM, and projection-owned TP/SP All-Gather/Reduce-Scatter are not part of the
-Attention operator experiment. The isolated H100 test must therefore capture or
-reuse identical projected Q/K/V inputs. Those upstream operators must be aligned
-separately before making an end-to-end Megatron-vLLM logprob claim.
+The Attention boundary includes QKV projection, Q/K RMSNorm, RoPE, core
+attention, KV-cache access, CP `(Out, LSE)` communication/merge, and o_proj.
+`AttentionProjectionOp` freezes QKV/o_proj to BF16 input and output, FP32
+accumulation, ascending-K reduction, and Split-K disabled. Native projection
+callables are accepted only after a bitwise probe against `DetGemmOp`; otherwise
+both sides use the deterministic fallback. Its collective contract records QKV
+column-parallel plus backward TP all-reduce, o_proj row-parallel partial output,
+and the SP all-gather/reduce-scatter directions. The model input RMSNorm and
+residual add remain outside this Attention experiment.
 
 ## Determinism is not one thing
 
@@ -144,7 +144,7 @@ collapsing them onto the supported value:
 | configured contract without runtime readback | `UNOBSERVABLE` | requested values do not prove what executed |
 | `rollout.context_parallel_size>1` with effective decode CP=1 | `ERROR`/`FALLBACK` | strict TP=2/CP=2 acceptance rejects the topology change |
 | missing/mismatched/fallback Split-KV plan set | binding failure | Split-KV provenance must cover every batch/TP/CP/owner coordinate |
-| missing/native/fallback QK-Norm or RoPE backend | binding failure | both sides must execute the RL-Kernel CUDA preprocessing path |
+| missing/unknown QK-Norm or RoPE backend, or mixed native/fallback sides | binding failure | both sides must execute the same verified native policy or the common RL-Kernel CUDA fallback |
 
 ## Knobs
 
@@ -178,10 +178,8 @@ retired rather than rewritten.
 Deliberately not in this PR:
 
 * launching `torchrun`, initializing process groups, or executing core attention;
-* pre-attention model RMSNorm, QKV projection GEMM, and projection-owned TP/SP
-  communication; isolated tests reuse identical projected Q/K/V;
+* pre-attention model RMSNorm and residual add;
 * decode-mode materialization, which needs the validated `KVCacheSpec` from #235 PR6
   and is refused with that reference rather than stubbed;
-* Transformer Engine calls of any kind (PR4's TE plan is policy and provenance only);
 * distributed drift benchmarks and report artifacts (#235 PR5);
 * fused production backend alignment (#235 PR7) and backward (#235 PR8).

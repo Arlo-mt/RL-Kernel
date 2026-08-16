@@ -13,6 +13,12 @@ friends) are validated against.
 This op covers **only** the softmax attention. Qwen3's QK-Norm and RoPE are applied *before*
 the call (see the chain), so the `q`, `k` passed in are already normalized and rotated.
 
+For the WS2 Attention experiment, the measured boundary also includes QKV and `o_proj`
+projections plus their TP/SP communication contracts. Those projections use native TE or
+vLLM callables only after an H100 bitwise probe; otherwise both sides use the deterministic
+`DetGemmOp` path with BF16 I/O, FP32 accumulation, ascending-K reduction, and Split-K disabled.
+The model input RMSNorm and residual add remain outside this boundary.
+
 ```text
 q --\
 k ----softmax(QKᵀ/√d + mask)·V--> out
