@@ -270,10 +270,11 @@ def _token_identity(
         if isinstance(token_id, bool) or not isinstance(token_id, int):
             raise RuntimeError(f"{label} token entry {index} has an invalid token_id")
         logprob = entry.get("logprob")
-        try:
-            if not math.isfinite(float(logprob)):
-                raise ValueError
-        except (TypeError, ValueError):
+        if (
+            isinstance(logprob, bool)
+            or not isinstance(logprob, (int, float))
+            or not math.isfinite(logprob)
+        ):
             raise RuntimeError(f"{label} token entry {index} has a non-finite logprob") from None
         positions.append(position)
         token_ids.append(token_id)

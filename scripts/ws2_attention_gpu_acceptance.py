@@ -21,7 +21,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = "ws2_attention_gpu_acceptance/v1"
@@ -206,16 +206,20 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
         ]
         if fixed_size is not None:
             command.extend(("--fixed-split-size", str(fixed_size)))
+
+        def pr7_validator(report: Mapping[str, Any], expected_policy: str = policy) -> list[str]:
+            return validate_pr7_report(
+                report,
+                args,
+                expected_policy=expected_policy,
+            )
+
         cases.append(
             AcceptanceCase(
                 name=f"pr7_flashinfer_{name.replace('-', '_')}",
                 command=tuple(command) if pr7_available else None,
                 report_path=pr7_reports[name],
-                validator=lambda report, policy=policy: validate_pr7_report(
-                    report,
-                    args,
-                    expected_policy=policy,
-                ),
+                validator=pr7_validator,
                 unavailable_reason=pr7_unavailable,
             )
         )
@@ -718,13 +722,17 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
     if seen_ranks != {0, 1}:
         errors.append("P2P report must cover ranks 0 and 1 exactly")
     ordered_query_ranges = [query_ranges_by_rank.get(rank) for rank in range(2)]
-    if (
-        any(bounds is None for bounds in ordered_query_ranges)
-        or ordered_query_ranges[0][0] != 0
-        or ordered_query_ranges[0][1] != ordered_query_ranges[1][0]
-        or ordered_query_ranges[1][1] <= ordered_query_ranges[1][0]
-    ):
+    if any(bounds is None for bounds in ordered_query_ranges):
         errors.append("P2P query ownership ranges are not canonical and contiguous")
+    else:
+        first_range, second_range = ordered_query_ranges
+        assert first_range is not None and second_range is not None
+        if (
+            first_range[0] != 0
+            or first_range[1] != second_range[0]
+            or second_range[1] <= second_range[0]
+        ):
+            errors.append("P2P query ownership ranges are not canonical and contiguous")
     if len(gathered_manifests) == 2 and gathered_manifests[0] != gathered_manifests[1]:
         errors.append("P2P ranks gathered different logical block manifests")
     return errors
@@ -904,7 +912,12 @@ def _validate_runtime_plan_set(
         ):
             errors.append(f"{entry_label} coordinate must contain integers")
             continue
-        coordinate = coordinate_values
+        coordinate: tuple[int, int, int, int] = (
+            cast(int, coordinate_values[0]),
+            cast(int, coordinate_values[1]),
+            cast(int, coordinate_values[2]),
+            cast(int, coordinate_values[3]),
+        )
         coordinates.append(coordinate)
         if coordinate not in expected_coordinates:
             errors.append(f"{entry_label} coordinate is out of range")
