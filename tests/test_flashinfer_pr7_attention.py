@@ -1052,9 +1052,7 @@ def test_cuda_ag_rs_attention_cp_comm_executes_injected_collective(monkeypatch):
         expected_kv_token_range=(0, 4),
         query_token_ranges=((0, 1), (1, 2)),
     )
-    communication = CUDAAGRSAttentionCPCommunication(
-        collective=_FakeDeterministicCollective()
-    )
+    communication = CUDAAGRSAttentionCPCommunication(collective=_FakeDeterministicCollective())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(communication, "_dist", lambda: _FakeCollectiveDist())
 
@@ -1360,9 +1358,10 @@ def test_pr7_check_writes_not_available_report_for_missing_flashinfer(monkeypatc
     monkeypatch.setattr(check_script, "FlashInferQwen3PagedAttentionOp", MissingFlashInfer)
     output = tmp_path / "pr7-not-available.json"
 
-    assert check_script.main(
-        ["--no-dry-run", "--device", "cuda", "--json", "--output", str(output)]
-    ) == 1
+    assert (
+        check_script.main(["--no-dry-run", "--device", "cuda", "--json", "--output", str(output)])
+        == 1
+    )
 
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["status"] == "not_available"

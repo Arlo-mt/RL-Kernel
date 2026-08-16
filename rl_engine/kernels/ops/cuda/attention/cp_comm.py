@@ -421,9 +421,7 @@ class P2PNCCLAttentionCPCommunication:
             raise AttentionCPCommunicationUnavailable(
                 "P2P NCCL query AG currently requires equal query shard lengths"
             )
-        received: dict[int, torch.Tensor] = {
-            plan.parallel.cp_rank: local_q.contiguous()
-        }
+        received: dict[int, torch.Tensor] = {plan.parallel.cp_rank: local_q.contiguous()}
         operations: list[Any] = []
         for peer_cp_rank in range(plan.parallel.cp_world_size):
             if peer_cp_rank == plan.parallel.cp_rank:

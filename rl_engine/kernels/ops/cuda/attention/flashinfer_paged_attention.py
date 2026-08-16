@@ -36,9 +36,9 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPCommunication,
+    AttentionCPCommunicationPlan,
     AttentionCPMergedState,
     AttentionCPPartialState,
-    AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
