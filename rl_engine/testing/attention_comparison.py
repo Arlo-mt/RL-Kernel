@@ -463,6 +463,26 @@ def _run_decode_kv_replay(
             token_counts=tuple(int(length) for length in inputs.metadata.kv_seq_lens.tolist()),
             domain="full_logical_kv_cache",
         ),
+        "kv_cache_identity_fingerprint": _decode_cache_fingerprint(
+            inputs,
+            token_counts=tuple(int(length) for length in inputs.metadata.kv_seq_lens.tolist()),
+            domain="full_logical_kv_cache",
+        ),
+        "rope_identity_fingerprint": decode_rope_identity_fingerprint(inputs),
+        "preprocess_policy": "reference_only_not_production",
+        "preprocess_backends": {
+            "qk_rmsnorm": "not_executed_projected_qk_input",
+            "rope": (
+                "rlkernel.pytorch.rope_reference"
+                if inputs.metadata.q_rope_state == "pre_rope"
+                or inputs.metadata.k_cache_rope_state == "pre_rope"
+                else "external_post_rope_input"
+            ),
+        },
+        "preprocess_fallback": True,
+        "preprocess_fallback_reason": (
+            "decode logical replay is a single-device correctness reference, not native vLLM"
+        ),
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
@@ -720,6 +740,29 @@ def decode_kv_cache_fingerprint(inputs: DecodeAttentionInputs) -> str:
         token_counts=tuple(int(length) for length in inputs.metadata.kv_seq_lens.tolist()),
         domain="full_logical_kv_cache",
     )
+
+
+def decode_rope_identity_fingerprint(inputs: DecodeAttentionInputs) -> str:
+    """Fingerprint every RoPE fact that changes decode Q/K interpretation."""
+
+    _validate_decode_inputs(inputs)
+    digest = hashlib.sha256()
+    digest.update(
+        (
+            f"q_rope_state={inputs.metadata.q_rope_state};"
+            f"k_cache_rope_state={inputs.metadata.k_cache_rope_state};"
+            f"rope_theta={float(inputs.rope_theta):.17g};"
+            f"rotary_dim={_decode_rope_rotary_dim(inputs)};"
+            f"rope_cast_at={inputs.rope_cast_at};"
+            f"q_rope_output_dtype={_decode_q_rope_output_dtype(inputs)};"
+            f"k_rope_output_dtype={_decode_k_rope_output_dtype(inputs)}\n"
+        ).encode()
+    )
+    for tensor in (inputs.metadata.query_position_ids, inputs.metadata.key_position_ids):
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _decode_cache_fingerprint(
@@ -1572,6 +1615,7 @@ __all__ = [
     "compare_single_gpu_attention",
     "compare_decode_kv_replay",
     "decode_kv_cache_fingerprint",
+    "decode_rope_identity_fingerprint",
     "decode_prefix_cache_fingerprint",
     "run_chunked_query_attention",
     "run_fused_like_rope_attention",

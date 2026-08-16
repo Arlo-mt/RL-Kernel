@@ -25,6 +25,7 @@ from rl_engine.testing.attention_comparison import (
     compare_single_gpu_attention,
     compare_single_gpu_rope_attention,
     decode_kv_cache_fingerprint,
+    decode_rope_identity_fingerprint,
     decode_prefix_cache_fingerprint,
     run_decode_kv_replay,
     run_paged_kv_attention,
@@ -269,6 +270,10 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert drift.provenance["supports_backward"] is False
     assert drift.provenance["communication"] == "none"
     assert drift.provenance["cache_execution_fingerprint"] == decode_kv_cache_fingerprint(inputs)
+    assert drift.provenance["kv_cache_identity_fingerprint"] == decode_kv_cache_fingerprint(inputs)
+    assert drift.provenance["rope_identity_fingerprint"] == decode_rope_identity_fingerprint(inputs)
+    assert drift.provenance["preprocess_policy"] == "reference_only_not_production"
+    assert drift.provenance["preprocess_fallback"] is True
     assert drift.provenance["logical_merge_orders"] == [
         [[0, 1, 2], [0, 1, 2]],
         [[0, 1, 2], [0, 1, 2]],
