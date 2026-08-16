@@ -297,6 +297,23 @@ def _run_case(
     row["stdout_tail"] = completed.stdout[-4000:]
     row["stderr_tail"] = completed.stderr[-4000:]
     if completed.returncode != 0:
+        if case.report_path is not None:
+            try:
+                unavailable_report = json.loads(
+                    case.report_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                unavailable_report = None
+            if (
+                isinstance(unavailable_report, dict)
+                and unavailable_report.get("status") == "not_available"
+            ):
+                row.update(status="not_available")
+                row["errors"] = list(
+                    unavailable_report.get("errors") or []
+                ) or [f"command exited with {completed.returncode}"]
+                row["report_summary"] = _report_summary(unavailable_report)
+                return row
         row.update(status="failed")
         row["errors"] = [f"command exited with {completed.returncode}"]
         return row

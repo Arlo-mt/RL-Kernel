@@ -8,6 +8,8 @@ import json
 import subprocess
 
 from scripts.ws2_attention_gpu_acceptance import (
+    AcceptanceCase,
+    _run_case,
     build_acceptance_cases,
     parse_args,
     run_acceptance,
@@ -44,6 +46,35 @@ def test_dlogp_default_uses_shared_bf16_logprob_tolerance(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
 
     assert args.dlogp_atol == 5.0e-2
+
+
+def test_run_mode_preserves_structured_not_available_reports(tmp_path):
+    report_path = tmp_path / "not-available.json"
+    args = parse_args(
+        ["--mode", "run", "--output", str(tmp_path / "acceptance.json")]
+    )
+    case = AcceptanceCase(
+        name="optional",
+        command=("fake",),
+        report_path=report_path,
+    )
+
+    def fake_runner(command, **kwargs):
+        report_path.write_text(
+            json.dumps(
+                {
+                    "status": "not_available",
+                    "errors": ["FlashInfer unavailable: missing wheel"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+
+    row = _run_case(case, args, runner=fake_runner)
+    assert row["status"] == "not_available"
+    assert row["passed"] is False
+    assert row["errors"] == ["FlashInfer unavailable: missing wheel"]
 
 
 def test_run_mode_does_not_pass_when_reports_are_missing(tmp_path):
