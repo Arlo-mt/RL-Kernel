@@ -437,6 +437,7 @@ class _TritonBatchInvariantAttention(torch.autograd.Function):
         causal: bool,
         scale: float,
         return_lse: bool,
+        output_fp32: bool,
     ):
         q = q.contiguous()
         k = k.contiguous()
@@ -459,7 +460,7 @@ class _TritonBatchInvariantAttention(torch.autograd.Function):
         if key_padding_mask is not None and key_padding_mask.shape != (batch, kv_len):
             raise ValueError("key_padding_mask must have shape [batch, key_seq_len]")
 
-        out = torch.empty_like(q)
+        out = torch.empty_like(q, dtype=torch.float32 if output_fp32 else q.dtype)
         lse = torch.empty((batch, q_heads, q_len), device=q.device, dtype=torch.float32)
         block_d = _next_power_of_2(head_dim)
         grid = (q_len, q_heads, batch)
@@ -610,7 +611,7 @@ class _TritonBatchInvariantAttention(torch.autograd.Function):
             stride_dvd=dv.stride(3),
             **common,
         )
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 def _resolve_scale(
@@ -644,6 +645,23 @@ def triton_batch_invariant_attention(
         causal,
         scale_value,
         False,
+        False,
+    )
+
+
+def triton_batch_invariant_attention_fp32(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = True,
+    scale: Optional[float] = None,
+    softmax_scale: Optional[float] = None,
+    key_padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    scale_value = _resolve_scale(q.shape[-1], scale=scale, softmax_scale=softmax_scale)
+    return _TritonBatchInvariantAttention.apply(
+        q, k, v, key_padding_mask, causal, scale_value, False, True
     )
 
 
@@ -666,6 +684,7 @@ def triton_batch_invariant_attention_with_lse(
         causal,
         scale_value,
         True,
+        False,
     )
 
 
@@ -710,6 +729,30 @@ class TritonBatchInvariantAttentionOp:
         if dropout_p != 0.0:
             raise ValueError("batch-invariant attention does not support dropout")
         return triton_batch_invariant_attention(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            softmax_scale=softmax_scale,
+            key_padding_mask=key_padding_mask,
+        )
+
+    def forward_fp32(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        if dropout_p != 0.0:
+            raise ValueError("batch-invariant attention does not support dropout")
+        return triton_batch_invariant_attention_fp32(
             q,
             k,
             v,

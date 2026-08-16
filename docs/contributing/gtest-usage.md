@@ -201,12 +201,18 @@ applied to both PyTorch and CUDA and recorded separately from `workload_seed`.
 The weight loader verifies the pinned index SHA-256, every shard size/SHA-256,
 and the aggregate content hash before allocating the 8B model.
 
-The C10 backward result is intentionally a representative subset
-(`norm.weight`, `lm_head.weight`, and
-`layers.0.input_layernorm.weight`), recorded as
-`gradient_scope=representative_parameter_subset` with
-`all_parameter_gradients=false`. It is not an all-parameter 8B training or
-bitwise-gradient claim.
+C10 compares `tensor.grad` after a real training-style backward over every
+official Qwen3-8B Dense trainable leaf
+(`gradient_scope=all_required_trainable_parameters`,
+`all_parameter_gradients=true`). Logprob accuracy vs FP32 gold uses only
+`max_abs_dlogp` / `approx_kl0` / `clipfrac0`. The JSON also records GPU name,
+representative `case_id`s, workflow URL, C8 evidence path, and backward
+runtime kernel identities.
+
+To keep the full-model gate within Hopper device memory, leaf-gradient snapshots
+are transferred to CPU without FP32 expansion and released after comparison. The
+The chain GPU job writes C8 outside the checkout; the artifact validator requires clean C8 evidence from the exact C10 commit and
+explicit packed-versus-FP32 forward and gradient accuracy rows.
 
 ---
 

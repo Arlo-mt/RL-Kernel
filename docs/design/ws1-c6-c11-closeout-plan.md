@@ -26,10 +26,10 @@ schema/topology tests stay in ordinary CI.
 - EXIT forbids shrinking layers / hidden / heads / vocab.
 - Concat-only `NativeKVCacheAttnOp` is Level A, **not** C7 B1.
 - C9 green ≠ EXIT. C10 + C11 + parent A/B are required to close #266.
-- C10 `backward_executed` is a representative-gradient gate. It checks
-  `norm.weight`, `lm_head.weight`, and
-  `layers.0.input_layernorm.weight` across cells; it does not claim
-  all-parameter 8B gradient equality.
+- C10 `backward_executed` compares real `tensor.grad` for every official
+  trainable leaf. Layout cells participate. Candidate vs FP32 gold uses
+  the three logprob aggregates. Full-model decode covers C6 short/long/
+  varlen/padding/B=1/N.
 
 ## Local vs H20
 

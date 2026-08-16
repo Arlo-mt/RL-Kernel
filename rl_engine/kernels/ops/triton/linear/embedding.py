@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
+
 
 @triton.jit
 def _embedding_fwd(ids, weight, out, n_tokens, hidden: tl.constexpr, block_h: tl.constexpr):
@@ -78,6 +80,12 @@ class _TritonEmbeddingFunction(torch.autograd.Function):
             n_tokens=ids.numel(),
             hidden=hidden,
             block_t=64,
+        )
+        record_backward(
+            "embedding",
+            kernel_id="rl_engine.kernels.ops.triton.linear.embedding._embedding_bwd",
+            impl="triton_embedding_bwd",
+            family="triton",
         )
         return None, grad_weight
 

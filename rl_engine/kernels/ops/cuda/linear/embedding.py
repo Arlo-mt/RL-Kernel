@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
@@ -91,6 +92,12 @@ class _SM90EmbeddingFunction(torch.autograd.Function):
                 weight_shape=ctx.weight_shape,
                 weight_dtype=ctx.weight_dtype,
             )
+        record_backward(
+            "embedding",
+            kernel_id="rl_engine.kernels.ops.cuda.linear.embedding._deterministic_embedding_grad_weight",
+            impl="cuda_sorted_segment_dweight",
+            family="cuda",
+        )
         return None, grad_weight, None
 
 

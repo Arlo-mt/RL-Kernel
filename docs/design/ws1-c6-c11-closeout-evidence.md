@@ -63,19 +63,28 @@ Bind the two C10 JSON files + `git rev-parse HEAD` + GPU/CC on the parent
 issue before closing #266.
 
 Each accepted JSON must report `backward_executed=true`,
-`train_infer_executed=true`, a null `first_drift`, verified weight content hash,
-complete runtime observations for all nine required node kinds, and
-`git_dirty=false`. Generate the JSON only after committing the gate code; the
-CI wrapper rejects dirty-worktree evidence.
+`train_infer_executed=true`, `accuracy_executed=true`,
+`gradient_accuracy_executed=true`, a null `first_drift`, verified weight
+content hash, complete runtime observations for all nine required node kinds,
+backward runtime kernel identities for `lm_head` / `rms_norm` / `det_gemm` /
+`embedding`, `gpu_name`, representative `case_id`s, C8 evidence path, and
+`git_dirty=false`. Schema is `ws1-c10-c11-v5`. Generate the JSON only after
+committing the gate code; the CI wrapper rejects dirty-worktree evidence.
 
-The C10 backward contract is deliberately scoped to a representative subset,
-not an all-parameter 8B training backward. The JSON must say
-`gradient_scope=representative_parameter_subset`,
-`all_parameter_gradients=false`, and list exactly these three required leaf
-gradients: `norm.weight`, `lm_head.weight`, and
-`layers.0.input_layernorm.weight`. This proves training-style backward and
-cross-cell gradient invariance for the gate's contract; it must not be cited
-as bitwise equality of every model parameter's gradient.
+C10 compares `tensor.grad` after a real `loss.backward()` for every official
+Qwen3-8B Dense trainable leaf (`gradient_scope=all_required_trainable_parameters`,
+`all_parameter_gradients=true`): embedding, final norm, LM head, and all 36
+layers of Q/K/V/O, QK-norm, RMSNorm, and MLP weights. Logprob accuracy vs the
+FP32 gold cell is judged only by `max_abs_dlogp` / `approx_kl0` /
+`clipfrac0`. Full-model decode/prefill covers short, long, varlen, left/right
+padding, and B=1/N. Backward runtime records the kernel that actually ran
+(`det_gemm` / RMSNorm / embedding), not a class-attribute string.
+
+Gradient snapshots are copied to CPU in their native dtype rather than retained as
+FP32 CUDA tensors, and their payloads are released after comparisons while report
+keys remain. The chain GPU job generates C8 outside the repository, then C11 loads `c8_evidence_path` and requires its commit to equal
+C10 `git_sha` with both worktrees clean. Packed forward and gradient accuracy must
+appear explicitly as `BN/packed` versus `fp32_reference`.
 
 ## Not claimed
 

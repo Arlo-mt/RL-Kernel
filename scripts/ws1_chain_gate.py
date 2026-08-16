@@ -20,7 +20,11 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rl_engine.kernels.gtest.chain_gate import build_model, run_chain_gate  # noqa: E402
+from rl_engine.kernels.gtest.chain_gate import (  # noqa: E402
+    build_model,
+    run_chain_gate,
+    run_fp32_reference_cell,
+)
 from rl_engine.kernels.gtest.tolerance import load_contract  # noqa: E402
 from rl_engine.testing.ws1_workload import load_manifest  # noqa: E402
 
@@ -92,12 +96,21 @@ def main() -> int:
     contract = load_contract()
     execution_seed = manifest.seed if args.seed is None else int(args.seed)
     log_stream = sys.stderr if args.json else sys.stdout
+    device = torch.device("cuda")
     with contextlib.redirect_stdout(log_stream):
+        reference_cell = run_fp32_reference_cell(
+            backend_profile=args.backend_profile,
+            weights_mode="hf",
+            weights_path=args.weights_path,
+            device=device,
+            manifest=manifest,
+            run_backward=True,
+        )
         model = build_model(
             backend_profile=args.backend_profile,
             weights_mode="hf",
             weights_path=args.weights_path,
-            device=torch.device("cuda"),
+            device=device,
             dtype=torch.bfloat16,
             manifest=manifest,
         )
@@ -109,11 +122,12 @@ def main() -> int:
             run_backward=True,
             run_train_infer=True,
             execution_seed=execution_seed,
+            reference_cell=reference_cell,
         )
     payload = report.to_dict()
     payload.update(
         {
-            "schema_version": "ws1-c10-c11-v2",
+            "schema_version": "ws1-c10-c11-v5",
             "git_sha": _git_sha(),
             "git_dirty": _git_dirty(),
             "contract_sha256": _file_sha(
@@ -149,6 +163,17 @@ def main() -> int:
             print(f"  aggregates passed={report.aggregates.passed}")
         if report.train_infer is not None:
             print(f"  train_infer passed={report.train_infer.passed}")
+        if report.train_infer_bn is not None:
+            print(f"  train_infer_bn passed={report.train_infer_bn.passed}")
+        for case_id, verdict in report.decode_prefill:
+            print(f"  decode_prefill {case_id} passed={verdict.passed}")
+        for item in report.accuracy_aggregates:
+            print(f"  acc_agg kind={item.report_kind} passed={item.passed}")
+        for item in report.accuracy:
+            print(
+                f"  acc {item.config_pair} max_abs={item.max_abs_error:.8e} "
+                f"passed={item.passed}"
+            )
         print(report.disclaimer)
     return 0 if report.passed else 1
 

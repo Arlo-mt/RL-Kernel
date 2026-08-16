@@ -182,6 +182,10 @@ def test_sm90_lm_head_bf16_backward_uses_fp32_reference_vjp(monkeypatch):
                 out = out + bias.float()
             return out.float()
 
+        @staticmethod
+        def det_gemm_fwd(a, b):
+            return a.float().matmul(b.float()).to(a.dtype)
+
     monkeypatch.setattr(lm_head_module, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(lm_head_module, "_C", FakeExtension)
     monkeypatch.setattr(
@@ -200,12 +204,15 @@ def test_sm90_lm_head_bf16_backward_uses_fp32_reference_vjp(monkeypatch):
 
     flat_hidden = hidden.detach().reshape(-1, hidden.size(-1))
     flat_dy = dy.reshape(-1, weight.size(0))
-    expected_hidden = flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16)
+    expected_hidden = (
+        flat_dy.float().matmul(weight.detach().float()).to(torch.bfloat16).reshape_as(hidden)
+    )
     expected_weight = flat_dy.float().t().matmul(flat_hidden.float()).to(torch.bfloat16)
+    expected_bias = flat_dy.float().sum(0).to(torch.bfloat16)
 
     assert torch.equal(hidden.grad, expected_hidden.reshape_as(hidden))
     assert torch.equal(weight.grad, expected_weight)
-    assert torch.equal(bias.grad, flat_dy.float().sum(0).to(torch.bfloat16))
+    assert torch.equal(bias.grad, expected_bias)
 
 
 @requires_sm90_linear

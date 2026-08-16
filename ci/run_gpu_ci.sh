@@ -118,6 +118,10 @@ echo "[ci] Target Establish -> root@$SSH_IP:$SSH_PORT"
 
 SSH_OPTIONS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $SSH_PORT"
 
+WS1_WORKFLOW_URL_VALUE="${WS1_WORKFLOW_URL:-}"
+if [ -z "$WS1_WORKFLOW_URL_VALUE" ] && [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
+  WS1_WORKFLOW_URL_VALUE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+fi
 TEST_SUITE="${TEST_SUITE:-full}"
 if [ "$TEST_SUITE" = "ws1-gtest" ]; then
   TEST_CMD='bash ci/run_ws1_gtest.sh'
@@ -139,6 +143,7 @@ if ! "$PY" -c "import torch" >/dev/null 2>&1; then
   done
 fi
 echo "[remote] Using interpreter: $PY"
+export WS1_WORKFLOW_URL="'"${WS1_WORKFLOW_URL_VALUE}"'"
 export FORCE_CUDA=1
 export MAX_JOBS=8
 export KERNEL_ALIGN_FORCE_SM90="'"${KERNEL_ALIGN_FORCE_SM90}"'"
@@ -231,10 +236,12 @@ if [ "$TEST_SUITE" = "ws1-chain" ]; then
     echo "[ci] Remote WS1 chain gate failed with exit code = $TEST_EXIT"
     exit "$TEST_EXIT"
   fi
-  echo "[ci] Fetching C10/C11 artifacts from the pod"
+  echo "[ci] Fetching C8/C10/C11 artifacts from the pod"
   mkdir -p artifacts
+  scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c8-ci.json artifacts/ws1-c8-ci.json
   scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c10-cuda_bf16.json artifacts/ws1-c10-cuda_bf16.json
   scp $SSH_OPTIONS root@"$SSH_IP":/tmp/ws1-c10-triton_cuda_bf16.json artifacts/ws1-c10-triton_cuda_bf16.json
+  test -s artifacts/ws1-c8-ci.json
   test -s artifacts/ws1-c10-cuda_bf16.json
   test -s artifacts/ws1-c10-triton_cuda_bf16.json
 fi

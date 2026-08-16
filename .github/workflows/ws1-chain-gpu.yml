@@ -70,10 +70,12 @@ jobs:
           WS1_WEIGHTS_PATH: ""
         run: bash ci/run_gpu_ci.sh
 
-      - name: Upload C10/C11 JSON
+      - name: Upload C8/C10/C11 JSON
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ws1-c10-${{ matrix.name }}
-          path: artifacts/ws1-c10-*.json
+          name: ws1-closeout-${{ matrix.name }}
+          path: |
+            artifacts/ws1-c8-ci.json
+            artifacts/ws1-c10-*.json
           if-no-files-found: error

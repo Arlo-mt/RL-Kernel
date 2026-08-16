@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
@@ -43,22 +44,37 @@ class _SM90LMHeadFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         hidden, weight, bias = ctx.saved_tensors
+        if not _EXT_AVAILABLE or not hasattr(_C, "det_gemm_fwd"):
+            raise RuntimeError(
+                "SM90 LM-head backward requires _C.det_gemm_fwd; "
+                "torch.matmul / cuBLAS fallback is forbidden"
+            )
+        grad_2d = grad_output.reshape(-1, weight.size(0)).contiguous()
+        hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
+        weight_c = weight.contiguous()
+        if grad_2d.dtype != torch.bfloat16:
+            grad_2d = grad_2d.to(torch.bfloat16)
+        if hidden_2d.dtype != torch.bfloat16:
+            hidden_2d = hidden_2d.to(torch.bfloat16)
+        if weight_c.dtype != torch.bfloat16:
+            weight_c = weight_c.to(torch.bfloat16)
         grad_hidden = grad_weight = grad_bias = None
-
-        hidden_2d = hidden.reshape(-1, hidden.size(-1))
-        grad_2d = grad_output.reshape(-1, weight.size(0)).float()
-        hidden_f = hidden_2d.float()
-        weight_f = weight.float()
-
         if ctx.needs_input_grad[0]:
-            # C1 accumulation is FP32. A bf16 GEMM over vocab=151936 misses
-            # the gradient_accuracy contract against the FP32 reference VJP.
-            grad_hidden = grad_2d.matmul(weight_f).reshape_as(hidden).to(hidden.dtype)
+            grad_hidden = _C.det_gemm_fwd(grad_2d, weight_c).reshape_as(hidden).to(hidden.dtype)
         if ctx.needs_input_grad[1]:
-            grad_weight = grad_2d.transpose(0, 1).matmul(hidden_f).contiguous().to(weight.dtype)
+            grad_weight = _C.det_gemm_fwd(grad_2d.t().contiguous(), hidden_2d).to(weight.dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
-            grad_bias = grad_2d.sum(0).to(bias.dtype)
-
+            rows = grad_output.reshape(-1, weight.size(0)).float()
+            acc = torch.zeros((rows.shape[1],), device=rows.device, dtype=torch.float32)
+            for index in range(rows.shape[0]):
+                acc = acc + rows[index]
+            grad_bias = acc.to(bias.dtype)
+        record_backward(
+            "lm_head",
+            kernel_id="rl_engine._C.det_gemm_fwd",
+            impl="cuda_det_gemm",
+            family="cuda",
+        )
         return grad_hidden, grad_weight, grad_bias, None
 
 
@@ -68,10 +84,12 @@ class SM90LMHeadOp:
     The CUDA forward launches one CTA per output logit and performs the full K
     reduction in that CTA. There is no Split-K and no cuBLAS algorithm selection
     in the forward path, so a row's logits do not depend on batch layout.
+    Backward uses the declared CUDA deterministic GEMM (no torch.matmul).
     """
 
     op_class = "reduction"
     is_batch_invariant = True
+    backward_impl = "cuda_det_gemm"
 
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "lm_head_sm90_forward"):

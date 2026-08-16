@@ -20,6 +20,10 @@ import torch
 
 from rl_engine.kernels.gtest.gradient_adapters import resolve_profile_candidate
 from rl_engine.kernels.gtest.operator_specs import OP_SPECS, _load_object
+from rl_engine.kernels.ops.canonical_backward import active_session
+from rl_engine.kernels.ops.canonical_linear import canonical_linear_fp32
+from rl_engine.kernels.ops.canonical_lm_head import canonical_cuda_lm_head_fp32
+from rl_engine.kernels.ops.canonical_rmsnorm import canonical_cuda_rmsnorm
 from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
 from rl_engine.testing.ws1_workload import (
     WS1Manifest,
@@ -55,6 +59,14 @@ NODE_KINDS = (
     "swiglu",
     "lm_head",
     "logprob",
+)
+_VJP_NODES = frozenset(
+    {
+        "final_layernorm",
+        "layers.0.input_layernorm",
+        "layers.0.q_proj",
+        "lm_head",
+    }
 )
 
 
@@ -243,6 +255,7 @@ class ProfileOps:
             "output_device": str(output.device),
             "output_dtype": str(output.dtype).removeprefix("torch."),
             "fallback_observed": False,
+            "backward_impl": str(getattr(op, "backward_impl", "autograd")),
         }
 
     def validated_runtime_observations(self) -> dict[str, dict[str, Any]]:
@@ -554,6 +567,10 @@ class Qwen3DenseBIModel:
         self.execution_dtype = execution_dtype
         self._last_node_outputs: dict[str, torch.Tensor] = {}
         self._capture_nodes = False
+        self._vjp_enabled = False
+        self._vjp_inputs: dict[str, list[dict[str, Any]]] = {}
+        self._vjp_grads: dict[str, dict[int, torch.Tensor]] = {}
+        self._vjp_hooks: list[Any] = []
         torch.backends.cuda.matmul.allow_tf32 = False
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.allow_tf32 = False
@@ -587,6 +604,7 @@ class Qwen3DenseBIModel:
         kv_cache: StatefulKVCache | None = None,
         capture_nodes: bool = False,
         segment_lengths: Sequence[int] | None = None,
+        logical_keys: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Teacher-forcing prefill (or one decode step when ``input_ids`` is length 1)."""
 
@@ -596,6 +614,13 @@ class Qwen3DenseBIModel:
             raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
         batch, seq = input_ids.shape
         device = input_ids.device
+        if logical_keys is not None:
+            if logical_keys.shape[:2] != (batch, seq) or logical_keys.shape[-1] != 2:
+                raise ValueError("logical_keys must have shape [B, S, 2]")
+            logical_keys = logical_keys.to(device=device, dtype=torch.long)
+        if active_session() is not None and logical_keys is None:
+            raise RuntimeError("active canonical backward requires logical_keys")
+        self._current_logical_keys = logical_keys
         if position_ids is None:
             position_ids = torch.arange(seq, device=device).unsqueeze(0).expand(batch, seq)
         if attention_mask is None:
@@ -609,6 +634,7 @@ class Qwen3DenseBIModel:
                 raise ValueError(f"segment_lengths sum {sum(segment_lengths)} != seq {seq}")
 
         hidden = self._embed(input_ids)
+        hidden = hidden.float()
         for layer in range(self.spec.num_hidden_layers):
             hidden = self._decoder_layer(
                 hidden,
@@ -618,24 +644,47 @@ class Qwen3DenseBIModel:
                 kv_cache=kv_cache,
                 segment_lengths=segment_lengths,
             )
-        hidden = self._rms(hidden, self.weights["norm.weight"], node="final_layernorm")
+        hidden = self._rms(
+            hidden.to(dtype=self.execution_dtype),
+            self.weights["norm.weight"],
+            node="final_layernorm",
+        )
         lm_head_op = self.profile_ops.get("lm_head")
-        logits = lm_head_op.forward(hidden, self.weights["lm_head.weight"], bias=None)
+        keys = getattr(self, "_current_logical_keys", None)
+        lm_family = self.profile_ops.provenance["lm_head"]["actual_backend"]
+        if active_session() is not None and keys is not None and lm_family.startswith("cuda"):
+            score_logits = canonical_cuda_lm_head_fp32(
+                hidden,
+                self.weights["lm_head.weight"],
+                keys.reshape(-1, 2),
+            )
+        else:
+            score_logits = lm_head_op.forward_fp32(
+                hidden, self.weights["lm_head.weight"], bias=None
+            )
+        logits = score_logits.to(dtype=self.execution_dtype)
         self.profile_ops.observe("lm_head", logits)
+        self._maybe_save_vjp(
+            "lm_head",
+            {"hidden": hidden.detach(), "weight": self.weights["lm_head.weight"].detach()},
+            score_logits,
+        )
         logits = self._record("lm_head", logits)
-        result: dict[str, torch.Tensor] = {"logits": logits, "hidden": hidden}
+        result: dict[str, torch.Tensor] = {
+            "logits": logits, "score_logits": score_logits, "hidden": hidden
+        }
         if target_ids is not None:
-            score_logits = logits
+            loss_logits = score_logits
             score_targets = target_ids
             score_mask = loss_mask
             if target_ids.shape == input_ids.shape:
                 if input_ids.shape[1] < 2:
                     raise ValueError("causal selected-logprob requires sequence length >= 2")
-                score_logits = logits[:, :-1]
+                loss_logits = score_logits[:, :-1]
                 score_targets = target_ids[:, 1:]
                 score_mask = None if loss_mask is None else loss_mask[:, 1:]
             logp = self._record(
-                "logprob", self._selected_logp(score_logits, score_targets)
+                "logprob", self._selected_logp(loss_logits, score_targets)
             )
             result["selected_logp"] = logp
             if score_mask is not None:
@@ -674,7 +723,7 @@ class Qwen3DenseBIModel:
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
-        logits = outputs["logits"][:, :-1, :]
+        logits = outputs.get("score_logits", outputs["logits"])[:, :-1, :]
         targets = input_ids[:, 1:]
         logp = self._selected_logp(logits, targets)
         if loss_mask is None:
@@ -683,6 +732,26 @@ class Qwen3DenseBIModel:
 
     def captured_node_outputs(self) -> dict[str, torch.Tensor]:
         return dict(self._last_node_outputs)
+
+    def begin_vjp_capture(self) -> None:
+        self.end_vjp_capture()
+        self._vjp_enabled = True
+        self._vjp_inputs = {}
+        self._vjp_grads = {}
+
+    def end_vjp_capture(self) -> None:
+        for hook in self._vjp_hooks:
+            hook.remove()
+        self._vjp_hooks = []
+        self._vjp_enabled = False
+
+    def take_vjp_captures(
+        self,
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[int, torch.Tensor]]]:
+        inputs = {key: list(value) for key, value in self._vjp_inputs.items()}
+        grads = {key: dict(value) for key, value in self._vjp_grads.items()}
+        self.end_vjp_capture()
+        return inputs, grads
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         op = self.profile_ops.get("embedding")
@@ -702,7 +771,7 @@ class Qwen3DenseBIModel:
     ) -> torch.Tensor:
         prefix = f"layers.{layer}"
         normed = self._rms(
-            hidden,
+            hidden.to(dtype=self.execution_dtype),
             self.weights[f"{prefix}.input_layernorm.weight"],
             node=f"{prefix}.input_layernorm",
         )
@@ -747,6 +816,7 @@ class Qwen3DenseBIModel:
             key_mask,
             node=f"{prefix}.attn",
             segment_lengths=segment_lengths,
+            output_fp32=self.execution_dtype == torch.bfloat16,
         )
         attn_merged = (
             attn.transpose(1, 2)
@@ -758,9 +828,9 @@ class Qwen3DenseBIModel:
             self.weights[f"{prefix}.self_attn.o_proj.weight"],
             node=f"{prefix}.o_proj",
         )
-        hidden = self._record(f"{prefix}.residual_attn", hidden + projected)
+        hidden = self._record(f"{prefix}.residual_attn", hidden + projected.to(dtype=hidden.dtype))
         mlp_in = self._rms(
-            hidden,
+            hidden.to(dtype=self.execution_dtype),
             self.weights[f"{prefix}.post_attention_layernorm.weight"],
             node=f"{prefix}.post_attention_layernorm",
         )
@@ -768,35 +838,92 @@ class Qwen3DenseBIModel:
             mlp_in,
             self.weights[f"{prefix}.mlp.gate_proj.weight"],
             node=f"{prefix}.gate_proj",
+            internal_fp32=True,
         )
         up = self._linear(
             mlp_in,
             self.weights[f"{prefix}.mlp.up_proj.weight"],
             node=f"{prefix}.up_proj",
+            internal_fp32=True,
         )
         swiglu_op = self.profile_ops.get("swiglu")
-        swiglu = swiglu_op.forward(gate, up)
-        self.profile_ops.observe("swiglu", swiglu)
-        swiglu = self._record(f"{prefix}.swiglu", swiglu)
+        if self.execution_dtype == torch.bfloat16:
+            swiglu = swiglu_op.forward_fp32(gate, up)
+            swiglu_public = swiglu.to(dtype=self.execution_dtype)
+        else:
+            swiglu = swiglu_op.forward(gate, up)
+            swiglu_public = swiglu
+        self.profile_ops.observe("swiglu", swiglu_public)
+        self._record(f"{prefix}.swiglu", swiglu_public)
         down = self._linear(
             swiglu,
             self.weights[f"{prefix}.mlp.down_proj.weight"],
             node=f"{prefix}.down_proj",
         )
-        return self._record(f"{prefix}.residual_mlp", hidden + down)
+        return self._record(f"{prefix}.residual_mlp", hidden + down.to(dtype=hidden.dtype))
 
-    def _linear(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
+    def _linear(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        node: str,
+        internal_fp32: bool = False,
+    ) -> torch.Tensor:
         flat = x.reshape(-1, x.shape[-1])
-        # HF Linear is x @ W.T with W stored [out, in]. det_gemm is a @ b.
+        # The BF16 candidate uses a fixed rowwise FP32 reduction for every
+        # projection. Public node values remain BF16; selected composite
+        # edges may retain the FP32 accumulator internally.
         op = self.profile_ops.get("det_gemm")
-        out = op(flat, weight.t().contiguous())
-        self.profile_ops.observe("det_gemm", out)
-        return self._record(node, out.reshape(*x.shape[:-1], weight.shape[0]))
+        if self.execution_dtype == torch.bfloat16:
+            keys = getattr(self, "_current_logical_keys", None)
+            if active_session() is not None and keys is not None:
+                family = self.profile_ops.provenance["det_gemm"]["actual_backend"]
+                out = canonical_linear_fp32(
+                    flat,
+                    weight.t().contiguous(),
+                    keys.reshape(-1, 2),
+                    parameter_id=node,
+                    family=family,
+                )
+            else:
+                out = op.forward_accum_fp32(flat, weight.t().contiguous())
+            shaped = out.reshape(*x.shape[:-1], weight.shape[0])
+            public = shaped.to(dtype=self.execution_dtype)
+        else:
+            out = op(flat, weight.t().contiguous())
+            shaped = out.reshape(*x.shape[:-1], weight.shape[0])
+            public = shaped
+        self.profile_ops.observe("det_gemm", public)
+        self._maybe_save_vjp(node, {"x": x.detach(), "weight": weight.detach()}, shaped)
+        self._record(node, public)
+        return shaped if internal_fp32 and self.execution_dtype == torch.bfloat16 else public
 
     def _rms(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
         op = self.profile_ops.get("rms_norm")
-        out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
+        keys = getattr(self, "_current_logical_keys", None)
+        family = self.profile_ops.provenance["rms_norm"]["actual_backend"]
+        if active_session() is not None and keys is not None and family == "cuda":
+            hidden = x.shape[-1]
+            out = canonical_cuda_rmsnorm(
+                x.contiguous().view(-1, hidden),
+                weight.contiguous(),
+                eps=self.spec.rms_norm_eps,
+                logical_keys=keys.reshape(-1, 2),
+                parameter_id=node,
+            ).view_as(x)
+        else:
+            out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
         self.profile_ops.observe("rms_norm", out)
+        self._maybe_save_vjp(
+            node,
+            {
+                "x": x.detach(),
+                "weight": weight.detach(),
+                "eps": float(self.spec.rms_norm_eps),
+            },
+            out,
+        )
         return self._record(node, out)
 
     def _qk_norm(self, x: torch.Tensor, weight: torch.Tensor, *, node: str) -> torch.Tensor:
@@ -804,7 +931,23 @@ class Qwen3DenseBIModel:
         batch, heads, seq, dim = x.shape
         flat = x.permute(0, 2, 1, 3).reshape(batch, seq * heads, dim)
         op = self.profile_ops.get("qk_norm")
-        out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)
+        keys = getattr(self, "_current_logical_keys", None)
+        family = self.profile_ops.provenance["qk_norm"]["actual_backend"]
+        if active_session() is not None and keys is not None and family == "cuda":
+            head_keys = (
+                keys[:, :, None, :]
+                .expand(batch, seq, heads, 2)
+                .reshape(-1, 2)
+            )
+            out = canonical_cuda_rmsnorm(
+                flat.contiguous().view(-1, dim),
+                weight.contiguous(),
+                eps=self.spec.rms_norm_eps,
+                logical_keys=head_keys,
+                parameter_id=node,
+            ).view_as(flat)
+        else:
+            out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)
         self.profile_ops.observe("qk_norm", out)
         return self._record(
             node, out.reshape(batch, seq, heads, dim).permute(0, 2, 1, 3).contiguous()
@@ -825,8 +968,10 @@ class Qwen3DenseBIModel:
         *,
         node: str,
         segment_lengths: Sequence[int] | None = None,
+        output_fp32: bool = False,
     ) -> torch.Tensor:
         op = self.profile_ops.get("attention")
+        forward = op.forward_fp32 if output_fp32 else op.forward
         if segment_lengths:
             pieces: list[torch.Tensor] = []
             start = 0
@@ -834,7 +979,7 @@ class Qwen3DenseBIModel:
                 end = start + int(length)
                 mask_s = key_mask[:, start:end] if key_mask is not None else None
                 pieces.append(
-                    op.forward(
+                    forward(
                         q[:, :, start:end, :],
                         k[:, :, start:end, :],
                         v[:, :, start:end, :],
@@ -845,9 +990,11 @@ class Qwen3DenseBIModel:
                 start = end
             out = torch.cat(pieces, dim=2)
         else:
-            out = op.forward(q, k, v, causal=True, key_padding_mask=key_mask)
-        self.profile_ops.observe("attention", out)
-        return self._record(node, out)
+            out = forward(q, k, v, causal=True, key_padding_mask=key_mask)
+        public = out.to(dtype=self.execution_dtype) if output_fp32 else out
+        self.profile_ops.observe("attention", public)
+        self._record(node, public)
+        return out if output_fp32 else public
 
     def _selected_logp(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         op = self.profile_ops.get("logprob")
@@ -900,6 +1047,24 @@ class Qwen3DenseBIModel:
         if self._capture_nodes:
             self._last_node_outputs[name] = value.detach()
         return value
+
+    def _maybe_save_vjp(
+        self,
+        node: str,
+        inputs: dict[str, Any],
+        output: torch.Tensor,
+    ) -> None:
+        if not self._vjp_enabled or node not in _VJP_NODES:
+            return
+        index = len(self._vjp_inputs.setdefault(node, []))
+        self._vjp_inputs[node].append(inputs)
+        if not output.requires_grad:
+            return
+
+        def _hook(grad: torch.Tensor, captured_node: str = node, slot: int = index) -> None:
+            self._vjp_grads.setdefault(captured_node, {})[slot] = grad.detach()
+
+        self._vjp_hooks.append(output.register_hook(_hook))
 
 
 def iter_parameter_tensors(

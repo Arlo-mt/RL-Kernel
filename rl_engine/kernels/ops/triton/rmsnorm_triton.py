@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
+from rl_engine.kernels.ops.vjp_fp32 import reduce_rows_fp32
+
 
 @triton.jit
 def _rmsnorm_fwd_kernel(
@@ -45,19 +48,6 @@ def _rmsnorm_bwd_dx_kernel(
     tl.store(PARTIAL_DW + row * H + offs, pdw, mask=mask)
 
 
-@triton.jit
-def _rmsnorm_bwd_dw_kernel(PARTIAL_DW, DW, T: tl.constexpr, H: tl.constexpr, BLOCK_T: tl.constexpr):
-    col = tl.program_id(0)
-    offs_t = tl.arange(0, BLOCK_T)
-    acc = tl.zeros((), dtype=tl.float32)
-    for start_t in tl.range(0, T, BLOCK_T):
-        rows = start_t + offs_t
-        mask = rows < T
-        vals = tl.load(PARTIAL_DW + rows * H + col, mask=mask, other=0.0).to(tl.float32)
-        acc += tl.sum(vals, axis=0)
-    tl.store(DW + col, acc)
-
-
 class RMSNormTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps: float = 1e-6):
@@ -83,15 +73,22 @@ class RMSNormTriton(torch.autograd.Function):
         T, H = x.shape
         dx = torch.empty_like(x)
         partial_dw = torch.empty((T, H), device=x.device, dtype=torch.float32)
-        dw = torch.empty((H,), device=x.device, dtype=torch.float32)
 
         block_h = triton.next_power_of_2(H)
-        block_t = 256
 
         _rmsnorm_bwd_dx_kernel[(T,)](
             grad_out, x, weight, rstd, dx, partial_dw, T, H, BLOCK_H=block_h
         )
-        _rmsnorm_bwd_dw_kernel[(H,)](partial_dw, dw, T, H, BLOCK_T=block_t)
+        dw = reduce_rows_fp32(partial_dw)
+        record_backward(
+            "rms_norm",
+            kernel_id=(
+                "rl_engine.kernels.ops.triton.rmsnorm_triton._rmsnorm_bwd_dx_kernel"
+                "+rl_engine.kernels.ops.vjp_fp32.reduce_rows_fp32"
+            ),
+            impl="triton_rmsnorm_dx_declared_fp32_rowfold_dw",
+            family="triton",
+        )
         return dx, dw.to(weight.dtype), None
 
 
@@ -101,6 +98,8 @@ def rmsnorm_triton(x, weight, eps: float = 1e-6):
 
 class RMSNormTritonOp:
     """Triton RMSNorm wrapper compatible with the shared operator harness."""
+
+    backward_impl = "triton_rmsnorm_dx_declared_fp32_rowfold_dw"
 
     def __call__(self, x, weight, *, eps: float = 1e-6):
         return self.forward(x, weight, eps=eps)
