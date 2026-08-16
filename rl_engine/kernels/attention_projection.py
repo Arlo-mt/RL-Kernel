@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -91,7 +91,7 @@ class ProjectionPlan:
     reduction_order: str = "k_ascending"
     split_k: bool = False
     policy_id: str = PROJECTION_POLICY_ID
-    collective: Mapping[str, str] = MappingProxyType({})
+    collective: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.projection not in {QKV_PROJECTION, O_PROJ_PROJECTION}:
