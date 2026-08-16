@@ -51,6 +51,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--torchrun", default="torchrun")
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--head-sha", default=os.environ.get("GITHUB_SHA"))
+    parser.add_argument(
+        "--megatron-te-script",
+        type=Path,
+        help="Megatron Bridge teacher script used for the native TE CP comparison",
+    )
+    parser.add_argument("--megatron-model", type=Path)
+    parser.add_argument("--megatron-token-artifact", type=Path)
+    parser.add_argument("--megatron-python", default=sys.executable)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument(
         "--collective-world-size",
@@ -91,6 +99,22 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     collective_unavailable = (
         None if collective_available else "self-owned deterministic collective check is absent"
     )
+    te_compare_script = REPO_ROOT / "scripts" / "ws2_megatron_te_cp_compare.py"
+    te_inputs = (
+        args.megatron_te_script,
+        args.megatron_model,
+        args.megatron_token_artifact,
+    )
+    te_available = te_compare_script.is_file() and all(
+        path is not None and path.exists() for path in te_inputs
+    )
+    te_unavailable = (
+        None
+        if te_available
+        else "native Megatron/TE comparison requires --megatron-te-script, "
+        "--megatron-model, and --megatron-token-artifact"
+    )
+    te_report = artifact_dir / "ws2-megatron-te-cp-compare.json"
 
     cases: list[AcceptanceCase] = [
         AcceptanceCase(
@@ -125,6 +149,36 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
                 str(args.out_atol),
             ),
             validator=validate_p2p_report,
+        ),
+        AcceptanceCase(
+            name="native_te_kv_ring_cp_compare",
+            # TE's native KV ring is a diagnostic/performance baseline.  It
+            # currently exposes CP-dependent drift and must not gate the
+            # self-owned AG/RS acceptance path.
+            required=False,
+            command=(
+                python,
+                str(te_compare_script),
+                "--teacher-script",
+                str(args.megatron_te_script),
+                "--model",
+                str(args.megatron_model),
+                "--token-artifact",
+                str(args.megatron_token_artifact),
+                "--output-dir",
+                str(artifact_dir / "megatron-te-cp-runs"),
+                "--output",
+                str(te_report),
+                "--python",
+                str(args.megatron_python),
+                "--cp-comm-type",
+                "p2p",
+            )
+            if te_available
+            else None,
+            report_path=te_report,
+            validator=lambda report: validate_native_te_report(report, args),
+            unavailable_reason=te_unavailable,
         ),
     ]
     for name, mode, query_len, policy, fixed_size in (
@@ -173,7 +227,9 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
                 str(collective_script),
                 "--output",
                 str(collective_report),
-            ) if collective_available else None,
+            )
+            if collective_available
+            else None,
             report_path=collective_report,
             validator=lambda report: validate_collective_report(report, args, operation="ag_rs"),
             unavailable_reason=collective_unavailable,
@@ -189,7 +245,9 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
                 str(collective_script),
                 "--output",
                 str(collective_report),
-            ) if collective_available else None,
+            )
+            if collective_available
+            else None,
             report_path=collective_report,
             validator=lambda report: validate_collective_report(
                 report, args, operation="allreduce"
@@ -299,9 +357,7 @@ def _run_case(
     if completed.returncode != 0:
         if case.report_path is not None:
             try:
-                unavailable_report = json.loads(
-                    case.report_path.read_text(encoding="utf-8")
-                )
+                unavailable_report = json.loads(case.report_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
                 unavailable_report = None
             if (
@@ -309,9 +365,9 @@ def _run_case(
                 and unavailable_report.get("status") == "not_available"
             ):
                 row.update(status="not_available")
-                row["errors"] = list(
-                    unavailable_report.get("errors") or []
-                ) or [f"command exited with {completed.returncode}"]
+                row["errors"] = list(unavailable_report.get("errors") or []) or [
+                    f"command exited with {completed.returncode}"
+                ]
                 row["report_summary"] = _report_summary(unavailable_report)
                 return row
         row.update(status="failed")
@@ -332,6 +388,87 @@ def _run_case(
     row["passed"] = not errors
     row["report_summary"] = _report_summary(report)
     return row
+
+
+def validate_native_te_report(report: Mapping[str, Any], args: argparse.Namespace) -> list[str]:
+    """Validate the delegated native Megatron/TE CP=1 vs CP=2 run."""
+
+    errors: list[str] = []
+    if report.get("schema_version") != "ws2_megatron_te_cp_compare/v1":
+        errors.append("native TE report schema is invalid")
+    if report.get("transport") != "native_te_kv_ring":
+        errors.append("native TE report did not use cp_comm_type=p2p")
+    if report.get("status") != "passed" or report.get("passed") is not True:
+        report_errors = report.get("errors")
+        if isinstance(report_errors, list):
+            errors.extend(str(error) for error in report_errors)
+        else:
+            errors.append("native TE report did not provide structured errors")
+    requested = report.get("requested")
+    if not isinstance(requested, Mapping):
+        errors.append("native TE request metadata is missing")
+        requested = {}
+    if requested.get("cp_comm_type") != "p2p":
+        errors.append("native TE request did not use cp_comm_type=p2p")
+    if requested.get("context_parallel_sizes") != [1, 2]:
+        errors.append("native TE comparison must cover CP=1 and CP=2")
+    comparison = report.get("comparison")
+    if not isinstance(comparison, Mapping):
+        errors.append("native TE report is missing CP comparison")
+        comparison_hash = None
+    else:
+        if comparison.get("pass") is not True:
+            errors.append("native TE CP comparison did not pass")
+        if comparison.get("left_cp_size") != 1 or comparison.get("right_cp_size") != 2:
+            errors.append("native TE comparison order is not CP=1 then CP=2")
+        errors.extend(
+            _scalar_threshold_errors(
+                comparison.get("max_abs"),
+                args.dlogp_atol,
+                "native TE CP logprob drift",
+            )
+        )
+        comparison_hash = comparison.get("token_ids_sha256")
+        if not (
+            isinstance(comparison_hash, str)
+            and len(comparison_hash) == 64
+            and all(character in "0123456789abcdef" for character in comparison_hash)
+        ):
+            errors.append("native TE comparison token hash is invalid")
+    runs = report.get("runs")
+    if not isinstance(runs, list) or len(runs) != 2:
+        errors.append("native TE report must contain exactly two runs")
+        return errors
+    seen_cp_sizes: set[int] = set()
+    for index, run in enumerate(runs):
+        if not isinstance(run, Mapping):
+            errors.append(f"native TE run {index} is invalid")
+            continue
+        cp_size = run.get("cp_size")
+        if isinstance(cp_size, int) and not isinstance(cp_size, bool):
+            seen_cp_sizes.add(cp_size)
+        if run.get("status") != "passed":
+            errors.append(f"native TE CP={cp_size} run did not pass")
+        active_token_count = run.get("active_token_count")
+        if (
+            isinstance(active_token_count, bool)
+            or not isinstance(active_token_count, int)
+            or active_token_count < 1
+        ):
+            errors.append(f"native TE CP={cp_size} active-token evidence is missing")
+        if run.get("token_ids_sha256") != comparison_hash:
+            errors.append(f"native TE CP={cp_size} token hash differs from the comparison")
+        actual = run.get("actual")
+        provider = actual.get("provider") if isinstance(actual, Mapping) else None
+        if not isinstance(provider, Mapping):
+            provider = {}
+        if provider.get("transformer_impl") != "transformer_engine":
+            errors.append("native TE run did not record transformer_engine")
+        if provider.get("cp_comm_type") != "p2p":
+            errors.append("native TE run did not record cp_comm_type=p2p")
+    if seen_cp_sizes != {1, 2}:
+        errors.append("native TE runs must cover CP=1 and CP=2 exactly")
+    return errors
 
 
 def validate_pr5_report(report: Mapping[str, Any], args: argparse.Namespace) -> list[str]:

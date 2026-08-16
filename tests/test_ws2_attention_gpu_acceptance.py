@@ -13,6 +13,7 @@ from scripts.ws2_attention_gpu_acceptance import (
     build_acceptance_cases,
     parse_args,
     run_acceptance,
+    validate_native_te_report,
     validate_p2p_report,
     validate_pr5_report,
     validate_pr7_report,
@@ -35,11 +36,21 @@ def test_matrix_contains_required_modes_splitk_and_communication(tmp_path):
 
     assert "pr5_cp_forward_backward_dlogp" in names
     assert "p2p_nccl_reference" in names
+    assert "native_te_kv_ring_cp_compare" in names
     assert "pr7_flashinfer_decode_disabled" in names
     assert "pr7_flashinfer_decode_fixed" in names
     assert "pr7_flashinfer_prefill_disabled" in names
     assert "pr7_flashinfer_prefill_fixed" in names
     assert "custom_cuda_ag_rs" in names
+
+
+def test_native_te_kv_ring_is_optional_diagnostic(tmp_path):
+    args = parse_args(["--output", str(tmp_path / "acceptance.json")])
+    case = next(
+        case for case in build_acceptance_cases(args) if case.name == "native_te_kv_ring_cp_compare"
+    )
+
+    assert case.required is False
 
 
 def test_dlogp_default_uses_shared_bf16_logprob_tolerance(tmp_path):
@@ -48,11 +59,55 @@ def test_dlogp_default_uses_shared_bf16_logprob_tolerance(tmp_path):
     assert args.dlogp_atol == 5.0e-2
 
 
+def test_native_te_validator_requires_native_kv_ring_and_cp_compare(tmp_path):
+    args = parse_args(["--output", str(tmp_path / "acceptance.json")])
+    report = {
+        "schema_version": "ws2_megatron_te_cp_compare/v1",
+        "status": "passed",
+        "passed": True,
+        "transport": "native_te_kv_ring",
+        "requested": {"cp_comm_type": "p2p", "context_parallel_sizes": [1, 2]},
+        "comparison": {
+            "pass": True,
+            "left_cp_size": 1,
+            "right_cp_size": 2,
+            "max_abs": 0.0,
+            "token_ids_sha256": "a" * 64,
+        },
+        "runs": [
+            {
+                "cp_size": cp_size,
+                "status": "passed",
+                "active_token_count": 2,
+                "token_ids_sha256": "a" * 64,
+                "actual": {
+                    "provider": {
+                        "transformer_impl": "transformer_engine",
+                        "cp_comm_type": "p2p",
+                    }
+                },
+            }
+            for cp_size in (1, 2)
+        ],
+        "errors": [],
+    }
+
+    assert validate_native_te_report(report, args) == []
+    report["comparison"]["max_abs"] = "not-a-number"
+    assert any("not numeric" in error for error in validate_native_te_report(report, args))
+    report["comparison"]["max_abs"] = 0.0
+    report["transport"] = "native_te_kv_all_gather"
+    assert validate_native_te_report(report, args)
+    report["transport"] = "native_te_kv_ring"
+    report["runs"] = report["runs"][:1]
+    assert "native TE report must contain exactly two runs" in validate_native_te_report(
+        report, args
+    )
+
+
 def test_run_mode_preserves_structured_not_available_reports(tmp_path):
     report_path = tmp_path / "not-available.json"
-    args = parse_args(
-        ["--mode", "run", "--output", str(tmp_path / "acceptance.json")]
-    )
+    args = parse_args(["--mode", "run", "--output", str(tmp_path / "acceptance.json")])
     case = AcceptanceCase(
         name="optional",
         command=("fake",),
