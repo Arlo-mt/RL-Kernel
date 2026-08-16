@@ -42,7 +42,12 @@ class _TritonLMHeadFn(torch.autograd.Function):
             weight_c = weight_c.to(torch.bfloat16)
         grad_hidden = grad_weight = grad_bias = None
         if ctx.needs_input_grad[0]:
-            grad_hidden = _triton_gemm(grad_2d, weight_c).reshape_as(hidden).to(hidden.dtype)
+            # Keep the reduction in FP32 before restoring the execution dtype.
+            # BF16-input dot rounding can otherwise exceed the shared gradient
+            # accuracy contract for the full-vocabulary projection.
+            grad_hidden = _triton_gemm(
+                grad_2d, weight_c, output_dtype=torch.float32
+            ).reshape_as(hidden).to(hidden.dtype)
         if ctx.needs_input_grad[1]:
             grad_weight = _triton_gemm(grad_2d.t().contiguous(), hidden_2d).to(weight.dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
