@@ -162,13 +162,14 @@ class H100AttentionPreprocessor:
         q_det = self.rope(q_norm_det, positions, theta=theta)
         k_det = self.rope(k_norm_det, positions, theta=theta)
 
-        native_available = self.native_qk_norm is not None and self.native_rope is not None
-        if native_available:
+        native_qk_norm = self.native_qk_norm
+        native_rope = self.native_rope
+        if native_qk_norm is not None and native_rope is not None:
             try:
-                q_norm_native = self.native_qk_norm(q, q_weight, eps=eps)
-                k_norm_native = self.native_qk_norm(k, k_weight, eps=eps)
-                q_native = self.native_rope(q_norm_native, positions, theta=theta)
-                k_native = self.native_rope(k_norm_native, positions, theta=theta)
+                q_norm_native = native_qk_norm(q, q_weight, eps=eps)
+                k_norm_native = native_qk_norm(k, k_weight, eps=eps)
+                q_native = native_rope(q_norm_native, positions, theta=theta)
+                k_native = native_rope(k_norm_native, positions, theta=theta)
                 probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
                 if (
                     torch.equal(q_norm_native, q_norm_det)
