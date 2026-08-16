@@ -652,7 +652,7 @@ class Qwen3DenseBIModel:
         lm_head_op = self.profile_ops.get("lm_head")
         keys = getattr(self, "_current_logical_keys", None)
         lm_family = self.profile_ops.provenance["lm_head"]["actual_backend"]
-        if active_session() is not None and keys is not None and lm_family.startswith("cuda"):
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None and lm_family.startswith("cuda"):
             score_logits = canonical_cuda_lm_head_fp32(
                 hidden,
                 self.weights["lm_head.weight"],
@@ -877,7 +877,7 @@ class Qwen3DenseBIModel:
         op = self.profile_ops.get("det_gemm")
         if self.execution_dtype == torch.bfloat16:
             keys = getattr(self, "_current_logical_keys", None)
-            if active_session() is not None and keys is not None:
+            if torch.is_grad_enabled() and active_session() is not None and keys is not None:
                 family = self.profile_ops.provenance["det_gemm"]["actual_backend"]
                 out = canonical_linear_fp32(
                     flat,
@@ -903,7 +903,7 @@ class Qwen3DenseBIModel:
         op = self.profile_ops.get("rms_norm")
         keys = getattr(self, "_current_logical_keys", None)
         family = self.profile_ops.provenance["rms_norm"]["actual_backend"]
-        if active_session() is not None and keys is not None and family == "cuda":
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None and family == "cuda":
             hidden = x.shape[-1]
             out = canonical_cuda_rmsnorm(
                 x.contiguous().view(-1, hidden),
@@ -933,7 +933,7 @@ class Qwen3DenseBIModel:
         op = self.profile_ops.get("qk_norm")
         keys = getattr(self, "_current_logical_keys", None)
         family = self.profile_ops.provenance["qk_norm"]["actual_backend"]
-        if active_session() is not None and keys is not None and family == "cuda":
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None and family == "cuda":
             head_keys = (
                 keys[:, :, None, :]
                 .expand(batch, seq, heads, 2)

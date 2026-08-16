@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+import contextlib
 import hashlib
 import json
 import os
@@ -933,19 +934,34 @@ def _run_chunked_cell_impl(
     node_token_digests: dict[str, dict[str, str]] = {}
     restores: list[tuple[tuple[tuple[str, int] | None, ...], ...]] = []
     seq = input_ids.shape[1]
-    for start in range(0, seq, plan.chunk_size):
-        end = min(start + plan.chunk_size, seq)
-        step = model.forward(
-            input_ids[:, start:end], attention_mask=attn[:, start:end],
-            position_ids=pos[:, start:end], kv_cache=cache, capture_nodes=True,
-            logical_keys=(logical_keys[:, start:end] if active_session() is not None else None),
+    forward_context = torch.no_grad() if defer_backward else contextlib.nullcontext()
+    with forward_context:
+        for start in range(0, seq, plan.chunk_size):
+            end = min(start + plan.chunk_size, seq)
+            step = model.forward(
+                input_ids[:, start:end], attention_mask=attn[:, start:end],
+                position_ids=pos[:, start:end], kv_cache=cache, capture_nodes=True,
+                logical_keys=(logical_keys[:, start:end] if active_session() is not None else None),
+            )
+            logits_parts.append(step["logits"])
+            score_logits_parts.append(_scoring_logits(step))
+            chunk_restore = tuple(tuple(row[start:end]) for row in padded.restore_map)
+            restores.append(chunk_restore)
+            _merge_node_token_digests(
+                node_token_digests, _node_token_fingerprints(model, chunk_restore)
+            )
+    if defer_backward:
+        del cache, logits_parts, score_logits_parts
+        full = model.forward(
+            input_ids, attention_mask=attn, position_ids=pos, capture_nodes=True,
+            logical_keys=logical_keys,
         )
-        logits_parts.append(step["logits"])
-        score_logits_parts.append(_scoring_logits(step))
-        chunk_restore = tuple(tuple(row[start:end]) for row in padded.restore_map)
-        restores.append(chunk_restore)
-        _merge_node_token_digests(
-            node_token_digests, _node_token_fingerprints(model, chunk_restore)
+        return _finish_cell(
+            model, full["logits"], input_ids, loss_mask,
+            restore=padded.restore_map, score_logits=full.get("score_logits"),
+            restores=(padded.restore_map,), cell_id=cell_id, run_backward=False,
+            retain_loss=True, active_token_denominator=active_token_denominator,
+            node_token_digests=node_token_digests,
         )
     return _finish_cell(
         model, torch.cat(logits_parts, dim=1), input_ids, loss_mask,
