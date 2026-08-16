@@ -856,7 +856,7 @@ class FlashInferQwen3PagedAttentionOp:
             raise FlashInferUnavailable(f"flashinfer.{namespace_name}.{class_name} is unavailable")
 
         workspace = torch.zeros(cfg.workspace_size_bytes, dtype=torch.uint8, device=q.device)
-        constructor_kwargs = {"kv_layout": cfg.kv_layout}
+        constructor_kwargs: dict[str, Any] = {"kv_layout": cfg.kv_layout}
         if cfg.mode == "decode":
             constructor_kwargs["use_tensor_cores"] = True
         try:
