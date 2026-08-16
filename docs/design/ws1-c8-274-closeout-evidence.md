@@ -12,10 +12,10 @@ python scripts/sweep_ws1_four_judgments.py --execute --json
 
 | Field | Value |
 | --- | --- |
-| Source commit | `5c33dcdd1c201f6e8bb8b0a4247d1cf9e9502b35` |
-| Branch | `feat/ws1-c1-c5-c8-gtest` |
+| Source commit | `fdf5bcc5165820abb506291a29370225306514ca` |
+| Branch | `feat/ws1-c6-c11-closeout-266` |
 | GPU | NVIDIA H20, CC 9.0 |
-| Driver | 580.82.07 |
+| Driver | 580.76.05 |
 | CUDA / PyTorch / Triton | 12.8 / 2.8.0+cu128 / 3.4.0 |
 | Workload | `ws1-qwen3-8b-dense-primary-v6` (`ws1-c2-v7`) |
 | Result | `green=176`, `N/A=16` (`pack`), **red=0**, exit 0 |
@@ -55,4 +55,4 @@ Invariance cells record the C3/C4 observed `actual_backend_id` and
 | No Native/Triton/reference masquerade | Pass (Triton attention has its own VJP; SM90 ops fail closed) |
 | Zero red | Pass |
 
-C8 all-green is not WS1 EXIT. C6/C7/C9/C10/C11 remain.
+C8 all-green is not WS1 EXIT. This artifact was refreshed during the C10/C11 closeout; parent EXIT still requires the final-commit required GPU CI run and issue bookkeeping.

@@ -2,8 +2,9 @@
 
 **Parent:** #266 · **Branch:** `feat/ws1-c6-c11-closeout-266`
 
-C9 green is assembly only. Full WS1 EXIT still needs H20 execute of C10/C11
-plus parent A/B/Final comments.
+C9 green is assembly only. H20 C8 and both C10 backend profiles are green on
+`fdf5bcc5165820abb506291a29370225306514ca`. Full WS1 EXIT still requires the
+final-commit required GitHub GPU CI run plus parent A/B/Final comments.
 
 ## What landed
 
@@ -37,7 +38,29 @@ Local pytest totals are command-scoped development evidence, not an EXIT
 criterion. Always quote the exact test command and commit with a pass count;
 do not cite a bare aggregate such as `220 passed` as closeout evidence.
 
-## H20 commands (user-run)
+## H20 technical execute
+
+Environment: NVIDIA H20 (CC 9.0), driver 580.76.05, CUDA 12.8,
+PyTorch 2.8.0+cu128, Triton 3.4.0, pinned Qwen3-8B weight hash
+`fc664a19c52c82b6f5ddb33d4fe2723181daeb93a344b16fee6369963e5a13a5`.
+
+| Gate | Profile | Result |
+| --- | --- | --- |
+| C8 four-judgment matrix | CUDA + Triton | green=176, N/A=16 (pack), red=0 |
+| C10 full model | `cuda_bf16` | passed, `first_drift=null`, clean SHA |
+| C10 full model | `triton_cuda_bf16` | passed, `first_drift=null`, clean SHA |
+
+Each C10 profile passed 7/7 forward-invariance rows, 2394/2394 parameter-gradient
+invariance rows, 2/2 FP32 forward-accuracy rows, 798/798 FP32 gradient-accuracy
+rows, 8/8 accuracy aggregates, all three train/infer aggregates, BN
+train/infer parity, and 6/6 decode/prefill cases. The four Batch/Chunk cells
+execute separate real paths; chunked training runs per-layer chunked operations
+and verifies its logits against stateful chunked prefill before backward.
+
+These local H20 results establish C10 technical readiness. They do not replace
+C11's required GitHub workflow success and workflow URL on the final commit.
+
+## H20 reproduction commands
 
 Pinned Qwen3-8B snapshot (C2 revision + shard hashes):
 
@@ -91,3 +114,4 @@ appear explicitly as `BN/packed` versus `fp32_reference`.
 - Multi-GPU / vime / real vLLM vs Megatron
 - C9 skeleton alone as EXIT
 - Production paged-KV (C7 B2 is explicitly absent)
+- C11/public EXIT until the required final-commit GitHub GPU workflow is green

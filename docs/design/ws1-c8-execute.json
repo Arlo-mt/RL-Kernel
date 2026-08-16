@@ -1,9 +1,9 @@
 {
   "schema_version": "ws1-c8-execute-v2",
   "git": {
-    "commit": "5c33dcdd1c201f6e8bb8b0a4247d1cf9e9502b35",
-    "branch": "feat/ws1-c1-c5-c8-gtest",
-    "dirty": true
+    "commit": "fdf5bcc5165820abb506291a29370225306514ca",
+    "branch": "feat/ws1-c6-c11-closeout-266",
+    "dirty": false
   },
   "environment": {
     "python": "3.12.3",
@@ -12,13 +12,13 @@
     "cuda_runtime": "12.8",
     "gpu_name": "NVIDIA H20",
     "compute_capability": "9.0",
-    "driver": "580.82.07",
+    "driver": "580.76.05",
     "triton": "3.4.0"
   },
   "workload": {
     "workload_id": "ws1-qwen3-8b-dense-primary-v6",
     "manifest_version": "ws1-c2-v7",
-    "fixture_identity_sha256": "4cfce614fa7e2f6a5c1ce801fa47c1d2cfb2be3667d009a33f06687c62f57807"
+    "fixture_identity_sha256": "3fa8a5913795a4a0011e038a5a33831dc63b096fce67c9817766f493dd66c222"
   },
   "command": "python scripts/sweep_ws1_four_judgments.py --execute --json",
   "threshold_source": "rl_engine/kernels/gtest/tolerance_contract.json",
