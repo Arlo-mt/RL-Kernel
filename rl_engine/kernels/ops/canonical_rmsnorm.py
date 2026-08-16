@@ -8,7 +8,12 @@ from __future__ import annotations
 import torch
 
 from rl_engine.kernels.ops.base import _C
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.canonical_backward import active_session
+from rl_engine.kernels.ops.triton.rmsnorm_triton import (
+    rmsnorm_triton_backward_rows,
+    rmsnorm_triton_forward_with_rstd,
+)
 from rl_engine.kernels.ops.vjp_fp32 import reduce_rows_fp32
 
 
@@ -54,3 +59,56 @@ def canonical_cuda_rmsnorm(
 
 
 __all__ = ["canonical_cuda_rmsnorm"]
+
+
+class _CanonicalRowRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, eps, logical_keys, parameter_id, forward_op):
+        session = active_session()
+        if session is None:
+            raise RuntimeError("canonical RMSNorm requires an active backward session")
+        del forward_op
+        with torch.no_grad():
+            y, rstd = rmsnorm_triton_forward_with_rstd(x, weight, float(eps))
+        ctx.save_for_backward(x, weight, rstd)
+        ctx.session = session
+        ctx.parameter_id = str(parameter_id)
+        ctx.slot = session.register(ctx.parameter_id, logical_keys)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, rstd = ctx.saved_tensors
+        dx, rows = rmsnorm_triton_backward_rows(
+            grad_out.contiguous(), x, weight, rstd
+        )
+        dw = ctx.session.submit_rows(
+            ctx.parameter_id,
+            ctx.slot,
+            rows,
+            lambda ordered: reduce_rows_fp32(ordered).to(weight.dtype),
+        )
+        record_backward(
+            "rms_norm",
+            kernel_id=(
+                "rl_engine.kernels.ops.triton.rmsnorm_triton._rmsnorm_bwd_dx_kernel"
+                "+rl_engine.kernels.ops.vjp_fp32.reduce_rows_fp32"
+            ),
+            impl="triton_rmsnorm_canonical_rowfold",
+            family="triton",
+        )
+        return dx, dw, None, None, None, None
+
+
+def canonical_row_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    logical_keys: torch.Tensor,
+    parameter_id: str,
+    forward_op,
+) -> torch.Tensor:
+    return _CanonicalRowRMSNorm.apply(
+        x, weight, eps, logical_keys, parameter_id, forward_op
+    )

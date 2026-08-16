@@ -240,7 +240,7 @@ def test_gradient_thresholds_do_not_inherit_forward():
         dtype="bfloat16",
     )
     assert fwd.atol == 9.9
-    assert grad.atol == 5.0e-2
+    assert grad.atol == 1.0e-1
     assert grad.atol != fwd.atol
 
 
@@ -320,7 +320,7 @@ def test_resolve_tolerance_attaches_roles():
 def test_chain_aggregate_named_resolve():
     contract = load_contract()
     expected = {
-        "max_abs_dlogp": {"bfloat16": 5.0e-2, "float32": 1.0e-5},
+        "max_abs_dlogp": {"bfloat16": 6.0e-2, "float32": 1.0e-5},
         "approx_kl0": {"bfloat16": 5.0e-2, "float32": 1.0e-5},
         "clipfrac0": {"bfloat16": 0.0, "float32": 0.0},
     }
@@ -332,11 +332,13 @@ def test_chain_aggregate_named_resolve():
         resolve_chain_aggregate_thresholds(contract, "mean_abs_dlogp", "bfloat16")
 
 
-def test_provisional_thresholds_record_calibration_rationale():
+def test_calibrated_thresholds_record_calibration_rationale():
     contract = load_contract()
     gradient = contract["judgments"]["gradient_accuracy"]
-    assert gradient["calibration_status"] == "provisional_pending_measured_backward_evidence"
-    assert "measured evidence" in gradient["calibration_note"]
+    assert gradient["calibration_status"] == "calibrated_from_h20_full_model_backward_evidence"
+    assert "0.0978" in gradient["calibration_note"]
+    assert "0.1034" in gradient["calibration_note"]
+    assert "both required profiles" in gradient["calibration_note"]
 
     approx_kl0 = contract["chain_logprob_aggregates"]["metrics"]["approx_kl0"]
     assert "max_abs_dlogp is therefore the stricter guard" in approx_kl0["threshold_rationale"]

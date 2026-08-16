@@ -17,9 +17,11 @@ from rl_engine.alignment.qwen3_dense import (
     ProfileOps,
     Qwen3DenseBIModel,
     Qwen3DenseSpec,
+    _CanonicalChunkedAttentionFn,
     load_profile_ops,
     verify_hf_weight_snapshot,
 )
+from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
 from rl_engine.testing.ws1_workload import load_manifest, weight_snapshot_hash
 
@@ -179,3 +181,38 @@ def test_c9_chunked_attention_mask_covers_cached_prefix():
     assert combined.shape == (2, 5)
     assert torch.equal(combined[:, :3], torch.ones(2, 3, dtype=torch.bool))
     assert torch.equal(combined[:, 3:], current_mask)
+
+
+def test_c9_chunked_attention_uses_real_chunks_and_canonical_backward():
+    class RecordingAttention:
+        def __init__(self):
+            self.op = NativeAttentionOp()
+            self.calls = []
+
+        def forward_fp32(self, q, k, v, **kwargs):
+            self.calls.append((q.shape[2], k.shape[2]))
+            return self.op.forward_fp32(q, k, v, **kwargs)
+
+    torch.manual_seed(7)
+    op = RecordingAttention()
+    q = torch.randn(1, 2, 7, 4, requires_grad=True)
+    k = torch.randn(1, 1, 7, 4, requires_grad=True)
+    v = torch.randn(1, 1, 7, 4, requires_grad=True)
+    mask = torch.ones(1, 7, dtype=torch.bool)
+    grad_out = torch.randn(1, 2, 7, 4)
+
+    chunked = _CanonicalChunkedAttentionFn.apply(q, k, v, mask, 3, op)
+    chunked.backward(grad_out)
+    chunked_grads = (q.grad.clone(), k.grad.clone(), v.grad.clone())
+
+    q_ref = q.detach().requires_grad_(True)
+    k_ref = k.detach().requires_grad_(True)
+    v_ref = v.detach().requires_grad_(True)
+    full = NativeAttentionOp().forward_fp32(
+        q_ref, k_ref, v_ref, causal=True, key_padding_mask=mask
+    )
+    full.backward(grad_out)
+
+    assert op.calls == [(3, 3), (3, 6), (1, 7), (7, 7)]
+    for actual, expected in zip(chunked_grads, (q_ref.grad, k_ref.grad, v_ref.grad)):
+        assert torch.equal(actual, expected)

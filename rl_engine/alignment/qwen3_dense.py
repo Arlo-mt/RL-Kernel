@@ -22,8 +22,14 @@ from rl_engine.kernels.gtest.gradient_adapters import resolve_profile_candidate
 from rl_engine.kernels.gtest.operator_specs import OP_SPECS, _load_object
 from rl_engine.kernels.ops.canonical_backward import active_session
 from rl_engine.kernels.ops.canonical_linear import canonical_linear_fp32
-from rl_engine.kernels.ops.canonical_lm_head import canonical_cuda_lm_head_fp32
-from rl_engine.kernels.ops.canonical_rmsnorm import canonical_cuda_rmsnorm
+from rl_engine.kernels.ops.canonical_lm_head import (
+    canonical_cuda_lm_head_fp32,
+    canonical_row_lm_head,
+)
+from rl_engine.kernels.ops.canonical_rmsnorm import (
+    canonical_cuda_rmsnorm,
+    canonical_row_rmsnorm,
+)
 from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
 from rl_engine.testing.ws1_workload import (
     WS1Manifest,
@@ -68,6 +74,52 @@ _VJP_NODES = frozenset(
         "lm_head",
     }
 )
+
+
+class _CanonicalChunkedAttentionFn(torch.autograd.Function):
+    """Run chunked attention forward with a partition-independent backward."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, key_padding_mask, chunk_size, op):
+        outputs = []
+        seq = q.shape[2]
+        for start in range(0, seq, int(chunk_size)):
+            end = min(start + int(chunk_size), seq)
+            outputs.append(
+                op.forward_fp32(
+                    q[:, :, start:end, :],
+                    k[:, :, :end, :],
+                    v[:, :, :end, :],
+                    causal=True,
+                    key_padding_mask=key_padding_mask[:, :end],
+                )
+            )
+        ctx.save_for_backward(q, k, v, key_padding_mask)
+        ctx.op = op
+        return torch.cat(outputs, dim=2)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, key_padding_mask = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ref = q.detach().requires_grad_(True)
+            k_ref = k.detach().requires_grad_(True)
+            v_ref = v.detach().requires_grad_(True)
+            out = ctx.op.forward_fp32(
+                q_ref,
+                k_ref,
+                v_ref,
+                causal=True,
+                key_padding_mask=key_padding_mask,
+            )
+            dq, dk, dv = torch.autograd.grad(
+                out,
+                (q_ref, k_ref, v_ref),
+                grad_out,
+                retain_graph=False,
+                create_graph=False,
+            )
+        return dq, dk, dv, None, None, None
 
 
 @dataclass(frozen=True)
@@ -658,6 +710,14 @@ class Qwen3DenseBIModel:
                 self.weights["lm_head.weight"],
                 keys.reshape(-1, 2),
             )
+        elif torch.is_grad_enabled() and active_session() is not None and keys is not None and lm_family == "triton":
+            score_logits = canonical_row_lm_head(
+                hidden,
+                self.weights["lm_head.weight"],
+                keys.reshape(-1, 2),
+                forward_op=lm_head_op.forward_fp32,
+                matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+            )
         else:
             score_logits = lm_head_op.forward_fp32(
                 hidden, self.weights["lm_head.weight"], bias=None
@@ -690,6 +750,199 @@ class Qwen3DenseBIModel:
             if score_mask is not None:
                 result["loss"] = self._masked_loss(logp, score_mask)
         return result
+
+    def forward_chunked_training(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        chunk_size: int,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        logical_keys: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Differentiable chunked-prefill with a canonical attention backward."""
+
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must be [B, S], got {tuple(input_ids.shape)}")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        batch, seq = input_ids.shape
+        if attention_mask.shape != (batch, seq):
+            raise ValueError("attention_mask must match input_ids")
+        if position_ids.shape != (batch, seq):
+            raise ValueError("position_ids must match input_ids")
+        if logical_keys.shape != (batch, seq, 2):
+            raise ValueError("logical_keys must have shape [B, S, 2]")
+
+        self._capture_nodes = False
+        self._last_node_outputs = {}
+        chunks = tuple(
+            (start, min(start + int(chunk_size), seq))
+            for start in range(0, seq, int(chunk_size))
+        )
+        hidden_parts: list[torch.Tensor] = []
+        for start, end in chunks:
+            self._current_logical_keys = logical_keys[:, start:end]
+            hidden_parts.append(self._embed(input_ids[:, start:end]).float())
+
+        attention_op = self.profile_ops.get("attention")
+        for layer in range(self.spec.num_hidden_layers):
+            prefix = f"layers.{layer}"
+            q_parts: list[torch.Tensor] = []
+            k_parts: list[torch.Tensor] = []
+            v_parts: list[torch.Tensor] = []
+            for hidden, (start, end) in zip(hidden_parts, chunks):
+                self._current_logical_keys = logical_keys[:, start:end]
+                normed = self._rms(
+                    hidden.to(dtype=self.execution_dtype),
+                    self.weights[f"{prefix}.input_layernorm.weight"],
+                    node=f"{prefix}.input_layernorm",
+                )
+                q = self._linear(
+                    normed,
+                    self.weights[f"{prefix}.self_attn.q_proj.weight"],
+                    node=f"{prefix}.q_proj",
+                )
+                k = self._linear(
+                    normed,
+                    self.weights[f"{prefix}.self_attn.k_proj.weight"],
+                    node=f"{prefix}.k_proj",
+                )
+                v = self._linear(
+                    normed,
+                    self.weights[f"{prefix}.self_attn.v_proj.weight"],
+                    node=f"{prefix}.v_proj",
+                )
+                q = self._to_heads(q, self.spec.num_attention_heads)
+                k = self._to_heads(k, self.spec.num_key_value_heads)
+                v = self._to_heads(v, self.spec.num_key_value_heads)
+                q = self._qk_norm(
+                    q,
+                    self.weights[f"{prefix}.self_attn.q_norm.weight"],
+                    node=f"{prefix}.q_norm",
+                )
+                k = self._qk_norm(
+                    k,
+                    self.weights[f"{prefix}.self_attn.k_norm.weight"],
+                    node=f"{prefix}.k_norm",
+                )
+                q_parts.append(
+                    self._rope(q, position_ids[:, start:end], node=f"{prefix}.rope_q")
+                )
+                k_parts.append(
+                    self._rope(k, position_ids[:, start:end], node=f"{prefix}.rope_k")
+                )
+                v_parts.append(v)
+
+            attn_all = _CanonicalChunkedAttentionFn.apply(
+                torch.cat(q_parts, dim=2),
+                torch.cat(k_parts, dim=2),
+                torch.cat(v_parts, dim=2),
+                attention_mask,
+                int(chunk_size),
+                attention_op,
+            )
+            attn_public = attn_all.to(dtype=self.execution_dtype)
+            self.profile_ops.observe("attention", attn_public)
+            self._record(f"{prefix}.attn", attn_public)
+
+            next_hidden_parts: list[torch.Tensor] = []
+            for hidden, (start, end) in zip(hidden_parts, chunks):
+                self._current_logical_keys = logical_keys[:, start:end]
+                attn = attn_all[:, :, start:end, :]
+                attn_merged = (
+                    attn.transpose(1, 2)
+                    .contiguous()
+                    .reshape(hidden.shape[0], end - start, self.spec.hidden_size)
+                )
+                projected = self._linear(
+                    attn_merged,
+                    self.weights[f"{prefix}.self_attn.o_proj.weight"],
+                    node=f"{prefix}.o_proj",
+                )
+                hidden = self._record(
+                    f"{prefix}.residual_attn", hidden + projected.to(dtype=hidden.dtype)
+                )
+                mlp_in = self._rms(
+                    hidden.to(dtype=self.execution_dtype),
+                    self.weights[f"{prefix}.post_attention_layernorm.weight"],
+                    node=f"{prefix}.post_attention_layernorm",
+                )
+                gate = self._linear(
+                    mlp_in,
+                    self.weights[f"{prefix}.mlp.gate_proj.weight"],
+                    node=f"{prefix}.gate_proj",
+                    internal_fp32=True,
+                )
+                up = self._linear(
+                    mlp_in,
+                    self.weights[f"{prefix}.mlp.up_proj.weight"],
+                    node=f"{prefix}.up_proj",
+                    internal_fp32=True,
+                )
+                swiglu_op = self.profile_ops.get("swiglu")
+                if self.execution_dtype == torch.bfloat16:
+                    swiglu = swiglu_op.forward_fp32(gate, up)
+                    swiglu_public = swiglu.to(dtype=self.execution_dtype)
+                else:
+                    swiglu = swiglu_op.forward(gate, up)
+                    swiglu_public = swiglu
+                self.profile_ops.observe("swiglu", swiglu_public)
+                self._record(f"{prefix}.swiglu", swiglu_public)
+                down = self._linear(
+                    swiglu,
+                    self.weights[f"{prefix}.mlp.down_proj.weight"],
+                    node=f"{prefix}.down_proj",
+                )
+                next_hidden_parts.append(
+                    self._record(
+                        f"{prefix}.residual_mlp",
+                        hidden + down.to(dtype=hidden.dtype),
+                    )
+                )
+            hidden_parts = next_hidden_parts
+
+        score_parts: list[torch.Tensor] = []
+        logits_parts: list[torch.Tensor] = []
+        hidden_outputs: list[torch.Tensor] = []
+        lm_head_op = self.profile_ops.get("lm_head")
+        lm_family = self.profile_ops.provenance["lm_head"]["actual_backend"]
+        for hidden, (start, end) in zip(hidden_parts, chunks):
+            keys = logical_keys[:, start:end]
+            self._current_logical_keys = keys
+            final_hidden = self._rms(
+                hidden.to(dtype=self.execution_dtype),
+                self.weights["norm.weight"],
+                node="final_layernorm",
+            )
+            if active_session() is not None and lm_family.startswith("cuda"):
+                score_logits = canonical_cuda_lm_head_fp32(
+                    final_hidden,
+                    self.weights["lm_head.weight"],
+                    keys.reshape(-1, 2),
+                )
+            elif active_session() is not None and lm_family == "triton":
+                score_logits = canonical_row_lm_head(
+                    final_hidden,
+                    self.weights["lm_head.weight"],
+                    keys.reshape(-1, 2),
+                    forward_op=lm_head_op.forward_fp32,
+                    matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+                )
+            else:
+                score_logits = lm_head_op.forward_fp32(
+                    final_hidden, self.weights["lm_head.weight"], bias=None
+                )
+            logits = score_logits.to(dtype=self.execution_dtype)
+            self.profile_ops.observe("lm_head", logits)
+            hidden_outputs.append(final_hidden)
+            score_parts.append(score_logits)
+            logits_parts.append(logits)
+        return {
+            "logits": torch.cat(logits_parts, dim=1),
+            "score_logits": torch.cat(score_parts, dim=1),
+            "hidden": torch.cat(hidden_outputs, dim=1),
+        }
 
     def decode_step(
         self,
@@ -903,15 +1156,29 @@ class Qwen3DenseBIModel:
         op = self.profile_ops.get("rms_norm")
         keys = getattr(self, "_current_logical_keys", None)
         family = self.profile_ops.provenance["rms_norm"]["actual_backend"]
-        if torch.is_grad_enabled() and active_session() is not None and keys is not None and family == "cuda":
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None:
             hidden = x.shape[-1]
-            out = canonical_cuda_rmsnorm(
-                x.contiguous().view(-1, hidden),
-                weight.contiguous(),
-                eps=self.spec.rms_norm_eps,
-                logical_keys=keys.reshape(-1, 2),
-                parameter_id=node,
-            ).view_as(x)
+            x_rows = x.contiguous().view(-1, hidden)
+            row_keys = keys.reshape(-1, 2)
+            if family == "cuda":
+                out = canonical_cuda_rmsnorm(
+                    x_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=row_keys,
+                    parameter_id=node,
+                ).view_as(x)
+            elif family == "triton":
+                out = canonical_row_rmsnorm(
+                    x_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=row_keys,
+                    parameter_id=node,
+                    forward_op=op.forward,
+                ).view_as(x)
+            else:
+                out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
         else:
             out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
         self.profile_ops.observe("rms_norm", out)
@@ -933,19 +1200,32 @@ class Qwen3DenseBIModel:
         op = self.profile_ops.get("qk_norm")
         keys = getattr(self, "_current_logical_keys", None)
         family = self.profile_ops.provenance["qk_norm"]["actual_backend"]
-        if torch.is_grad_enabled() and active_session() is not None and keys is not None and family == "cuda":
+        if torch.is_grad_enabled() and active_session() is not None and keys is not None:
             head_keys = (
                 keys[:, :, None, :]
                 .expand(batch, seq, heads, 2)
                 .reshape(-1, 2)
             )
-            out = canonical_cuda_rmsnorm(
-                flat.contiguous().view(-1, dim),
-                weight.contiguous(),
-                eps=self.spec.rms_norm_eps,
-                logical_keys=head_keys,
-                parameter_id=node,
-            ).view_as(flat)
+            flat_rows = flat.contiguous().view(-1, dim)
+            if family == "cuda":
+                out = canonical_cuda_rmsnorm(
+                    flat_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=head_keys,
+                    parameter_id=node,
+                ).view_as(flat)
+            elif family == "triton":
+                out = canonical_row_rmsnorm(
+                    flat_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=head_keys,
+                    parameter_id=node,
+                    forward_op=op.forward,
+                ).view_as(flat)
+            else:
+                out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)
         else:
             out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)
         self.profile_ops.observe("qk_norm", out)

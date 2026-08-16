@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from rl_engine.kernels.ops.base import _C
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.canonical_backward import active_session
 from rl_engine.kernels.ops.triton.matmul.det_gemm import _triton_gemm
 
@@ -52,6 +53,13 @@ class _CanonicalLinearFn(torch.autograd.Function):
 
             dweight = ctx.session.submit_linear(
                 ctx.parameter_id, ctx.slot, a, grad_out, reducer
+            )
+        if ctx.family == "triton":
+            record_backward(
+                "det_gemm",
+                kernel_id="rl_engine.kernels.ops.triton.matmul.det_gemm._triton_gemm",
+                impl="triton_det_gemm_canonical_rowfold",
+                family="triton",
             )
         return da, dweight, None, None, None
 

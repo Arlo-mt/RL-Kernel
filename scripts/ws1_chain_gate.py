@@ -10,9 +10,13 @@ import argparse
 import contextlib
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
+
+if "--json" in sys.argv:
+    os.environ["RL_KERNEL_LOG_STREAM"] = "stderr"
 
 import torch
 

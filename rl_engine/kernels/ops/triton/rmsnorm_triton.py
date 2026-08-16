@@ -48,6 +48,41 @@ def _rmsnorm_bwd_dx_kernel(
     tl.store(PARTIAL_DW + row * H + offs, pdw, mask=mask)
 
 
+def rmsnorm_triton_forward_with_rstd(x, weight, eps: float = 1e-6):
+    assert x.is_cuda and weight.is_cuda
+    assert x.dim() == 2 and weight.dim() == 1
+    rows, hidden = x.shape
+    assert weight.numel() == hidden
+
+    output = torch.empty_like(x)
+    rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
+    block_hidden = triton.next_power_of_2(hidden)
+    assert block_hidden <= 131072, "H too large for this simple Triton kernel"
+    _rmsnorm_fwd_kernel[(rows,)](
+        x, weight, output, rstd, rows, hidden, eps, BLOCK_H=block_hidden
+    )
+    return output, rstd
+
+
+def rmsnorm_triton_backward_rows(grad_out, x, weight, rstd):
+    rows, hidden = x.shape
+    dx = torch.empty_like(x)
+    partial_dw = torch.empty((rows, hidden), device=x.device, dtype=torch.float32)
+    block_hidden = triton.next_power_of_2(hidden)
+    _rmsnorm_bwd_dx_kernel[(rows,)](
+        grad_out,
+        x,
+        weight,
+        rstd,
+        dx,
+        partial_dw,
+        rows,
+        hidden,
+        BLOCK_H=block_hidden,
+    )
+    return dx, partial_dw
+
+
 class RMSNormTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps: float = 1e-6):
@@ -56,28 +91,15 @@ class RMSNormTriton(torch.autograd.Function):
         T, H = x.shape
         assert weight.numel() == H
 
-        y = torch.empty_like(x)
-        rstd = torch.empty((T,), device=x.device, dtype=torch.float32)
-
-        block_h = triton.next_power_of_2(H)
-        assert block_h <= 131072, "H too large for this simple Triton kernel"
-
-        _rmsnorm_fwd_kernel[(T,)](x, weight, y, rstd, T, H, eps, BLOCK_H=block_h)
+        y, rstd = rmsnorm_triton_forward_with_rstd(x, weight, eps)
         ctx.save_for_backward(x, weight, rstd)
-        ctx.H = H
         return y
 
     @staticmethod
     def backward(ctx, grad_out):
         x, weight, rstd = ctx.saved_tensors
-        T, H = x.shape
-        dx = torch.empty_like(x)
-        partial_dw = torch.empty((T, H), device=x.device, dtype=torch.float32)
-
-        block_h = triton.next_power_of_2(H)
-
-        _rmsnorm_bwd_dx_kernel[(T,)](
-            grad_out, x, weight, rstd, dx, partial_dw, T, H, BLOCK_H=block_h
+        dx, partial_dw = rmsnorm_triton_backward_rows(
+            grad_out, x, weight, rstd
         )
         dw = reduce_rows_fp32(partial_dw)
         record_backward(

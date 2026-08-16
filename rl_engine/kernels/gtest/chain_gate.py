@@ -951,15 +951,25 @@ def _run_chunked_cell_impl(
                 node_token_digests, _node_token_fingerprints(model, chunk_restore)
             )
     if defer_backward:
+        observed_logits = torch.cat(logits_parts, dim=1)
+        observed_score_logits = torch.cat(score_logits_parts, dim=1)
         del cache, logits_parts, score_logits_parts
-        full = model.forward(
-            input_ids, attention_mask=attn, position_ids=pos, capture_nodes=True,
+        chunked = model.forward_chunked_training(
+            input_ids,
+            chunk_size=plan.chunk_size,
+            attention_mask=attn,
+            position_ids=pos,
             logical_keys=logical_keys,
         )
+        if not torch.equal(observed_logits, chunked["logits"].detach()):
+            raise RuntimeError("chunked training logits differ from stateful chunked prefill")
+        if not torch.equal(observed_score_logits, chunked["score_logits"].detach()):
+            raise RuntimeError("chunked training score logits differ from stateful chunked prefill")
+        del observed_logits, observed_score_logits
         return _finish_cell(
-            model, full["logits"], input_ids, loss_mask,
-            restore=padded.restore_map, score_logits=full.get("score_logits"),
-            restores=(padded.restore_map,), cell_id=cell_id, run_backward=False,
+            model, chunked["logits"], input_ids, loss_mask,
+            restore=padded.restore_map, score_logits=chunked.get("score_logits"),
+            restores=tuple(restores), cell_id=cell_id, run_backward=False,
             retain_loss=True, active_token_denominator=active_token_denominator,
             node_token_digests=node_token_digests,
         )
