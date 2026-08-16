@@ -22,47 +22,49 @@ def _gemm_fp32(a: torch.Tensor, b: torch.Tensor, family: str) -> torch.Tensor:
 
 class _CanonicalLinearFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, a, b, logical_keys, parameter_id, family):
+    def forward(ctx, a, weight, logical_keys, parameter_id, family):
         session = active_session()
         if session is None:
             raise RuntimeError("canonical linear requires an active backward session")
-        ctx.save_for_backward(a, b)
+        ctx.save_for_backward(a, weight)
         ctx.session = session
         ctx.parameter_id = str(parameter_id)
         ctx.family = str(family)
         ctx.slot = session.register(ctx.parameter_id, logical_keys)
-        return _gemm_fp32(a.float(), b.float(), ctx.family)
+        return _gemm_fp32(
+            a.float(), weight.float().t().contiguous(), ctx.family
+        )
 
     @staticmethod
     def backward(ctx, grad_out):
-        a, b = ctx.saved_tensors
+        a, weight = ctx.saved_tensors
         grad32 = grad_out.contiguous().float()
         da = None
         if ctx.needs_input_grad[0]:
-            da = _gemm_fp32(grad32, b.float().t().contiguous(), ctx.family).to(a.dtype)
+            da = _gemm_fp32(grad32, weight.float(), ctx.family).to(a.dtype)
 
-        db = None
+        dweight = None
         if ctx.needs_input_grad[1]:
             def reducer(rows, grads):
                 return _gemm_fp32(
-                    rows.float().t().contiguous(), grads.float(), ctx.family
-                ).to(b.dtype)
+                    grads.float().t().contiguous(), rows.float(), ctx.family
+                ).to(weight.dtype)
 
-            db = ctx.session.submit_linear(
+            dweight = ctx.session.submit_linear(
                 ctx.parameter_id, ctx.slot, a, grad_out, reducer
             )
-        return da, db, None, None, None
+        return da, dweight, None, None, None
 
 
 def canonical_linear_fp32(
     a: torch.Tensor,
-    b: torch.Tensor,
+    weight: torch.Tensor,
     logical_keys: torch.Tensor,
     *,
     parameter_id: str,
     family: str,
 ) -> torch.Tensor:
-    return _CanonicalLinearFn.apply(a, b, logical_keys, parameter_id, family)
+    return _CanonicalLinearFn.apply(a, weight, logical_keys, parameter_id, family)
 
 
 __all__ = ["canonical_linear_fp32"]

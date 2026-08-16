@@ -881,7 +881,7 @@ class Qwen3DenseBIModel:
                 family = self.profile_ops.provenance["det_gemm"]["actual_backend"]
                 out = canonical_linear_fp32(
                     flat,
-                    weight.t().contiguous(),
+                    weight,
                     keys.reshape(-1, 2),
                     parameter_id=node,
                     family=family,
