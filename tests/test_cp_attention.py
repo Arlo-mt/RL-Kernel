@@ -385,6 +385,12 @@ def test_backward_report_cp2_prefill_matches_cp1_reference():
     assert drift.provenance["merge_order"] == "global_block_index"
     assert drift.provenance["te_backward_oracle"] == "not_used"
     assert drift.provenance["decode_backward"] == "not_supported"
+    assert drift.provenance["projection_scope"] == "attention_core_only"
+    assert drift.provenance["qkv_projection_backward_dgrad_collective"] == "all_reduce"
+    assert drift.provenance["qkv_projection_sp_backward_collective"] == "reduce_scatter"
+    assert drift.provenance["o_proj_backward_dgrad_collective"] == "none"
+    assert drift.provenance["o_proj_sp_backward_collective"] == "all_gather"
+    assert drift.provenance["projection_collectives_executed"] is False
     json.dumps(report.to_dict())
 
 

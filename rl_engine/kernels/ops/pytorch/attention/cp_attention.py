@@ -538,6 +538,13 @@ class DeterministicCPAttentionReferenceOp:
                 "backward_algorithm": "saved_out_lse_block_order_reference",
                 "te_backward_oracle": "not_used",
                 "decode_backward": "not_supported",
+                "projection_scope": "attention_core_only",
+                "qkv_projection_backward_dgrad_collective": "all_reduce",
+                "qkv_projection_sp_backward_collective": "reduce_scatter",
+                "o_proj_backward_dgrad_collective": "none",
+                "o_proj_sp_backward_collective": "all_gather",
+                "projection_collectives_executed": False,
+                "projection_collectives_source": "attention_contract_runtime_adapter",
             },
         )
 
