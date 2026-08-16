@@ -35,9 +35,18 @@ from rl_engine.kernels.attention_contract import (
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPCommunication,
+    AttentionCPMergedState,
+    AttentionCPPartialState,
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
+from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+    AttentionPartialState,
+    DeterministicCPAttentionReferenceOp,
+    build_reference_split_kv_runtime_plan_set,
+    merge_attention_partial_states,
+)
+from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
 
 RoPEState = Literal["pre_rope", "post_rope"]
 FlashInferAttentionMode = Literal["prefill", "decode"]
@@ -137,12 +146,11 @@ class FlashInferPagedAttentionConfig:
             )
         self.cp_comm_plan.validate()
         if self.require_cp_comm:
-            raise ValueError(
-                "FlashInfer currently evaluates the complete logical KV cache, so its output "
-                "cannot be labeled as one CP-owner partial state or merged again. Use the "
-                "standalone P2P NCCL reference until owner-local FlashInfer execution and "
-                "self-owned CUDA AG/RS are implemented."
-            )
+            if self.cp_comm_plan.status != "implemented":
+                raise ValueError(
+                    "require_cp_comm=True needs an implemented CP communication plan; "
+                    "interface-only plans cannot produce owner-local partial states"
+                )
         elif self.cp_comm_plan.status != "interface_only":
             raise ValueError("implemented CP communication plans require require_cp_comm=True")
         if not isinstance(self.require_verified_arithmetic, bool):
@@ -338,7 +346,7 @@ class FlashInferQwen3PagedAttentionOp:
         batch_size, q_heads, query_len, head_dim = q.shape
         kv_heads = k_cache.size(1)
         cfg.validate(head_dim=head_dim, query_len=query_len)
-        if self._flashinfer_module is None and q.device.type != "cuda":
+        if self._flashinfer_module is None and q.device.type != "cuda" and not cfg.require_cp_comm:
             raise FlashInferUnavailable("FlashInfer PR7 candidate requires CUDA tensors")
 
         plan = build_flashinfer_paged_kv_plan(
@@ -350,6 +358,15 @@ class FlashInferQwen3PagedAttentionOp:
         )
         _validate_flashinfer_rope_metadata(metadata, cfg, q)
         _validate_flashinfer_prefix_cache(q, k_cache, v_cache, metadata, cfg)
+        if cfg.require_cp_comm:
+            return self._forward_deterministic_cp_fallback(
+                q,
+                k_cache,
+                v_cache,
+                metadata,
+                cfg,
+                plan,
+            )
         q_flat = q.transpose(1, 2).reshape(batch_size * query_len, q_heads, head_dim).contiguous()
         k_pages, v_pages = materialize_flashinfer_paged_kv_cache(
             k_cache,
@@ -422,6 +439,188 @@ class FlashInferQwen3PagedAttentionOp:
         return FlashInferAttentionResult(
             out=out.to(dtype=q.dtype),
             lse=lse,
+            provenance=provenance,
+        )
+
+    @staticmethod
+    def _forward_deterministic_cp_fallback(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: Any,
+        cfg: FlashInferPagedAttentionConfig,
+        paged_plan: FlashInferPagedKVPlan,
+    ) -> FlashInferAttentionResult:
+        """Execute the owner-local CP contract without relabeling full-KV output.
+
+        FlashInfer's public paged wrapper does not expose one FP32 partial state
+        per CP-owned KV block.  Until it does, strict CP execution uses the
+        deterministic reference arithmetic while preserving the production
+        communication boundary: AG Q, owner-local partials, ordered FP32 merge,
+        and RS of the merged ``(Out, LSE)`` state.
+        """
+
+        communication = cfg.cp_communication
+        if communication is None:
+            raise FlashInferUnavailable(
+                "strict CP fallback requires an AttentionCPCommunication implementation"
+            )
+        cp_plan = cfg.cp_comm_plan
+        total_query_tokens = cp_plan.query_token_ranges[-1][1]
+        if q.size(2) != total_query_tokens:
+            raise ValueError(
+                "strict CP fallback expects the complete logical Q sequence before AG"
+            )
+        kv_seq_lens = tuple(int(value) for value in paged_plan.kv_seq_lens.tolist())
+        if len(set(kv_seq_lens)) != 1:
+            raise ValueError(
+                "strict CP fallback currently requires equal KV lengths across the batch"
+            )
+        total_kv_tokens = kv_seq_lens[0]
+        if cp_plan.expected_kv_token_range != (0, total_kv_tokens):
+            raise ValueError(
+                "CP block manifest must cover the complete logical KV token range"
+            )
+
+        query_start, query_end = cp_plan.query_token_ranges[cp_plan.parallel.cp_rank]
+        local_q = q[:, :, query_start:query_end, :].contiguous()
+        try:
+            gathered_q = communication.all_gather_query(local_q, cp_plan)
+        except AttributeError as exc:
+            raise FlashInferUnavailable(
+                "strict CP communication must implement the query AllGather boundary"
+            ) from exc
+        if gathered_q.shape != q.shape:
+            raise FlashInferUnavailable(
+                "query AllGather did not reconstruct the complete logical Q tensor"
+            )
+
+        logical_k, logical_v, logical_key_positions = _materialize_logical_kv_cache(
+            k_cache,
+            v_cache,
+            metadata,
+            total_kv_tokens=total_kv_tokens,
+        )
+        rope = NativeRoPEOp()
+        q_ready = gathered_q
+        if cfg.rope.q_rope_state == "pre_rope":
+            q_ready = rope.forward_fp32(
+                gathered_q,
+                metadata.query_position_ids,
+                theta=cfg.rope.rope_theta,
+            ).to(gathered_q.dtype)
+        k_ready = logical_k
+        if cfg.rope.k_cache_rope_state == "pre_rope":
+            k_ready = rope.forward_fp32(
+                logical_k,
+                logical_key_positions,
+                theta=cfg.rope.rope_theta,
+            ).to(logical_k.dtype)
+
+        reference = DeterministicCPAttentionReferenceOp()
+        local_states = []
+        for block in cp_plan.expected_blocks:
+            if block.owner_cp_rank != cp_plan.parallel.cp_rank:
+                continue
+            partial = reference.local_partial_state(
+                q_ready,
+                k_ready[:, :, block.kv_block_start : block.kv_block_end, :],
+                logical_v[:, :, block.kv_block_start : block.kv_block_end, :],
+                q_start=0,
+                k_start=block.kv_block_start,
+                total_kv_len=total_kv_tokens,
+                total_query_len=q_ready.size(2),
+                causal=cfg.causal,
+                scale=cfg.softmax_scale,
+                query_position_offsets=metadata.query_position_ids[:, 0],
+                key_position_offsets=logical_key_positions[:, 0],
+            )
+            local_states.append(
+                AttentionCPPartialState(
+                    out=partial.out,
+                    lse=partial.lse,
+                    block=block,
+                )
+            )
+        gathered_states = communication.all_gather_partial_states(
+            tuple(local_states),
+            cp_plan,
+        )
+        merged = merge_attention_partial_states(
+            [
+                AttentionPartialState(
+                    out=state.out,
+                    lse=state.lse,
+                    block_start=state.block.kv_block_start,
+                    block_end=state.block.kv_block_end,
+                )
+                for state in gathered_states
+            ]
+        )
+        local = communication.reduce_scatter_merged_state(
+            AttentionCPMergedState(out=merged.out, lse=merged.lse),
+            cp_plan,
+        )
+
+        kv_chunk_size = (
+            cfg.split_kv.fixed_split_size
+            if cfg.split_kv.mode is SplitKVMode.FIXED
+            else None
+        )
+        runtime_plan_set = build_reference_split_kv_runtime_plan_set(
+            kv_seq_lens,
+            tp_world_size=cp_plan.parallel.tp_world_size,
+            cp_world_size=cp_plan.parallel.cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_fallback",
+        )
+        actual_plans = tuple(
+            cfg.split_kv.resolve(length, backend="deterministic_cp_fallback")
+            for length in kv_seq_lens
+        )
+        applied_split_knobs = (
+            {"fixed_split_size": cfg.split_kv.fixed_split_size}
+            if cfg.split_kv.mode is SplitKVMode.FIXED
+            else {"disable_split_kv": True}
+        )
+        provenance = {
+            "attention_backend": "deterministic_cp_fallback",
+            "requested_backend": "flashinfer_qwen3_rope_paged_attention",
+            "actual_backend": "rlkernel_deterministic_cp_reference",
+            "attention_mode": cfg.mode,
+            "materialization": "logical_paged_kv_owner_local",
+            "kv_layout": cfg.kv_layout,
+            "causal": cfg.causal,
+            "softmax_scale": cfg.softmax_scale,
+            "lse_domain": "attention",
+            "lse_exported": True,
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "lse_dtype": "fp32",
+            "arithmetic_plan_source": "rlkernel_deterministic_cp_reference",
+            "arithmetic_semantics_verified": True,
+            "fallback": True,
+            "fallback_reason": "flashinfer_owner_local_cp_partial_api_unavailable",
+            "paged_kv_policy": "validated_logical_page_table",
+            "cp_comm_required": True,
+            "query_ag": "cp_rank_order",
+            "query_range": [query_start, query_end],
+        }
+        provenance.update(cfg.rope.provenance(q.size(-1)))
+        provenance.update(
+            _split_kv_provenance(
+                cfg.split_kv,
+                actual_plans,
+                applied_plan_kwargs=applied_split_knobs,
+                require_batch_invariant=cfg.require_batch_invariant,
+            )
+        )
+        provenance["actual_split_kv_plan_set"] = runtime_plan_set.to_dict()
+        provenance.update(cp_plan.provenance())
+        provenance.update(paged_plan.provenance())
+        return FlashInferAttentionResult(
+            out=local.out.to(dtype=q.dtype),
+            lse=local.lse,
             provenance=provenance,
         )
 
@@ -936,6 +1135,37 @@ def _validate_flashinfer_rope_metadata(
             "FlashInfer implicit RoPE positions require queries to be the trailing "
             "contiguous positions of each KV sequence"
         )
+
+
+def _materialize_logical_kv_cache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    metadata: Any,
+    *,
+    total_kv_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Restore paged KV to logical order for the deterministic CP fallback."""
+
+    page_size = int(metadata.page_size)
+    block_count = (total_kv_tokens + page_size - 1) // page_size
+    logical_k: list[torch.Tensor] = []
+    logical_v: list[torch.Tensor] = []
+    logical_positions: list[torch.Tensor] = []
+    for batch_index in range(k_cache.size(0)):
+        pages = metadata.block_table[batch_index, :block_count].long()
+        token_index = torch.arange(total_kv_tokens, device=k_cache.device, dtype=torch.long)
+        slots = pages[token_index // page_size] * page_size + token_index % page_size
+        logical_k.append(k_cache[batch_index, :, slots, :])
+        logical_v.append(v_cache[batch_index, :, slots, :])
+        if hasattr(metadata, "key_position_ids"):
+            logical_positions.append(metadata.key_position_ids[batch_index, slots].long())
+        else:
+            logical_positions.append(token_index)
+    return (
+        torch.stack(logical_k, dim=0).contiguous(),
+        torch.stack(logical_v, dim=0).contiguous(),
+        torch.stack(logical_positions, dim=0).contiguous(),
+    )
 
 
 def flashinfer_prefix_cache_fingerprint(

@@ -289,6 +289,9 @@ class _FakeNCCLDistributed:
 
 
 class _FakeCPCommunication:
+    def all_gather_query(self, local_q, plan):
+        return torch.cat([local_q] * plan.parallel.cp_world_size, dim=2)
+
     def all_gather_partial_states(self, local_states, plan):
         local = local_states[0]
         remote_block = next(
@@ -307,6 +310,24 @@ class _FakeCPCommunication:
             out=merged_state.out[:, :, start:end, :],
             lse=merged_state.lse[:, :, start:end],
         )
+
+
+class _FakeDeterministicCollective:
+    world_size = 2
+
+    @staticmethod
+    def all_gather(tensor):
+        return torch.cat((tensor, tensor + 10), dim=0)
+
+    @staticmethod
+    def reduce_scatter(tensor):
+        return tensor.chunk(2, dim=0)[0].contiguous()
+
+
+class _FakeCollectiveDist:
+    @staticmethod
+    def all_gather_object(outputs, value, group=None):
+        outputs[:] = [value, value]
 
 
 def test_flashinfer_pr7_prefill_adapter_passes_qwen3_rope_and_splitk_policy():
@@ -376,25 +397,47 @@ def test_flashinfer_pr7_prefill_adapter_passes_qwen3_rope_and_splitk_policy():
     assert plan["disable_split_kv"] is False
 
 
-def test_flashinfer_pr7_rejects_full_kv_output_as_cp_partial_state():
-    q, k, v = _qkv(query_len=1)
-    metadata = _metadata(query_len=1)
-    plan = _p2p_plan()
+def test_flashinfer_pr7_required_cp_comm_uses_explicit_deterministic_fallback():
+    q, k, v = _qkv(query_len=2)
+    metadata = _metadata(query_len=2)
+    plan = AttentionCPCommunicationPlan(
+        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        backend="p2p_nccl_reference",
+        status="implemented",
+        expected_blocks=(
+            AttentionCPBlockMetadata(0, 0, 3, 0, 0),
+            AttentionCPBlockMetadata(1, 3, 6, 1, 0),
+        ),
+        expected_kv_token_range=(0, 6),
+        query_token_ranges=((0, 1), (1, 2)),
+    )
     config = FlashInferPagedAttentionConfig(
-        mode="decode",
+        mode="prefill",
         workspace_size_bytes=1024,
         cp_comm_plan=plan,
         require_cp_comm=True,
         cp_communication=_FakeCPCommunication(),
     )
-    with pytest.raises(ValueError, match="complete logical KV cache"):
-        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
-            q,
-            k,
-            v,
-            metadata,
-            config=config,
-        )
+    result = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+        q,
+        k,
+        v,
+        metadata,
+        config=config,
+    )
+
+    assert result.out.shape == (q.size(0), q.size(1), 1, q.size(3))
+    assert result.lse.shape == (q.size(0), q.size(1), 1)
+    assert result.provenance["actual_backend"] == "rlkernel_deterministic_cp_reference"
+    assert result.provenance["fallback"] is True
+    assert result.provenance["fallback_reason"] == (
+        "flashinfer_owner_local_cp_partial_api_unavailable"
+    )
+    assert result.provenance["cp_comm_required"] is True
+    assert result.provenance["query_ag"] == "cp_rank_order"
+    assert result.provenance["actual_split_kv_plan_set"]["coverage"] == (
+        "complete_batch_tp_cp_owner_cartesian_product"
+    )
 
 
 def test_flashinfer_pr7_decode_adapter_can_disable_splitk_for_strict_candidate():
@@ -716,12 +759,12 @@ def test_flashinfer_pr7_rejects_non_fp32_runtime_lse():
         )
 
 
-def test_flashinfer_pr7_rejects_required_cp_comm_until_cuda_ag_rs_ops_exist():
+def test_flashinfer_pr7_required_cp_comm_needs_implemented_plan():
     q, k, v = _qkv(query_len=1)
     metadata = _metadata(query_len=1)
     op = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())
 
-    with pytest.raises(ValueError, match="complete logical KV cache"):
+    with pytest.raises(ValueError, match="implemented CP communication plan"):
         op(
             q,
             k,
@@ -735,7 +778,7 @@ def test_flashinfer_pr7_rejects_required_cp_comm_until_cuda_ag_rs_ops_exist():
         )
 
 
-def test_flashinfer_pr7_rejects_implemented_cp_comm_status_in_scaffold():
+def test_flashinfer_pr7_implemented_cp_comm_status_requires_execution():
     config = FlashInferPagedAttentionConfig(
         cp_comm_plan=AttentionCPCommunicationPlan(
             parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
@@ -910,7 +953,8 @@ def test_flashinfer_pr7_rejects_stale_prefix_cache_content():
 
 def test_attention_cp_partial_states_sort_by_global_block_index():
     plan = AttentionCPCommunicationPlan(
-        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2)
+        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        status="implemented",
     )
 
     ordered = sort_attention_cp_partial_states(
@@ -933,21 +977,64 @@ def test_attention_cp_partial_states_reject_duplicate_global_block_index():
         )
 
 
-def test_cuda_ag_rs_attention_cp_comm_is_interface_only():
+def test_cuda_ag_rs_attention_cp_comm_requires_compiled_collective():
     plan = AttentionCPCommunicationPlan(
-        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2)
+        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        status="implemented",
     )
     communication = CUDAAGRSAttentionCPCommunication()
 
-    with pytest.raises(AttentionCPCommunicationUnavailable, match="CUDA AG"):
+    with pytest.raises(AttentionCPCommunicationUnavailable, match="requires CUDA"):
         communication.all_gather_partial_states((_partial_state(0),), plan)
 
     merged = AttentionCPMergedState(
         out=torch.zeros(1, 2, 1, 4),
         lse=torch.zeros(1, 2, 1, dtype=torch.float32),
     )
-    with pytest.raises(AttentionCPCommunicationUnavailable, match="CUDA RS"):
+    with pytest.raises(AttentionCPCommunicationUnavailable, match="requires CUDA"):
         communication.reduce_scatter_merged_state(merged, plan)
+
+
+def test_cuda_ag_rs_attention_cp_comm_executes_injected_collective(monkeypatch):
+    plan = AttentionCPCommunicationPlan(
+        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        backend="cuda_ag_rs",
+        status="implemented",
+        expected_blocks=(
+            AttentionCPBlockMetadata(0, 0, 2, 0, 0),
+            AttentionCPBlockMetadata(1, 2, 4, 1, 0),
+        ),
+        expected_kv_token_range=(0, 4),
+        query_token_ranges=((0, 1), (1, 2)),
+    )
+    communication = CUDAAGRSAttentionCPCommunication(
+        collective=_FakeDeterministicCollective()
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(communication, "_dist", lambda: _FakeCollectiveDist())
+
+    local_q = torch.zeros(1, 2, 1, 4)
+    gathered_q = communication.all_gather_query(local_q, plan)
+    assert gathered_q.shape == (1, 2, 2, 4)
+    assert torch.equal(gathered_q[:, :, :1, :], local_q)
+    assert torch.equal(gathered_q[:, :, 1:, :], local_q + 10)
+
+    local_state = AttentionCPPartialState(
+        out=torch.zeros(1, 2, 2, 4),
+        lse=torch.zeros(1, 2, 2, dtype=torch.float32),
+        block=plan.expected_blocks[0],
+    )
+    gathered = communication.all_gather_partial_states((local_state,), plan)
+    assert [state.block.global_block_index for state in gathered] == [0, 1]
+    assert torch.equal(gathered[1].out, local_state.out + 10)
+
+    merged = AttentionCPMergedState(
+        out=torch.arange(16, dtype=torch.float32).reshape(1, 2, 2, 4),
+        lse=torch.arange(4, dtype=torch.float32).reshape(1, 2, 2),
+    )
+    shard = communication.reduce_scatter_merged_state(merged, plan)
+    assert torch.equal(shard.out, merged.out[:, :, :1, :])
+    assert torch.equal(shard.lse, merged.lse[:, :, :1])
 
 
 def test_cp_manifest_rejects_gap_wrong_owner_and_incomplete_gather():
@@ -994,6 +1081,21 @@ def test_cp_manifest_rejects_wrong_local_cp_owner():
 
     with pytest.raises(ValueError, match="wrong CP owner"):
         communication.all_gather_partial_states((wrong_owner,), _p2p_plan())
+
+
+def test_p2p_nccl_reference_query_ag_preserves_cp_rank_order():
+    local_q = torch.zeros(1, 2, 1, 4)
+    remote_q = torch.ones_like(local_q)
+    communication = P2PNCCLAttentionCPCommunication(
+        dist_module=_FakeNCCLDistributed(rank=0, receive_payloads=[remote_q]),
+        validate_cuda_tensors=False,
+    )
+
+    gathered = communication.all_gather_query(local_q, _p2p_plan())
+
+    assert gathered.shape == (1, 2, 2, 4)
+    assert torch.equal(gathered[:, :, :1, :], local_q)
+    assert torch.equal(gathered[:, :, 1:, :], remote_q)
 
 
 def test_cp_manifest_allows_sparse_global_block_indices_and_rejects_short_query_state():

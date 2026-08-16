@@ -1,6 +1,6 @@
 # WS2 PR7 Fused Attention Backend Alignment
 
-Status: PR7 scaffold for #235
+Status: PR7 candidate plus deterministic communication integration for #235
 
 ## Goal
 
@@ -43,7 +43,7 @@ reconstructs the states required by the contract and passes the drift gates.
 | Training path | Training-side forward is full-prefill / teacher-forcing.  TE may be evaluated through its public `DotProductAttention` path, not by redefining RL-Kernel semantics. |
 | Rollout path | Rollout-side forward is paged KV prefill/decode.  FlashInfer is a rollout candidate, not a training backward backend. |
 | LSE | Candidate must return attention-domain `lse` shaped as `[B, Hq, Sq]`. |
-| CP/TP communication | PR7 exposes the `TP=2, CP=2` custom CUDA AG/RS communication interface.  Real communication kernels are future work and fail-closed in this scaffold. |
+| CP/TP communication | PR7 preserves the P2P NCCL reference and maps the production `cuda_ag_rs` path to the deterministic CUDA AllGather/ReduceScatter operators from PR311/PR312. Missing compiled operators fail closed. |
 | CP order | CP correctness remains PR3's `global_block_index` merge.  A black-box backend that only returns final output must be validated against PR3/PR6; it cannot define CP merge order. |
 | Paged KV | Page table, `cache_position`, `query_position_ids`, `key_position_ids`, and logical token order must be validated before execution. |
 | Precision | Record accumulation/downcast policy.  BF16 output is acceptable only after FP32/reference drift is reported. |
@@ -91,26 +91,29 @@ FlashInferQwen3PagedAttentionOp.forward(...)
 
 ## CP/TP Communication Interface
 
-Issue #235 targets `Qwen3-8B, TP=2, CP=2, BF16`.  PR7 therefore surfaces the
-distributed attention boundary even though the real custom CUDA communication
-operators are not implemented in this scaffold.
+Issue #235 targets `Qwen3-8B, TP=2, CP=2, BF16`. PR7 surfaces the distributed
+attention boundary and reuses the self-owned deterministic CUDA collectives.
 
 The exposed interface is:
 
 ```text
 AttentionParallelSpec(tp_world_size=2, cp_world_size=2)
-AttentionCPCommunicationPlan(backend="cuda_ag_rs", status="interface_only")
+AttentionCPCommunicationPlan(backend="cuda_ag_rs", status="implemented")
 AttentionCPPartialState(out, lse, AttentionCPBlockMetadata(...))
+CUDAAGRSAttentionCPCommunication.all_gather_query(...)
 CUDAAGRSAttentionCPCommunication.all_gather_partial_states(...)
 CUDAAGRSAttentionCPCommunication.reduce_scatter_merged_state(...)
 sort_attention_cp_partial_states(..., plan=...)
 ```
 
-The future custom CUDA AG/RS operators must move attention-domain partial states
-with compute and communication kept decoupled:
+The CP execution order is explicit and keeps compute and communication
+decoupled:
 
 ```text
-per-rank local attention over rank-owned KV blocks
+local Q shard
+  -> custom CUDA AG operator
+  -> full logical Q
+owner-local attention over rank-owned KV blocks
   -> AttentionCPPartialState(
        out: [B, Hq, Sq, D],
        lse: [B, Hq, Sq] fp32,
@@ -124,15 +127,14 @@ per-rank local attention over rank-owned KV blocks
   -> custom CUDA RS communication operator
 ```
 
-In this PR, `CUDAAGRSAttentionCPCommunication.all_gather_partial_states(...)`
-and `CUDAAGRSAttentionCPCommunication.reduce_scatter_merged_state(...)` are
-fail-closed placeholders and raise `AttentionCPCommunicationUnavailable`.
-Likewise, `FlashInferPagedAttentionConfig(require_cp_comm=True)` raises before
-execution. FlashInfer currently evaluates the complete logical KV cache; that
-final state is not an owner-local CP partial state and must not be merged again.
-The standalone P2P NCCL reference remains executable for transport validation.
-The fused path can enable CP only after it computes owner-local KV partial
-states and the self-owned CUDA AG/RS operators are implemented.
+`CUDAAGRSAttentionCPCommunication` uses the self-owned deterministic CUDA
+collectives from PR311/PR312 for Q AG, partial-state AG, and the final RS.
+`P2PNCCLAttentionCPCommunication` keeps the same contract as a correctness
+reference.  Because the public FlashInfer wrapper does not expose owner-local
+partial states, `FlashInferPagedAttentionConfig(require_cp_comm=True)` takes
+the deterministic CP fallback: it restores logical paged KV, computes each
+owner block in FP32, merges by `global_block_index`, and records the fallback
+reason.  It never labels a complete-KV FlashInfer result as a CP partial.
 
 Ordering is part of the interface:
 
@@ -283,7 +285,7 @@ shared gate:
 | --- | --- | --- |
 | RoPE fusion vs PR2/PR6 post-RoPE references | A fused backend might hide post-RoPE Q/K state. | PR7 records `rope_fusion_boundary`, rejects post-RoPE inputs for this path, and compares final `out/lse` against references. |
 | FlashInfer split-KV vs PR3 CP merge order | FlashInfer internal split-KV order is not PR3 `global_block_index`. | Treat split-KV as backend-local reduction.  CP merge remains PR3; FlashInfer must pass drift gates and cannot define CP order. |
-| CP=2/TP=2 target vs missing communication operator | The issue requires distributed semantics, but the custom CUDA AG/RS communication operators are not ready. | PR7 exposes `AttentionCPCommunicationPlan` / `AttentionCPPartialState` / `CUDAAGRSAttentionCPCommunication` as interface-only, and fails if execution is required. |
+| CP=2/TP=2 target vs communication ordering | The issue requires actual distributed semantics, not an interface claim. | `CUDAAGRSAttentionCPCommunication` executes PR311/PR312, keeps FP32 partial states, sorts the authoritative manifest by `global_block_index`, and fails closed if the compiled collective is absent. |
 | Batch-invariant claim vs backend heuristics | Auto split-KV may depend on batch composition/runtime scheduling. | Reject `auto` when `require_batch_invariant=True`; report disabled/fixed policy explicitly. |
 | TE training lane vs FlashInfer rollout lane | Two libraries may have different materialization boundaries. | Both bind to the same RL-Kernel semantic contract and are judged by shared `out/lse/dlogp` reports. |
 | Requested policy vs actual plan | A requested fixed/max-splits knob may not equal the runtime token boundaries. | Require actual runtime plan callbacks in strict fixed mode; fail closed when unavailable. |
@@ -348,16 +350,17 @@ fallback / fallback_reason
 
 ## Non-Claims
 
-This scaffold does not enable FlashInfer by default, does not implement the TE
-training lane, does not implement the custom CUDA AG/RS communication operators,
-does not replace PR3 CP merge, does not prove real H-card batch-invariance
-locally, and does not implement training backward.
+This candidate does not enable FlashInfer by default, does not implement the TE
+training lane, does not replace PR3 CP merge, does not prove real H-card
+batch-invariance locally, and does not implement training backward.
 # P2P NCCL reference and strict arithmetic provenance
 
-The existing `CUDAAGRSAttentionCPCommunication` interface is preserved and
-remains fail-closed until the self-owned CUDA AG/RS kernels exist.  For GPU
-validation, `P2PNCCLAttentionCPCommunication` implements the same partial-state
-protocol with `torch.distributed.batch_isend_irecv` on an NCCL process group.
+The existing `CUDAAGRSAttentionCPCommunication` interface is preserved and now
+uses the self-owned deterministic CUDA AG/RS implementation. It remains
+fail-closed when PR311/PR312 or their compiled symbols are absent. For GPU
+reference validation, `P2PNCCLAttentionCPCommunication` implements the same partial-state
+and Q-AG protocol with `torch.distributed.batch_isend_irecv` on an NCCL process
+group.
 It requires an authoritative manifest containing every logical KV block,
 token range, CP owner, TP owner, and query scatter range.  Missing blocks,
 gaps, overlaps, wrong owners, incomplete gathers, non-NCCL groups, and CPU

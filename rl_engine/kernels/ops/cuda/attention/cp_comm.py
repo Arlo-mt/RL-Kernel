@@ -1,28 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""CP/TP attention communication interfaces and a P2P NCCL reference.
+"""CP/TP attention communication and a P2P NCCL reference.
 
 PR7 evaluates fused attention backends for the #235 target
-``Qwen3-8B, TP=2, CP=2, BF16``.  The self-owned CUDA communication operators are
-AG/RS and compute-communication decoupled.  They are not implemented in this
-scaffold, but their interface is exposed here so backend adapters cannot
-silently ignore the distributed contract.
+``Qwen3-8B, TP=2, CP=2, BF16``. The self-owned CUDA communication operators are
+AG/RS and compute-communication decoupled. This module adapts the deterministic
+collectives from PR311/PR312 to the Attention partial-state contract.
 
 The production communication path is expected to move attention partial states:
 
 ```text
-local FlashInfer/TE attention over rank-owned KV blocks
+owner-local deterministic fallback or TE attention over rank-owned KV blocks
   -> AttentionCPPartialState(out, lse, global_block_index, tp/cp rank metadata)
   -> custom CUDA AG communication operator
   -> sort by global_block_index
   -> PR3 FP32 online-softmax merge
   -> custom CUDA RS communication operator
 ```
-The custom CUDA AG/RS interface remains fail-closed.  The P2P NCCL backend is
-an intentionally simple, correctness-first implementation of the same
-protocol: it exchanges tensors peer-to-peer, reconstructs metadata from an
-authoritative manifest, and validates complete logical coverage before merge.
+The CUDA backend uses the self-owned deterministic CUDA collectives when PR311 /
+PR312 are present.  It keeps the same manifest and FP32 merge contract as the
+P2P NCCL reference, and fails closed when those compiled operators are absent.
 """
 
 from __future__ import annotations
@@ -221,7 +219,14 @@ class AttentionCPCommunicationPlan:
 
 
 class AttentionCPCommunication(Protocol):
-    """Protocol future custom CUDA AG/RS communication operators must implement."""
+    """Protocol implemented by custom CUDA AG/RS communication operators."""
+
+    def all_gather_query(
+        self,
+        local_q: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> torch.Tensor:
+        """Gather the query sequence shards in logical CP-rank order."""
 
     def all_gather_partial_states(
         self,
@@ -239,33 +244,141 @@ class AttentionCPCommunication(Protocol):
 
 
 class CUDAAGRSAttentionCPCommunication:
-    """Fail-closed placeholder for future custom CUDA AG/RS communication operators."""
+    """Deterministic CUDA AG/RS adapter backed by PR311/PR312."""
+
+    def __init__(self, *, process_group: Any = None, collective: Any = None) -> None:
+        self._process_group = process_group
+        self._collective = collective
+
+    def _get_collective(self, plan: AttentionCPCommunicationPlan):
+        if self._collective is not None:
+            return self._collective
+        try:
+            from rl_engine.distributed import DeterministicCollective
+        except ImportError as exc:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG/RS requires PR311/PR312 DeterministicCollective"
+            ) from exc
+        try:
+            self._collective = DeterministicCollective(
+                group=self._process_group,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise AttentionCPCommunicationUnavailable(
+                f"self-owned CUDA AG/RS is unavailable: {exc}"
+            ) from exc
+        if self._collective.world_size != plan.parallel.cp_world_size:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned collective world size does not match CP communication plan"
+            )
+        return self._collective
+
+    def all_gather_query(
+        self,
+        local_q: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> torch.Tensor:
+        """Gather Q with the self-owned CUDA AG operator.
+
+        The collective works on the leading dimension, so Q is temporarily
+        laid out as ``[S_local, B, H, D]``.  The returned tensor is restored to
+        the Attention layout ``[B, H, S_global, D]`` in CP-rank order.
+        """
+
+        self._validate_cuda_plan(plan)
+        _validate_query_shard(local_q, plan)
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG requires equal query shard lengths"
+            )
+        collective = self._get_collective(plan)
+        packed = local_q.permute(2, 0, 1, 3).contiguous()
+        gathered = collective.all_gather(packed)
+        query_tokens, batch, heads, dim = gathered.shape
+        return gathered.reshape(query_tokens, batch, heads, dim).permute(1, 2, 0, 3).contiguous()
 
     def all_gather_partial_states(
         self,
         local_states: tuple[AttentionCPPartialState, ...],
         plan: AttentionCPCommunicationPlan,
     ) -> tuple[AttentionCPPartialState, ...]:
-        plan.validate()
-        for state in local_states:
-            state.validate(plan.parallel)
-        raise AttentionCPCommunicationUnavailable(
-            "custom CUDA AG attention communication is interface-only in this PR7 scaffold; "
-            "future implementation must gather AttentionCPPartialState tensors before "
-            "global_block_index sorting and PR3 FP32 merge"
-        )
+        self._validate_cuda_plan(plan)
+        _validate_local_partial_states(local_states, plan)
+        ordered = tuple(sorted(local_states, key=lambda state: state.block.global_block_index))
+        block_count = len(ordered)
+        counts = [None] * plan.parallel.cp_world_size
+        self._dist().all_gather_object(counts, block_count, group=self._process_group)
+        if any(count != block_count for count in counts):
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG requires equal block counts on all CP ranks"
+            )
+        collective = self._get_collective(plan)
+        packed_out = torch.stack([state.out for state in ordered], dim=0).contiguous()
+        packed_lse = torch.stack([state.lse for state in ordered], dim=0).contiguous()
+        gathered_out = collective.all_gather(packed_out)
+        gathered_lse = collective.all_gather(packed_lse)
+        received: list[AttentionCPPartialState] = []
+        blocks_by_rank = [
+            _expected_blocks_for_cp_rank(plan, cp_rank)
+            for cp_rank in range(plan.parallel.cp_world_size)
+        ]
+        for cp_rank, blocks in enumerate(blocks_by_rank):
+            for block_index, block in enumerate(blocks):
+                row = cp_rank * block_count + block_index
+                received.append(
+                    AttentionCPPartialState(
+                        out=gathered_out[row],
+                        lse=gathered_lse[row],
+                        block=block,
+                    )
+                )
+        return sort_attention_cp_partial_states(tuple(received), plan=plan)
 
     def reduce_scatter_merged_state(
         self,
         merged_state: AttentionCPMergedState,
         plan: AttentionCPCommunicationPlan,
     ) -> AttentionCPMergedState:
-        plan.validate()
+        self._validate_cuda_plan(plan)
         merged_state.validate()
-        raise AttentionCPCommunicationUnavailable(
-            "custom CUDA RS attention communication is interface-only in this PR7 scaffold; "
-            "future implementation must scatter the PR3-merged attention state to CP ranks"
-        )
+        ranges = plan.query_token_ranges
+        if not ranges or len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA RS currently requires equal contiguous query ranges"
+            )
+        collective = self._get_collective(plan)
+        rank = plan.parallel.cp_rank
+        root = plan.merge_root_cp_rank
+        out_input = merged_state.out.permute(2, 0, 1, 3).contiguous()
+        lse_input = merged_state.lse.permute(2, 0, 1).contiguous()
+        if rank != root:
+            out_input = torch.zeros_like(out_input)
+            lse_input = torch.zeros_like(lse_input)
+        out_local = collective.reduce_scatter(out_input).permute(1, 2, 0, 3).contiguous()
+        lse_local = collective.reduce_scatter(lse_input).permute(1, 2, 0).contiguous()
+        result = AttentionCPMergedState(out=out_local, lse=lse_local)
+        result.validate()
+        return result
+
+    def _dist(self):
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG/RS requires initialized torch.distributed"
+            )
+        return dist
+
+    def _validate_cuda_plan(self, plan: AttentionCPCommunicationPlan) -> None:
+        plan.validate()
+        if plan.backend != "cuda_ag_rs" or plan.status != "implemented":
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA AG/RS requires an implemented cuda_ag_rs plan"
+            )
+        if not torch.cuda.is_available():
+            raise AttentionCPCommunicationUnavailable("self-owned CUDA AG/RS requires CUDA")
 
 
 class P2PNCCLAttentionCPCommunication:
@@ -292,6 +405,48 @@ class P2PNCCLAttentionCPCommunication:
         self._dist = dist_module
         self._group = process_group
         self._validate_cuda_tensors = validate_cuda_tensors
+
+    def all_gather_query(
+        self,
+        local_q: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> torch.Tensor:
+        """Reference query AG implemented with explicit NCCL P2P traffic."""
+
+        self._validate_runtime(plan)
+        _validate_query_shard(local_q, plan)
+        self._require_cuda(local_q)
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "P2P NCCL query AG currently requires equal query shard lengths"
+            )
+        received: dict[int, torch.Tensor] = {
+            plan.parallel.cp_rank: local_q.contiguous()
+        }
+        operations: list[Any] = []
+        for peer_cp_rank in range(plan.parallel.cp_world_size):
+            if peer_cp_rank == plan.parallel.cp_rank:
+                continue
+            peer = self._global_peer(peer_cp_rank)
+            remote = torch.empty_like(local_q)
+            received[peer_cp_rank] = remote
+            operations.extend(
+                (
+                    self._dist.P2POp(self._dist.irecv, remote, peer, group=self._group),
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        local_q.contiguous(),
+                        peer,
+                        group=self._group,
+                    ),
+                )
+            )
+        self._run_operations(operations)
+        return torch.cat(
+            [received[rank] for rank in range(plan.parallel.cp_world_size)],
+            dim=2,
+        )
 
     def all_gather_partial_states(
         self,
@@ -601,6 +756,19 @@ def _validate_query_token_ranges(plan: AttentionCPCommunicationPlan) -> None:
         previous_end = end
     if previous_end == 0:
         raise ValueError("query token ranges must cover at least one query token")
+
+
+def _validate_query_shard(
+    local_q: torch.Tensor,
+    plan: AttentionCPCommunicationPlan,
+) -> None:
+    if local_q.ndim != 4:
+        raise ValueError("local Q must have shape [B, Hq, Sq_local, D]")
+    if not plan.query_token_ranges:
+        raise ValueError("query AG requires query_token_ranges")
+    start, end = plan.query_token_ranges[plan.parallel.cp_rank]
+    if local_q.size(2) != end - start:
+        raise ValueError("local Q sequence length does not match its query_token_range")
 
 
 def _validate_local_partial_states(

@@ -147,13 +147,17 @@ def run_check(
         expected_kv_token_range=(0, args.seq_len),
         query_token_ranges=owner_ranges,
     )
+    communication = P2PNCCLAttentionCPCommunication()
+    q_local = q[:, :, owner_ranges[rank][0] : owner_ranges[rank][1], :].contiguous()
+    q_gathered = communication.all_gather_query(q_local, plan)
+    query_ag_max_abs = float((q_gathered - q).abs().max().item())
     reference = DeterministicCPAttentionReferenceOp()
     local_states: list[AttentionCPPartialState] = []
     for block in reversed(blocks):
         if block.owner_cp_rank != rank:
             continue
         state = reference.local_partial_state(
-            q,
+            q_gathered,
             k[:, :, block.kv_block_start : block.kv_block_end, :],
             v[:, :, block.kv_block_start : block.kv_block_end, :],
             q_start=0,
@@ -164,7 +168,6 @@ def run_check(
         )
         local_states.append(AttentionCPPartialState(state.out, state.lse, block))
 
-    communication = P2PNCCLAttentionCPCommunication()
     gathered = communication.all_gather_partial_states(tuple(local_states), plan)
     merged = merge_attention_partial_states(
         [
@@ -191,6 +194,7 @@ def run_check(
     gathered_indices = [state.block.global_block_index for state in gathered]
     passed = (
         gathered_indices == list(range(len(blocks)))
+        and query_ag_max_abs == 0.0
         and out_max_abs <= args.atol
         and lse_max_abs <= args.atol
         and final_out.dtype == q.dtype
@@ -205,6 +209,8 @@ def run_check(
         "downcast_at": "final_write",
         "final_output_dtype": str(final_out.dtype).removeprefix("torch."),
         "transport": "p2p_nccl_reference",
+        "query_ag": "p2p_nccl_reference",
+        "query_ag_max_abs": query_ag_max_abs,
         "query_range": [start, end],
         "expected_block_manifest": [block.provenance() for block in blocks],
         "gathered_block_indices": gathered_indices,
