@@ -61,7 +61,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-atol", type=float, default=2.0e-4)
     parser.add_argument("--lse-atol", type=float, default=2.0e-4)
-    parser.add_argument("--dlogp-atol", type=float, default=1.0e-4)
+    # The synthetic dlogp leg consumes the final BF16 Attention write. Use
+    # the shared WS1 logprob/BF16 tolerance instead of an FP32-only threshold.
+    parser.add_argument("--dlogp-atol", type=float, default=5.0e-2)
     parser.add_argument("--grad-atol", type=float, default=5.0e-2)
     return parser.parse_args(argv)
 

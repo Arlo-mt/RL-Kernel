@@ -40,6 +40,12 @@ def test_matrix_contains_required_modes_splitk_and_communication(tmp_path):
     assert "custom_cuda_ag_rs" in names
 
 
+def test_dlogp_default_uses_shared_bf16_logprob_tolerance(tmp_path):
+    args = parse_args(["--output", str(tmp_path / "acceptance.json")])
+
+    assert args.dlogp_atol == 5.0e-2
+
+
 def test_run_mode_does_not_pass_when_reports_are_missing(tmp_path):
     args = parse_args(
         [
