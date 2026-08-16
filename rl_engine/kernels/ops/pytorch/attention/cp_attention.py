@@ -224,6 +224,38 @@ class DeterministicCPAttentionReferenceOp:
             backend="deterministic_cp_reference",
         )
 
+    @staticmethod
+    def execution_provenance(
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> dict[str, object]:
+        """Describe the reference boundary without claiming production communication."""
+
+        plans = split_kv_execution_plan_provenance(
+            total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_reference",
+        )
+        return {
+            "execution_scope": "logical_single_process_cp_reference",
+            "runtime_verified": False,
+            "input_boundary": "projected_post_qk_norm_post_rope_qkv",
+            "query_scope": "logical_global_query_reference",
+            "kv_scope": "logical_owner_local_cp_shards",
+            "production_cp_protocol": "ag_query_local_kv_rs_out_lse",
+            "communication_executed": "none",
+            "partial_state": "fp32_out_attention_lse",
+            "merge_order": "global_block_index",
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "requested_split_kv_policy": "disabled" if kv_chunk_size is None else "fixed",
+            "requested_split_kv_size": kv_chunk_size,
+            "actual_split_kv_plans": plans,
+        }
+
     def __call__(
         self,
         q: torch.Tensor,

@@ -626,6 +626,27 @@ def test_invalid_scale_fails_before_attention_math(scale):
         op.forward_fp32_with_lse(q, k, v, scale=scale)
 
 
+def test_forward_reference_provenance_does_not_claim_production_communication():
+    provenance = DeterministicCPAttentionReferenceOp.execution_provenance(
+        8,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+
+    assert provenance["execution_scope"] == "logical_single_process_cp_reference"
+    assert provenance["query_scope"] == "logical_global_query_reference"
+    assert provenance["kv_scope"] == "logical_owner_local_cp_shards"
+    assert provenance["production_cp_protocol"] == "ag_query_local_kv_rs_out_lse"
+    assert provenance["communication_executed"] == "none"
+    assert provenance["merge_order"] == "global_block_index"
+    plans = provenance["actual_split_kv_plans"]
+    assert [plan["owner_cp_rank"] for plan in plans] == [0, 1]
+    assert [plan["actual_split_boundaries"] for plan in plans] == [
+        [[0, 2], [2, 4]],
+        [[4, 6], [6, 8]],
+    ]
+
+
 def test_qkv_dtype_and_floating_contract_fails_closed():
     op = DeterministicCPAttentionReferenceOp()
     q, k, v = _qkv(1, 4, 4, seed=25, heads=4, kv_heads=2, dim=8)
