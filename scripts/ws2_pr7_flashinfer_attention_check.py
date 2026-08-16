@@ -34,6 +34,7 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     FlashInferQwen3PagedAttentionOp,
     FlashInferRoPEFusionConfig,
     FlashInferSplitKVPolicy,
+    FlashInferUnavailable,
     build_flashinfer_paged_kv_plan,
 )
 from rl_engine.testing.attention_comparison import (  # noqa: E402
@@ -110,13 +111,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if device.type != "cuda":
         raise SystemExit("non-dry-run PR7 validation requires --device cuda")
     op = FlashInferQwen3PagedAttentionOp()
-    candidate = op(
-        inputs.q,
-        inputs.k_cache,
-        inputs.v_cache,
-        inputs.metadata,
-        config=config,
-    )
+    try:
+        candidate = op(
+            inputs.q,
+            inputs.k_cache,
+            inputs.v_cache,
+            inputs.metadata,
+            config=config,
+        )
+    except FlashInferUnavailable as exc:
+        # Keep optional dependency failures machine-readable while preserving
+        # a non-zero exit so aggregate acceptance cannot pass closed.
+        report.update(
+            {
+                "status": "not_available",
+                "passed": False,
+                "acceptance_eligible": False,
+                "errors": [f"FlashInfer unavailable: {exc}"],
+                "unavailable_reason": str(exc),
+            }
+        )
+        _emit(report, json_output=args.json, output=args.output)
+        return 1
     reference_inputs = replace(
         inputs,
         metadata=replace(

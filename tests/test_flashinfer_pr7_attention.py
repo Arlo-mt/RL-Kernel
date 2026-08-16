@@ -992,7 +992,7 @@ def test_cuda_ag_rs_attention_cp_comm_requires_compiled_collective():
 
     with pytest.raises(
         AttentionCPCommunicationUnavailable,
-        match="requires CUDA|requires initialized|unavailable|extension",
+        match="requires CUDA|requires initialized|unavailable|extension|DeterministicCollective",
     ):
         communication.all_gather_partial_states((_partial_state(0),), plan)
 
@@ -1002,7 +1002,7 @@ def test_cuda_ag_rs_attention_cp_comm_requires_compiled_collective():
     )
     with pytest.raises(
         AttentionCPCommunicationUnavailable,
-        match="requires CUDA|requires initialized|unavailable|extension",
+        match="requires CUDA|requires initialized|unavailable|extension|DeterministicCollective",
     ):
         communication.reduce_scatter_merged_state(merged, plan)
 
@@ -1316,6 +1316,26 @@ def test_pr7_check_dry_run_writes_non_eligible_report(tmp_path):
     assert report["status"] == "dry_run"
     assert report["passed"] is False
     assert report["acceptance_eligible"] is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for the real entrypoint")
+def test_pr7_check_writes_not_available_report_for_missing_flashinfer(monkeypatch, tmp_path):
+    class MissingFlashInfer:
+        def __call__(self, *args, **kwargs):
+            raise FlashInferUnavailable("No module named 'flashinfer'")
+
+    monkeypatch.setattr(check_script, "FlashInferQwen3PagedAttentionOp", MissingFlashInfer)
+    output = tmp_path / "pr7-not-available.json"
+
+    assert check_script.main(
+        ["--no-dry-run", "--device", "cuda", "--json", "--output", str(output)]
+    ) == 1
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["status"] == "not_available"
+    assert report["passed"] is False
+    assert report["acceptance_eligible"] is False
+    assert "FlashInfer unavailable" in report["errors"][0]
 
 
 def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
