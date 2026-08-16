@@ -497,6 +497,7 @@ def run_full_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult
             "attention_mode": "prefill",
             "materialization": "full_sequence",
             "lse_domain": "attention",
+            **_single_gpu_reference_provenance(),
         },
     )
 
@@ -604,6 +605,7 @@ def run_chunked_query_attention(
             "query_chunk_size": chunk_size,
             "chunk_bounds": [list(bound) for bound in chunk_bounds],
             "lse_domain": "attention",
+            **_single_gpu_reference_provenance(),
         },
     )
 
@@ -666,6 +668,7 @@ def run_paged_kv_attention(
         "lse_exported": True,
         "accum_dtype": "fp32",
         "downcast_at": "final_write",
+        **_single_gpu_reference_provenance(),
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
@@ -901,6 +904,28 @@ def _rope_attention_provenance(
         "rope_output_dtype": str(_rope_output_dtype(inputs)).replace("torch.", ""),
         "fusion_boundary": fusion_boundary,
         "lse_domain": "attention",
+        "preprocess_backends": {
+            "rope": "rlkernel.pytorch.rope_reference",
+            "qk_rmsnorm": "not_executed_projected_qk_input",
+        },
+        **_single_gpu_reference_provenance(),
+    }
+
+
+def _single_gpu_reference_provenance() -> dict[str, Any]:
+    return {
+        "execution_scope": "single_device_correctness_reference",
+        "runtime_verified": False,
+        "preprocess_policy": "reference_only_not_production",
+        "native_backend_executed": False,
+        "preprocess_fallback": True,
+        "preprocess_fallback_reason": (
+            "single-GPU attribution harness intentionally uses the PyTorch deterministic reference"
+        ),
+        "qkv_input_boundary": "projected_qkv",
+        "qkv_projection_executed": False,
+        "output_projection_executed": False,
+        "communication": "none",
     }
 
 

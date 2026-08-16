@@ -142,6 +142,10 @@ def test_single_gpu_attention_harness_reports_out_lse_and_dlogp_drift():
         assert drift.dlogp is not None
         assert drift.dlogp.active_count == 7
         assert drift.dlogp.p95_abs <= 1.0e-6
+        assert drift.provenance["execution_scope"] == "single_device_correctness_reference"
+        assert drift.provenance["native_backend_executed"] is False
+        assert drift.provenance["preprocess_fallback"] is True
+        assert drift.provenance["qkv_projection_executed"] is False
 
     payload = report.to_dict()
     assert payload["reference_name"] == "full_prefill"
@@ -212,6 +216,11 @@ def test_single_gpu_rope_attention_harness_reports_rope_and_attention_drift():
     assert drift.provenance["rotary_dim"] == base.q.size(-1)
     assert drift.provenance["rope_cast_at"] == "after_rope"
     assert drift.provenance["fusion_boundary"] == "fused_rope_attention"
+    assert drift.provenance["preprocess_backends"] == {
+        "rope": "rlkernel.pytorch.rope_reference",
+        "qk_rmsnorm": "not_executed_projected_qk_input",
+    }
+    assert drift.provenance["preprocess_policy"] == "reference_only_not_production"
 
     payload = report.to_dict()
     assert payload["drifts"][0]["post_rope_q"]["active_count"] == base.q.numel()
