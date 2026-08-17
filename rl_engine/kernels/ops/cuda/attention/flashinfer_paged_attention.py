@@ -25,6 +25,7 @@ from typing import Any, Literal
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
     AttentionContractError,
     SplitKVExecutionPlan,
     SplitKVMode,
@@ -40,6 +41,10 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPMergedState,
     AttentionCPPartialState,
     AttentionParallelSpec,
+)
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+    DeterministicAttentionCoreResult,
+    RLKernelDeterministicAttentionCore,
 )
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
@@ -125,6 +130,9 @@ class FlashInferPagedAttentionConfig:
     require_cp_comm: bool = False
     require_verified_arithmetic: bool = True
     cp_communication: AttentionCPCommunication | None = None
+    strict_mode: bool = False
+    deterministic_core: Any | None = None
+    strict_rope_op: Any | None = None
 
     def validate(self, *, head_dim: int, query_len: int) -> None:
         if self.mode not in {"prefill", "decode"}:
@@ -156,6 +164,28 @@ class FlashInferPagedAttentionConfig:
             raise ValueError("implemented CP communication plans require require_cp_comm=True")
         if not isinstance(self.require_verified_arithmetic, bool):
             raise ValueError("require_verified_arithmetic must be a bool")
+        if not isinstance(self.strict_mode, bool):
+            raise ValueError("strict_mode must be a bool")
+        if self.strict_mode:
+            if not self.require_batch_invariant:
+                raise ValueError("strict Attention requires batch invariance")
+            if self.split_kv.mode is not SplitKVMode.DISABLED:
+                raise ValueError("strict Attention requires Split-KV to be disabled")
+            if self.deterministic_core is not None:
+                _validate_strict_core(self.deterministic_core)
+            if self.require_cp_comm:
+                if self.cp_communication is None:
+                    raise ValueError("strict CP Attention requires a communication adapter")
+                for method_name in (
+                    "all_gather_query",
+                    "all_gather_kv",
+                    "all_gather_position_ids",
+                    "reduce_scatter_strict_result",
+                ):
+                    if not callable(getattr(self.cp_communication, method_name, None)):
+                        raise ValueError(
+                            "strict CP communication adapter must implement " f"{method_name}"
+                        )
 
 
 @dataclass(frozen=True)
@@ -561,6 +591,8 @@ class FlashInferQwen3PagedAttentionOp:
         batch_size, q_heads, query_len, head_dim = q.shape
         kv_heads = k_cache.size(1)
         cfg.validate(head_dim=head_dim, query_len=query_len)
+        if cfg.require_cp_comm and cfg.strict_mode:
+            return self._run_strict_cp(q, k_cache, v_cache, metadata, cfg)
         if self._flashinfer_module is None and q.device.type != "cuda" and not cfg.require_cp_comm:
             raise FlashInferUnavailable("FlashInfer PR7 candidate requires CUDA tensors")
 
@@ -582,6 +614,8 @@ class FlashInferQwen3PagedAttentionOp:
                 cfg,
                 plan,
             )
+        if cfg.strict_mode:
+            return self._run_strict_core(q, k_cache, v_cache, metadata, cfg, plan)
         q_flat = q.transpose(1, 2).reshape(batch_size * query_len, q_heads, head_dim).contiguous()
         k_pages, v_pages = materialize_flashinfer_paged_kv_cache(
             k_cache,
@@ -654,6 +688,176 @@ class FlashInferQwen3PagedAttentionOp:
         return FlashInferAttentionResult(
             out=out.to(dtype=q.dtype),
             lse=lse,
+            provenance=provenance,
+        )
+
+    @staticmethod
+    def _run_strict_core(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: Any,
+        cfg: FlashInferPagedAttentionConfig,
+        paged_plan: FlashInferPagedKVPlan,
+    ) -> FlashInferAttentionResult:
+        """Use FlashInfer only for paged-KV layout, never Attention arithmetic."""
+
+        core = cfg.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=cfg.split_kv)
+        _validate_strict_core(core)
+        rope = _resolve_strict_rope(cfg)
+        logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
+            k_cache, v_cache, metadata, paged_plan
+        )
+        query_positions = getattr(metadata, "query_position_ids", None)
+        if not isinstance(query_positions, torch.Tensor):
+            raise FlashInferUnavailable(
+                "strict Attention requires query_position_ids runtime metadata"
+            )
+
+        outputs: list[torch.Tensor] = []
+        lses: list[torch.Tensor] = []
+        row_provenance: list[dict[str, object]] = []
+        for batch_index, seq_len_value in enumerate(paged_plan.kv_seq_lens.tolist()):
+            seq_len = int(seq_len_value)
+            q_row = q[batch_index : batch_index + 1]
+            k_row = logical_k[batch_index : batch_index + 1, :, :seq_len, :]
+            v_row = logical_v[batch_index : batch_index + 1, :, :seq_len, :]
+            q_pos = query_positions[batch_index : batch_index + 1]
+            k_pos = key_positions[batch_index : batch_index + 1, :seq_len]
+            q_ready = _apply_strict_rope(rope, q_row, q_pos, cfg.rope.rope_theta)
+            k_ready = _apply_strict_rope(rope, k_row, k_pos, cfg.rope.rope_theta)
+            result = core.forward_with_lse(
+                q_ready,
+                k_ready,
+                v_row,
+                causal=cfg.causal,
+                scale=cfg.softmax_scale,
+                query_position_ids=q_pos,
+                key_position_ids=k_pos,
+                output_dtype=q.dtype,
+            )
+            _validate_strict_core_result(result, core)
+            outputs.append(result.out)
+            lses.append(result.lse)
+            row_provenance.append(dict(result.provenance))
+
+        provenance = _strict_attention_provenance(
+            cfg,
+            core_provenance=row_provenance[0],
+            materialization="flashinfer_paged_kv_layout_shared_core",
+            cp_required=False,
+            rope=rope,
+        )
+        provenance["strict_core_row_plans"] = [item["split_kv"] for item in row_provenance]
+        provenance.update(cfg.cp_comm_plan.provenance())
+        provenance.update(paged_plan.provenance())
+        return FlashInferAttentionResult(
+            out=torch.cat(outputs, dim=0),
+            lse=torch.cat(lses, dim=0),
+            provenance=provenance,
+        )
+
+    @staticmethod
+    def _run_strict_cp(
+        q_local: torch.Tensor,
+        k_local: torch.Tensor,
+        v_local: torch.Tensor,
+        metadata: Any,
+        cfg: FlashInferPagedAttentionConfig,
+    ) -> FlashInferAttentionResult:
+        """AG full Q/K/V, execute the shared core, then RS final Out/LSE."""
+
+        plan = cfg.cp_comm_plan
+        communication = cfg.cp_communication
+        assert communication is not None
+        if any(tensor.requires_grad for tensor in (q_local, k_local, v_local)) and not getattr(
+            communication, "supports_autograd", False
+        ):
+            raise FlashInferUnavailable(
+                "strict training requires the autograd-capable self-owned CUDA AG/RS backend"
+            )
+        query_start, query_end = plan.query_token_ranges[plan.parallel.cp_rank]
+        key_start, key_end = _cp_owner_ranges(plan)[plan.parallel.cp_rank]
+        if q_local.size(2) != query_end - query_start:
+            raise ValueError("strict CP Q must contain only the owner-local query range")
+        if k_local.size(2) != key_end - key_start:
+            raise ValueError("strict CP K/V must contain only the owner-local KV range")
+        if getattr(metadata, "q_rope_state", None) != "pre_rope" or (
+            getattr(metadata, "k_cache_rope_state", None) != "pre_rope"
+        ):
+            raise ValueError("strict CP Attention requires pre-RoPE Q and K")
+        local_query_positions = _strict_local_query_positions(
+            metadata, q_local, (query_start, query_end)
+        )
+        local_key_positions = _strict_local_key_positions(metadata, k_local, (key_start, key_end))
+
+        global_q = communication.all_gather_query(q_local, plan)
+        global_k, global_v = communication.all_gather_kv(k_local, v_local, plan)
+        global_q_positions, global_k_positions = communication.all_gather_position_ids(
+            local_query_positions,
+            local_key_positions,
+            plan,
+        )
+        expected_q_tokens = plan.query_token_ranges[-1][1]
+        expected_kv_range = plan.expected_kv_token_range
+        if expected_kv_range is None:
+            raise FlashInferUnavailable("strict CP Attention requires an expected KV range")
+        expected_k_tokens = expected_kv_range[1] - expected_kv_range[0]
+        if global_q.size(2) != expected_q_tokens:
+            raise FlashInferUnavailable("strict AG(Q) returned the wrong global width")
+        if global_k.size(2) != expected_k_tokens or global_v.shape != global_k.shape:
+            raise FlashInferUnavailable("strict AG(K/V) returned the wrong global shape")
+
+        rope = _resolve_strict_rope(cfg)
+        q_ready = _apply_strict_rope(rope, global_q, global_q_positions, cfg.rope.rope_theta)
+        k_ready = _apply_strict_rope(rope, global_k, global_k_positions, cfg.rope.rope_theta)
+        core = cfg.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=cfg.split_kv)
+        _validate_strict_core(core)
+
+        outputs: list[torch.Tensor] = []
+        lses: list[torch.Tensor] = []
+        row_provenance: list[dict[str, object]] = []
+        for batch_index in range(global_q.size(0)):
+            result = core.forward_with_lse(
+                q_ready[batch_index : batch_index + 1],
+                k_ready[batch_index : batch_index + 1],
+                global_v[batch_index : batch_index + 1],
+                causal=cfg.causal,
+                scale=cfg.softmax_scale,
+                query_position_ids=global_q_positions[batch_index : batch_index + 1],
+                key_position_ids=global_k_positions[batch_index : batch_index + 1],
+                output_dtype=q_local.dtype,
+            )
+            _validate_strict_core_result(result, core)
+            outputs.append(result.out)
+            lses.append(result.lse)
+            row_provenance.append(dict(result.provenance))
+        full_out = torch.cat(outputs, dim=0)
+        full_lse = torch.cat(lses, dim=0)
+        local_result = communication.reduce_scatter_strict_result(full_out, full_lse, plan)
+
+        provenance = _strict_attention_provenance(
+            cfg,
+            core_provenance=row_provenance[0],
+            materialization="ag_qkv_positions_shared_core_rs",
+            cp_required=True,
+            rope=rope,
+        )
+        provenance.update(plan.provenance())
+        provenance.update(
+            {
+                "strict_core_row_plans": [item["split_kv"] for item in row_provenance],
+                "strict_full_qkv_all_gather": True,
+                "strict_position_ids_all_gather": True,
+                "strict_split_kv": "disabled",
+                "strict_comm_autograd": bool(getattr(communication, "supports_autograd", False)),
+                "strict_local_query_range": [query_start, query_end],
+                "strict_local_kv_range": [key_start, key_end],
+            }
+        )
+        return FlashInferAttentionResult(
+            out=local_result.out,
+            lse=local_result.lse,
             provenance=provenance,
         )
 
@@ -1210,7 +1414,11 @@ class FlashInferQwen3PagedAttentionOp:
         else:
             result = _call_with_supported_kwargs(
                 wrapper.run,
-                {"q": q_flat, "paged_kv_cache": paged_kv_cache, "return_lse": cfg.return_lse},
+                {
+                    "q": q_flat,
+                    "paged_kv_cache": paged_kv_cache,
+                    "return_lse": cfg.return_lse,
+                },
             )
         if not isinstance(result, tuple) or len(result) != 2:
             raise FlashInferUnavailable("FlashInfer PR7 candidate must return (out, lse)")
@@ -1239,6 +1447,248 @@ class FlashInferQwen3PagedAttentionOp:
             )
         if lse_flat.dtype != torch.float32:
             raise FlashInferUnavailable("FlashInfer attention-domain LSE must be FP32")
+
+
+def _validate_strict_core(core: Any) -> None:
+    if not callable(getattr(core, "forward_with_lse", None)):
+        raise ValueError("strict deterministic core must implement forward_with_lse")
+    if getattr(core, "core_id", None) != STRICT_ATTENTION_CORE_ID:
+        raise ValueError("strict deterministic core ID must be " f"{STRICT_ATTENTION_CORE_ID!r}")
+    required = {
+        "merge_order": "global_block_index",
+        "accum_dtype": "fp32",
+        "downcast_at": "final_write",
+        "fallback": False,
+        "native_attention_arithmetic": False,
+    }
+    mismatches = [
+        name for name, expected in required.items() if getattr(core, name, None) != expected
+    ]
+    if mismatches:
+        raise ValueError(
+            "strict deterministic core has incompatible arithmetic identity: "
+            + ", ".join(mismatches)
+        )
+
+
+def _validate_strict_core_result(
+    result: Any,
+    core: Any,
+) -> None:
+    if not isinstance(result, DeterministicAttentionCoreResult):
+        raise FlashInferUnavailable(
+            "strict deterministic core must return DeterministicAttentionCoreResult"
+        )
+    if result.out.dtype not in (torch.float16, torch.bfloat16):
+        raise FlashInferUnavailable("strict deterministic core output must be FP16/BF16")
+    if result.lse.dtype is not torch.float32:
+        raise FlashInferUnavailable("strict deterministic core LSE must be FP32")
+    expected = {
+        "strict_core_id": core.core_id,
+        "attention_backend": core.backend_id,
+        "merge_order": core.merge_order,
+        "accum_dtype": core.accum_dtype,
+        "downcast_at": core.downcast_at,
+        "fallback": False,
+        "native_attention_arithmetic": False,
+    }
+    mismatches = [name for name, value in expected.items() if result.provenance.get(name) != value]
+    if mismatches:
+        raise FlashInferUnavailable(
+            "strict core result changed its declared arithmetic identity: " + ", ".join(mismatches)
+        )
+    split_plan = result.provenance.get("split_kv")
+    if not isinstance(split_plan, dict) or split_plan.get("actual_split_kv_policy") != (
+        SplitKVMode.DISABLED.value
+    ):
+        raise FlashInferUnavailable("strict core result did not prove Split-KV disabled")
+
+
+def _resolve_strict_rope(cfg: FlashInferPagedAttentionConfig) -> Any:
+    if cfg.strict_rope_op is not None:
+        return cfg.strict_rope_op
+    try:
+        from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op
+
+        return RoPESM90Op()
+    except (ImportError, RuntimeError) as exc:
+        raise FlashInferUnavailable(
+            "strict Attention requires the RL-Kernel WS1 RoPE CUDA operator"
+        ) from exc
+
+
+def _apply_strict_rope(
+    rope: Any,
+    x: torch.Tensor,
+    position_ids: torch.Tensor,
+    theta: float,
+) -> torch.Tensor:
+    """RoPESM90Op accepts shared 1-D positions, so execute one batch row at a time."""
+
+    if position_ids.shape != (x.size(0), x.size(2)):
+        raise ValueError("strict RoPE position IDs must have shape [B,S]")
+    rows = []
+    for batch_index in range(x.size(0)):
+        row = x[batch_index : batch_index + 1]
+        positions = position_ids[batch_index]
+        try:
+            rotated = rope(row, positions, theta=float(theta))
+        except TypeError:
+            rotated = rope(row, positions)
+        if not isinstance(rotated, torch.Tensor) or rotated.shape != row.shape:
+            raise FlashInferUnavailable("strict RoPE returned an invalid tensor")
+        if rotated.dtype != row.dtype or rotated.device != row.device:
+            raise FlashInferUnavailable("strict RoPE changed dtype or device")
+        rows.append(rotated)
+    return torch.cat(rows, dim=0)
+
+
+def _materialize_strict_logical_kv(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    metadata: Any,
+    plan: FlashInferPagedKVPlan,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Restore each paged cache row to logical order without padding arithmetic."""
+
+    max_len = int(plan.kv_seq_lens.max().item())
+    logical_k = torch.zeros(
+        (k_cache.size(0), k_cache.size(1), max_len, k_cache.size(3)),
+        dtype=k_cache.dtype,
+        device=k_cache.device,
+    )
+    logical_v = torch.zeros_like(logical_k)
+    positions = torch.full(
+        (k_cache.size(0), max_len),
+        -1,
+        dtype=torch.long,
+        device=k_cache.device,
+    )
+    page_size = int(metadata.page_size)
+    for batch_index, seq_len_value in enumerate(plan.kv_seq_lens.tolist()):
+        seq_len = int(seq_len_value)
+        block_count = (seq_len + page_size - 1) // page_size
+        token_index = torch.arange(seq_len, device=k_cache.device, dtype=torch.long)
+        pages = metadata.block_table[batch_index, :block_count].long()
+        slots = pages[token_index // page_size] * page_size + token_index % page_size
+        logical_k[batch_index, :, :seq_len, :] = k_cache[batch_index, :, slots, :]
+        logical_v[batch_index, :, :seq_len, :] = v_cache[batch_index, :, slots, :]
+        source_positions = getattr(metadata, "key_position_ids", None)
+        if not isinstance(source_positions, torch.Tensor):
+            source_positions = getattr(metadata, "global_token_positions", None)
+        if not isinstance(source_positions, torch.Tensor):
+            raise FlashInferUnavailable(
+                "strict Attention requires key_position_ids runtime metadata"
+            )
+        positions[batch_index, :seq_len] = source_positions[batch_index, slots].long()
+    return logical_k, logical_v, positions
+
+
+def _cp_owner_ranges(
+    plan: AttentionCPCommunicationPlan,
+) -> tuple[tuple[int, int], ...]:
+    ranges = []
+    for owner_rank in range(plan.parallel.cp_world_size):
+        blocks = sorted(
+            (
+                block
+                for block in plan.expected_blocks
+                if block.owner_cp_rank == owner_rank
+                and block.owner_tp_rank == plan.parallel.tp_rank
+            ),
+            key=lambda block: block.kv_block_start,
+        )
+        if not blocks:
+            raise ValueError(f"strict CP manifest has no blocks for owner {owner_rank}")
+        start = blocks[0].kv_block_start
+        cursor = start
+        for block in blocks:
+            if block.kv_block_start != cursor:
+                raise ValueError("strict CP owner blocks must form a contiguous range")
+            cursor = block.kv_block_end
+        ranges.append((start, cursor))
+    expected = plan.expected_kv_token_range
+    if expected is None or ranges[0][0] != expected[0] or ranges[-1][1] != expected[1]:
+        raise ValueError("strict CP owner ranges do not cover expected_kv_token_range")
+    for left, right in zip(ranges, ranges[1:], strict=False):
+        if left[1] != right[0]:
+            raise ValueError("strict CP owner ranges must be gap-free and rank ordered")
+    return tuple(ranges)
+
+
+def _strict_local_query_positions(
+    metadata: Any,
+    q_local: torch.Tensor,
+    query_range: tuple[int, int],
+) -> torch.Tensor:
+    positions = getattr(metadata, "query_position_ids", None)
+    if not isinstance(positions, torch.Tensor):
+        raise ValueError("strict CP requires query_position_ids")
+    if positions.shape == (q_local.size(0), q_local.size(2)):
+        return positions.contiguous()
+    start, end = query_range
+    if positions.ndim == 2 and positions.size(0) == q_local.size(0) and positions.size(1) >= end:
+        return positions[:, start:end].contiguous()
+    raise ValueError("strict CP query_position_ids do not match local query ownership")
+
+
+def _strict_local_key_positions(
+    metadata: Any,
+    k_local: torch.Tensor,
+    key_range: tuple[int, int],
+) -> torch.Tensor:
+    positions = getattr(metadata, "key_position_ids", None)
+    if not isinstance(positions, torch.Tensor):
+        positions = getattr(metadata, "global_token_positions", None)
+    if not isinstance(positions, torch.Tensor):
+        raise ValueError("strict CP requires key_position_ids")
+    if positions.shape == (k_local.size(0), k_local.size(2)):
+        return positions.contiguous()
+    start, end = key_range
+    if positions.ndim == 2 and positions.size(0) == k_local.size(0) and positions.size(1) >= end:
+        return positions[:, start:end].contiguous()
+    raise ValueError("strict CP key_position_ids do not match local KV ownership")
+
+
+def _strict_attention_provenance(
+    cfg: FlashInferPagedAttentionConfig,
+    *,
+    core_provenance: dict[str, object],
+    materialization: str,
+    cp_required: bool,
+    rope: Any,
+) -> dict[str, Any]:
+    return {
+        "attention_backend": core_provenance["attention_backend"],
+        "requested_backend": "flashinfer_layout_adapter",
+        "actual_backend": core_provenance["attention_backend"],
+        "adapter_backend": "flashinfer",
+        "attention_mode": cfg.mode,
+        "materialization": materialization,
+        "causal": cfg.causal,
+        "softmax_scale": cfg.softmax_scale,
+        "lse_domain": "attention",
+        "lse_exported": True,
+        "lse_dtype": "fp32",
+        "strict_mode": True,
+        "strict_core_id": core_provenance["strict_core_id"],
+        "accum_dtype": core_provenance["accum_dtype"],
+        "downcast_at": core_provenance["downcast_at"],
+        "arithmetic_plan_source": "rlkernel_deterministic_cuda_core",
+        "arithmetic_semantics_verified": True,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "fallback_reason": None,
+        "rope_backend": getattr(rope, "backend_id", "rlkernel.cuda.rope_sm90"),
+        "rope_theta": float(cfg.rope.rope_theta),
+        "rotary_dim": cfg.rope.rotary_dim,
+        "rope_fusion": False,
+        "rope_fusion_boundary": "rlkernel_rope_then_attention",
+        "q_rope_state": "post_rope",
+        "k_cache_rope_state": "post_rope",
+        "batch_invariant_claim": "strict_runtime_verified",
+        "cp_comm_required": cp_required,
+    }
 
 
 def flashinfer_qwen3_paged_attention_available() -> bool:

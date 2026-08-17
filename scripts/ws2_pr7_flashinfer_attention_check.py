@@ -93,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "split-K disabled/fixed policy drift",
             "batch composition/position invariant sweep",
             "attention-domain LSE export drift",
-            "CP=2 TP=2 custom CUDA AG/RS communication interface wiring; real ops are future work",
+            "strict shared CUDA core with separate multi-rank AG/RS forward/backward evidence",
         ],
         "thresholds": {
             "out_max_abs": args.out_atol,
@@ -119,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inputs.metadata,
             config=config,
         )
-    except FlashInferUnavailable as exc:
+    except (FlashInferUnavailable, RuntimeError) as exc:
         # Keep optional dependency failures machine-readable while preserving
         # a non-zero exit so aggregate acceptance cannot pass closed.
         report.update(
@@ -127,7 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": "not_available",
                 "passed": False,
                 "acceptance_eligible": False,
-                "errors": [f"FlashInfer unavailable: {exc}"],
+                "errors": [f"Attention backend unavailable: {exc}"],
                 "unavailable_reason": str(exc),
             }
         )
@@ -154,8 +154,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["split_kv"].update(
         {
             "provenance_status": "runtime_verified",
-            "actual_execution_plans": candidate.provenance["actual_split_kv_plans"],
-            "actual_plan_set": candidate.provenance["actual_split_kv_plan_set"],
+            "actual_execution_plans": candidate.provenance.get(
+                "actual_split_kv_plans",
+                candidate.provenance.get("strict_core_row_plans"),
+            ),
+            "actual_plan_set": candidate.provenance.get("actual_split_kv_plan_set"),
         }
     )
     report["drift"] = {
@@ -215,6 +218,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="cuda_ag_rs",
     )
     parser.add_argument("--require-cp-comm", action="store_true")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="use FlashInfer only for paged layout and execute the RL-Kernel shared core",
+    )
     parser.add_argument("--fixed-split-size", type=int, default=None)
     parser.add_argument(
         "--split-kv-policy",
@@ -243,6 +251,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.head_dim != 128:
         parser.error("--head-dim must be 128 for the Qwen3-8B acceptance target")
+    if args.strict and args.split_kv_policy != "disabled":
+        parser.error("--strict requires --split-kv-policy disabled")
     return args
 
 
@@ -278,6 +288,7 @@ def _make_config(args: argparse.Namespace) -> FlashInferPagedAttentionConfig:
             status="interface_only",
         ),
         require_cp_comm=args.require_cp_comm,
+        strict_mode=args.strict,
     )
 
 
@@ -554,19 +565,37 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
         errors.append("runtime attention mode differs from the requested mode")
     if provenance.get("fallback") is not False:
         errors.append("FlashInfer execution used or omitted fallback provenance")
-    if provenance.get("pos_encoding_mode") != "ROPE_LLAMA":
+    if args.strict:
+        if provenance.get("strict_mode") is not True:
+            errors.append("strict runtime did not execute the shared Attention core")
+        if provenance.get("strict_core_id") != "rlkernel.attention.deterministic_core.v1":
+            errors.append("strict runtime core identity is invalid")
+        if provenance.get("native_attention_arithmetic") is not False:
+            errors.append("strict runtime entered native FlashInfer Attention arithmetic")
+        strict_plans = provenance.get("strict_core_row_plans")
+        if not isinstance(strict_plans, list) or not strict_plans:
+            errors.append("strict no-Split-K execution plans are missing")
+        elif any(plan.get("actual_split_kv_policy") != "disabled" for plan in strict_plans):
+            errors.append("strict runtime did not keep Split-KV disabled")
+        if provenance.get("rope_backend") not in {
+            "rlkernel.cuda.rope_sm90",
+            "rlkernel.cuda.rope_sm90_op",
+        }:
+            errors.append("strict runtime did not use the RL-Kernel WS1 RoPE operator")
+    elif provenance.get("pos_encoding_mode") != "ROPE_LLAMA":
         errors.append("FlashInfer runtime did not use ROPE_LLAMA")
     if provenance.get("rope_theta") != 1_000_000.0 or provenance.get("rotary_dim") != 128:
         errors.append("FlashInfer runtime RoPE identity does not match Qwen3-8B")
     if provenance.get("arithmetic_semantics_verified") is not True:
         errors.append("runtime arithmetic semantics were not verified")
-    if not provenance.get("actual_split_kv_plans"):
-        errors.append("actual Split-KV runtime plans are missing")
-    plan_set = provenance.get("actual_split_kv_plan_set")
-    if not isinstance(plan_set, dict) or plan_set.get("coverage") != (
-        "complete_batch_tp_cp_owner_cartesian_product"
-    ):
-        errors.append("complete batch/TP/CP/owner Split-KV plan set is missing")
+    if not args.strict:
+        if not provenance.get("actual_split_kv_plans"):
+            errors.append("actual Split-KV runtime plans are missing")
+        plan_set = provenance.get("actual_split_kv_plan_set")
+        if not isinstance(plan_set, dict) or plan_set.get("coverage") != (
+            "complete_batch_tp_cp_owner_cartesian_product"
+        ):
+            errors.append("complete batch/TP/CP/owner Split-KV plan set is missing")
     for sweep_name in ("batch_invariant_sweep", "page_layout_invariant_sweep"):
         if report.get(sweep_name, {}).get("passed") is not True:
             errors.append(f"{sweep_name} failed")

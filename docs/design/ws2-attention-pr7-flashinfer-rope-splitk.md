@@ -72,6 +72,13 @@ FlashInferQwen3PagedAttentionOp.forward(...)
   validate Qwen3 RoPE fusion config
   validate split-KV policy
   validate CP=2 / TP=2 AG/RS communication interface contract
+  if strict_mode and require_cp_comm:
+    validate owner-local Q/K/V and real position IDs
+    deterministic AG(Q/K/V/position IDs)
+    apply WS1 RoPESM90Op row-by-row
+    run the shared WS1 no-Split-K deterministic Attention core
+    deterministic RS(Out, LSE) -> local query shard
+    return without constructing a FlashInfer arithmetic wrapper
   build_flashinfer_paged_kv_plan(...)
     validate page bounds
     validate block_table/global_token_positions logical order
@@ -81,7 +88,10 @@ FlashInferQwen3PagedAttentionOp.forward(...)
   validate cache_position == query_position_ids and trailing query positions
   validate prefix-cache fingerprint against K/V content and RoPE identity
   materialize_flashinfer_paged_kv_cache(...)
-  flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper
+  if strict_mode:
+    materialize logical paged KV and run the shared WS1 deterministic core
+  else:
+    flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper
     or flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper
   wrapper.plan(..., pos_encoding_mode="ROPE_LLAMA", rope_theta=1e6, rope_scale=1.0, ...)
   wrapper.run_return_lse(...)
@@ -101,8 +111,11 @@ AttentionParallelSpec(tp_world_size=2, cp_world_size=2)
 AttentionCPCommunicationPlan(backend="cuda_ag_rs", status="implemented")
 AttentionCPPartialState(out, lse, AttentionCPBlockMetadata(...))
 CUDAAGRSAttentionCPCommunication.all_gather_query(...)
+CUDAAGRSAttentionCPCommunication.all_gather_kv(...)
+CUDAAGRSAttentionCPCommunication.all_gather_position_ids(...)
 CUDAAGRSAttentionCPCommunication.all_gather_partial_states(...)
 CUDAAGRSAttentionCPCommunication.reduce_scatter_merged_state(...)
+CUDAAGRSAttentionCPCommunication.reduce_scatter_strict_result(...)
 sort_attention_cp_partial_states(..., plan=...)
 ```
 
@@ -110,31 +123,26 @@ The CP execution order is explicit and keeps compute and communication
 decoupled:
 
 ```text
-local Q shard
-  -> custom CUDA AG operator
-  -> full logical Q
-owner-local attention over rank-owned KV blocks
-  -> AttentionCPPartialState(
-       out: [B, Hq, Sq, D],
-       lse: [B, Hq, Sq] fp32,
-       global_block_index,
-       kv_block_start / kv_block_end,
-       owner_cp_rank / owner_tp_rank,
-     )
-  -> custom CUDA AG communication operator
-  -> sort by global_block_index
-  -> PR3 FP32 online-softmax merge
-  -> custom CUDA RS communication operator
+strict production:
+  local Q/K/V + position IDs
+  -> custom CUDA AG(Q/K/V/position IDs)
+  -> shared full-logical-QKV WS1 deterministic Attention core
+  -> custom CUDA RS(Out, LSE)
+  -> local query shard
+
+reference compatibility path:
+  local Q shard -> custom AG(Q)
+  -> owner-local partial AttentionCPState(out, lse, global_block_index)
+  -> custom AG(partial states) -> PR3 FP32 ordered merge
+  -> custom RS(merged state)
 ```
 
 `CUDAAGRSAttentionCPCommunication` uses the self-owned deterministic CUDA
-collectives from PR311/PR312 for Q AG, partial-state AG, and the final RS.
-`P2PNCCLAttentionCPCommunication` keeps the same contract as a correctness
-reference.  Because the public FlashInfer wrapper does not expose owner-local
-partial states, `FlashInferPagedAttentionConfig(require_cp_comm=True)` takes
-the deterministic CP fallback: it restores logical paged KV, computes each
-owner block in FP32, merges by `global_block_index`, and records the fallback
-reason.  It never labels a complete-KV FlashInfer result as a CP partial.
+collectives from PR311/PR312 for strict Q/K/V/position AG and the final Out/LSE
+RS. `P2PNCCLAttentionCPCommunication` implements the same strict boundary as
+an independent NCCL reference. The old partial-state methods remain available
+for PR3/reference validation, but strict mode never labels a full-KV result as
+an owner-local partial or enters native FlashInfer Attention arithmetic.
 
 Ordering is part of the interface:
 
@@ -147,9 +155,10 @@ compute_communication = decoupled
 duplicate global_block_index -> error
 ```
 
-FlashInfer split-KV is backend-local KV reduction inside one rank.  It is not
-the CP merge and does not define cross-rank order.  The real CP path must still
-return ordered partial states before calling the PR3 merge rule.
+Strict production disables Split-KV in the shared CUDA core. This gives CP=1
+and CP=2 the same full-QKV kernel grid and reduction graph. Fixed/auto
+Split-KV remains available only on the diagnostic/reference FlashInfer lane;
+it cannot claim strict bitwise identity.
 
 ## FlashInfer RoPE Fusion
 

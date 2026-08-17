@@ -17,6 +17,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import torch
@@ -35,6 +36,15 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     CUDAAGRSAttentionCPCommunication,
     P2PNCCLAttentionCPCommunication,
 )
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
+    RLKernelDeterministicAttentionCore,
+)
+from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
+    FlashInferPagedAttentionConfig,
+    FlashInferQwen3PagedAttentionOp,
+    _apply_strict_rope,
+)
+from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (  # noqa: E402
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
@@ -60,8 +70,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="p2p_nccl_reference",
         help="P2P is the correctness reference; cuda_ag_rs selects PR311/PR312",
     )
+    parser.add_argument(
+        "--strict-shared-core",
+        action="store_true",
+        help="run AG(Q/K/V/positions) -> shared CUDA core -> RS(Out/LSE) with backward",
+    )
     parser.add_argument("--output", type=Path)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.strict_shared_core and args.transport != "cuda_ag_rs":
+        parser.error("--strict-shared-core requires --transport cuda_ag_rs")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -84,17 +102,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             dist.new_group(ranks=[pair_start, pair_start + 1])
             for pair_start in range(0, world_size, 2)
         ]
-        replica_rank = global_rank if world_size < 8 else global_rank % 4
-        sp_rank = 0 if world_size < 8 else global_rank // 4
-        tp_rank = 0 if world_size == 2 else replica_rank // 2
-        cp_rank = replica_rank % 2
+        rank_in_replica = global_rank if world_size < 8 else global_rank % 4
+        replica_index = 0 if world_size < 8 else global_rank // 4
+        tp_rank = 0 if world_size == 2 else rank_in_replica // 2
+        cp_rank = rank_in_replica % 2
         cp_group = cp_groups[global_rank // 2]
         result = run_check(
             args,
             global_rank=global_rank,
             tp_rank=tp_rank,
             cp_rank=cp_rank,
-            sp_rank=sp_rank,
+            replica_index=replica_index,
             cp_group=cp_group,
             device=device,
         )
@@ -119,7 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "world_size": world_size,
                 "tp_world_size": 1 if world_size == 2 else 2,
                 "cp_world_size": 2,
-                "sp_world_size": 2 if world_size == 8 else 1,
+                "replica_count": 2 if world_size == 8 else 1,
                 "global_failure_count": int(failures.item()),
                 "ranks": reports,
             }
@@ -139,7 +157,7 @@ def run_check(
     global_rank: int,
     tp_rank: int,
     cp_rank: int,
-    sp_rank: int,
+    replica_index: int,
     cp_group: Any,
     device: torch.device,
 ) -> dict[str, object]:
@@ -158,7 +176,7 @@ def run_check(
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and non-negative")
 
-    generator = torch.Generator(device="cpu").manual_seed(args.seed + tp_rank + 100 * sp_rank)
+    generator = torch.Generator(device="cpu").manual_seed(args.seed + tp_rank + 100 * replica_index)
     shape_q = (args.batch, args.q_heads, args.seq_len, args.head_dim)
     shape_kv = (args.batch, args.kv_heads, args.seq_len, args.head_dim)
     q = torch.randn(shape_q, generator=generator, dtype=torch.bfloat16).to(device)
@@ -260,6 +278,19 @@ def run_check(
     final_out = local.out.to(q.dtype)
     expected_final_out = full_out[:, :, start:end, :].to(q.dtype)
     final_out_max_abs = float((final_out.float() - expected_final_out.float()).abs().max().item())
+    strict_shared_core = (
+        _run_strict_shared_core_check(
+            args,
+            plan=plan,
+            communication=communication,
+            q=q,
+            k=k,
+            v=v,
+            owner_ranges=owner_ranges,
+        )
+        if args.strict_shared_core
+        else {"executed": False, "passed": False}
+    )
     passed = (
         gathered_indices == list(range(len(blocks)))
         and query_ag_max_abs == 0.0
@@ -271,16 +302,17 @@ def run_check(
         and lse_max_abs <= args.atol
         and final_out.dtype == q.dtype
         and final_out_max_abs <= args.final_write_atol
+        and (not args.strict_shared_core or strict_shared_core["passed"] is True)
     )
     return {
         "rank": global_rank,
         "global_world_size": dist.get_world_size() if dist.is_initialized() else 1,
         "tp_rank": tp_rank,
-        "tp_world_size": 2,
+        "tp_world_size": 1 if dist.is_initialized() and dist.get_world_size() == 2 else 2,
         "cp_rank": cp_rank,
         "cp_world_size": 2,
-        "sp_rank": sp_rank,
-        "sp_world_size": 2 if dist.is_initialized() and dist.get_world_size() == 8 else 1,
+        "replica_index": replica_index,
+        "replica_count": 2 if dist.is_initialized() and dist.get_world_size() == 8 else 1,
         "device": str(device),
         "dtype": "bf16",
         "accum_dtype": "fp32",
@@ -288,6 +320,7 @@ def run_check(
         "final_output_dtype": str(final_out.dtype).removeprefix("torch."),
         "transport": args.transport,
         "protocol": "ag_query_local_kv_rs_out_lse",
+        "strict_protocol": "ag_qkv_positions_shared_core_rs_out_lse",
         "query_ag": args.transport,
         "query_ag_max_abs": query_ag_max_abs,
         "query_range": [start, end],
@@ -304,7 +337,125 @@ def run_check(
         "final_out_max_abs": final_out_max_abs,
         "atol": args.atol,
         "final_write_atol": args.final_write_atol,
+        "strict_shared_core": strict_shared_core,
         "passed": passed,
+    }
+
+
+def _run_strict_shared_core_check(
+    args: argparse.Namespace,
+    *,
+    plan: AttentionCPCommunicationPlan,
+    communication: CUDAAGRSAttentionCPCommunication | P2PNCCLAttentionCPCommunication,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    owner_ranges: tuple[tuple[int, int], ...],
+) -> dict[str, object]:
+    """Exercise the complete differentiable self-owned communication path."""
+
+    cp_rank = plan.parallel.cp_rank
+    start, end = owner_ranges[cp_rank]
+    q_local = q[:, :, start:end, :].detach().clone().requires_grad_()
+    k_local = k[:, :, start:end, :].detach().clone().requires_grad_()
+    v_local = v[:, :, start:end, :].detach().clone().requires_grad_()
+    positions = torch.arange(args.seq_len, dtype=torch.long, device=q.device).expand(args.batch, -1)
+    metadata = SimpleNamespace(
+        q_rope_state="pre_rope",
+        k_cache_rope_state="pre_rope",
+        query_position_ids=positions[:, start:end].contiguous(),
+        key_position_ids=positions[:, start:end].contiguous(),
+    )
+    config = FlashInferPagedAttentionConfig(
+        mode="prefill",
+        cp_comm_plan=plan,
+        require_cp_comm=True,
+        strict_mode=True,
+        cp_communication=communication,
+    )
+    op = FlashInferQwen3PagedAttentionOp(flashinfer_module=None)
+    distributed = op(q_local, k_local, v_local, metadata, config=config)
+
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    rope = RoPESM90Op()
+    q_ready = _apply_strict_rope(rope, q_ref, positions, config.rope.rope_theta)
+    k_ready = _apply_strict_rope(rope, k_ref, positions, config.rope.rope_theta)
+    reference = RLKernelDeterministicAttentionCore().forward_with_lse(
+        q_ready,
+        k_ready,
+        v_ref,
+        causal=True,
+        query_position_ids=positions,
+        key_position_ids=positions,
+        output_dtype=q.dtype,
+    )
+    out_ref = reference.out[:, :, start:end, :]
+    lse_ref = reference.lse[:, :, start:end]
+
+    dout = torch.randn(
+        q.shape,
+        generator=torch.Generator(device="cpu").manual_seed(args.seed + 10_000),
+        dtype=q.dtype,
+    ).to(q.device)
+    (distributed.out.float() * dout[:, :, start:end, :].float()).sum().backward()
+    (reference.out.float() * dout.float()).sum().backward()
+
+    comparisons = {
+        "out": (distributed.out, out_ref),
+        "lse": (distributed.lse, lse_ref),
+        "dq": (q_local.grad, q_ref.grad[:, :, start:end, :]),
+        "dk": (k_local.grad, k_ref.grad[:, :, start:end, :]),
+        "dv": (v_local.grad, v_ref.grad[:, :, start:end, :]),
+    }
+    bitwise = {
+        name: left is not None and right is not None and torch.equal(left, right)
+        for name, (left, right) in comparisons.items()
+    }
+    max_abs = {
+        name: float((left.float() - right.float()).abs().max().item())
+        for name, (left, right) in comparisons.items()
+        if left is not None and right is not None
+    }
+
+    repeat_out_bitwise = True
+    repeat_lse_bitwise = True
+    for _ in range(args.repeats - 1):
+        repeated = op(
+            q_local.detach(),
+            k_local.detach(),
+            v_local.detach(),
+            metadata,
+            config=config,
+        )
+        repeat_out_bitwise = repeat_out_bitwise and torch.equal(repeated.out, distributed.out)
+        repeat_lse_bitwise = repeat_lse_bitwise and torch.equal(repeated.lse, distributed.lse)
+
+    provenance = distributed.provenance
+    identity_valid = (
+        provenance.get("strict_core_id") == "rlkernel.attention.deterministic_core.v1"
+        and provenance.get("strict_mode") is True
+        and provenance.get("native_attention_arithmetic") is False
+        and provenance.get("fallback") is False
+        and provenance.get("strict_split_kv") == "disabled"
+        and provenance.get("strict_comm_autograd") is True
+    )
+    return {
+        "executed": True,
+        "passed": (
+            all(bitwise.values()) and repeat_out_bitwise and repeat_lse_bitwise and identity_valid
+        ),
+        "strict_core_id": provenance.get("strict_core_id"),
+        "strict_mode": provenance.get("strict_mode"),
+        "native_attention_arithmetic": provenance.get("native_attention_arithmetic"),
+        "fallback": provenance.get("fallback"),
+        "split_kv_policy": provenance.get("strict_split_kv"),
+        "communication_autograd": provenance.get("strict_comm_autograd"),
+        "bitwise": bitwise,
+        "max_abs": max_abs,
+        "repeat_out_bitwise": repeat_out_bitwise,
+        "repeat_lse_bitwise": repeat_lse_bitwise,
     }
 
 

@@ -18,6 +18,11 @@ from typing import Any, Iterable, TypeVar
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
+# Stable identity for the CUDA Attention arithmetic shared by training and
+# rollout. Backend adapters may differ, but strict runtime evidence must not.
+STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+
+
 class AttentionContractError(ValueError):
     """Raised when attention metadata does not describe a valid invocation."""
 
@@ -1447,6 +1452,7 @@ __all__ = [
     "SplitKVRuntimePlanEntry",
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
+    "STRICT_ATTENTION_CORE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

@@ -10,18 +10,20 @@ from dataclasses import replace
 import pytest
 import torch
 
-from rl_engine.kernels.attention_contract import SplitKVSpec
+from rl_engine.kernels.attention_contract import STRICT_ATTENTION_CORE_ID, SplitKVSpec
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
     AttentionCPCommunicationUnavailable,
     AttentionCPMergedState,
+    AttentionCPOutputShard,
     AttentionCPPartialState,
     AttentionParallelSpec,
     CUDAAGRSAttentionCPCommunication,
     P2PNCCLAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionCoreResult
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -345,6 +347,92 @@ class _FakeCPCommunication:
         )
 
 
+class _IdentityStrictRoPE:
+    backend_id = "rlkernel.cuda.rope_sm90"
+
+    def __call__(self, x, positions, *, theta=1_000_000.0):
+        assert positions.ndim == 1
+        assert float(theta) == 1_000_000.0
+        return x
+
+
+class _RecordingStrictCore:
+    core_id = STRICT_ATTENTION_CORE_ID
+    backend_id = "test.strict_cuda_core"
+    merge_order = "global_block_index"
+    accum_dtype = "fp32"
+    downcast_at = "final_write"
+    fallback = False
+    native_attention_arithmetic = False
+
+    def __init__(self):
+        self.calls = []
+
+    def forward_with_lse(
+        self,
+        q,
+        k,
+        v,
+        *,
+        query_position_ids,
+        key_position_ids,
+        **_kwargs,
+    ):
+        self.calls.append(
+            {
+                "q": q.clone(),
+                "k": k.clone(),
+                "v": v.clone(),
+                "query_position_ids": query_position_ids.clone(),
+                "key_position_ids": key_position_ids.clone(),
+            }
+        )
+        return DeterministicAttentionCoreResult(
+            out=torch.zeros_like(q),
+            lse=torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device),
+            provenance={
+                "strict_core_id": self.core_id,
+                "attention_backend": self.backend_id,
+                "split_kv": {
+                    "actual_split_kv_policy": "disabled",
+                    "actual_split_boundaries": [[0, k.size(2)]],
+                },
+                "merge_order": self.merge_order,
+                "accum_dtype": self.accum_dtype,
+                "downcast_at": self.downcast_at,
+                "fallback": False,
+                "fallback_reason": None,
+                "native_attention_arithmetic": False,
+            },
+        )
+
+
+class _StrictCPCommunication:
+    backend_id = "p2p_nccl_reference"
+
+    def all_gather_query(self, local_q, plan):
+        return torch.cat((local_q, local_q + 1), dim=2)
+
+    def all_gather_kv(self, local_k, local_v, plan):
+        return (
+            torch.cat((local_k, local_k + 2), dim=2),
+            torch.cat((local_v, local_v + 3), dim=2),
+        )
+
+    def all_gather_position_ids(self, local_q_positions, local_k_positions, plan):
+        return (
+            torch.cat((local_q_positions, local_q_positions + 1), dim=1),
+            torch.cat((local_k_positions, local_k_positions + 2), dim=1),
+        )
+
+    def reduce_scatter_strict_result(self, out, lse, plan):
+        start, end = plan.query_token_ranges[plan.parallel.cp_rank]
+        return AttentionCPOutputShard(
+            out=out[:, :, start:end, :].contiguous(),
+            lse=lse[:, :, start:end].contiguous(),
+        )
+
+
 class _FakeDeterministicCollective:
     world_size = 2
 
@@ -355,6 +443,23 @@ class _FakeDeterministicCollective:
     @staticmethod
     def reduce_scatter(tensor):
         return tensor.chunk(2, dim=0)[0].contiguous()
+
+
+class _FakeAutogradCollective:
+    world_size = 2
+
+    def __init__(self):
+        self.all_gather_calls = 0
+        self.reduce_scatter_calls = 0
+
+    def all_gather(self, tensor):
+        self.all_gather_calls += 1
+        return torch.cat((tensor, tensor), dim=0)
+
+    def reduce_scatter(self, tensor):
+        self.reduce_scatter_calls += 1
+        first, second = tensor.chunk(2, dim=0)
+        return (first + second).contiguous()
 
 
 class _FakeCollectiveDist:
@@ -471,6 +576,129 @@ def test_flashinfer_pr7_required_cp_comm_uses_explicit_deterministic_fallback():
     assert result.provenance["actual_split_kv_plan_set"]["coverage"] == (
         "complete_batch_tp_cp_owner_cartesian_product"
     )
+
+
+def test_strict_paged_path_uses_shared_core_and_never_runs_flashinfer_arithmetic():
+    q, k, v = (tensor.to(torch.bfloat16) for tensor in _qkv(query_len=1))
+    core = _RecordingStrictCore()
+    _FakeFlashInferWrapper.instances = []
+
+    result = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+        q,
+        k,
+        v,
+        _metadata(query_len=1),
+        config=FlashInferPagedAttentionConfig(
+            mode="decode",
+            workspace_size_bytes=1024,
+            strict_mode=True,
+            deterministic_core=core,
+            strict_rope_op=_IdentityStrictRoPE(),
+        ),
+    )
+
+    assert _FakeFlashInferWrapper.instances == []
+    assert len(core.calls) == q.size(0)
+    assert core.calls[0]["query_position_ids"].tolist() == [[5]]
+    assert core.calls[0]["key_position_ids"].tolist() == [[0, 1, 2, 3, 4, 5]]
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["native_attention_arithmetic"] is False
+    assert result.provenance["fallback"] is False
+    assert result.provenance["materialization"] == ("flashinfer_paged_kv_layout_shared_core")
+    assert result.out.dtype is torch.bfloat16
+    assert result.lse.dtype is torch.float32
+
+
+def test_strict_cp_path_gathers_qkv_and_real_position_ids_before_shared_core():
+    generator = torch.Generator().manual_seed(19)
+    q = torch.randn(1, 4, 1, 8, generator=generator, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 2, 8, generator=generator, dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 2, 8, generator=generator, dtype=torch.bfloat16)
+    core = _RecordingStrictCore()
+    metadata = types.SimpleNamespace(
+        q_rope_state="pre_rope",
+        k_cache_rope_state="pre_rope",
+        query_position_ids=torch.tensor([[2]], dtype=torch.long),
+        key_position_ids=torch.tensor([[0, 1]], dtype=torch.long),
+    )
+
+    result = FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+        q,
+        k,
+        v,
+        metadata,
+        config=FlashInferPagedAttentionConfig(
+            mode="prefill",
+            workspace_size_bytes=1024,
+            cp_comm_plan=_p2p_plan(),
+            require_cp_comm=True,
+            strict_mode=True,
+            cp_communication=_StrictCPCommunication(),
+            deterministic_core=core,
+            strict_rope_op=_IdentityStrictRoPE(),
+        ),
+    )
+
+    assert len(core.calls) == 1
+    assert core.calls[0]["query_position_ids"].tolist() == [[2, 3]]
+    assert core.calls[0]["key_position_ids"].tolist() == [[0, 1, 2, 3]]
+    assert core.calls[0]["q"].shape[2] == 2
+    assert core.calls[0]["k"].shape[2] == 4
+    assert result.out.shape == q.shape
+    assert result.provenance["materialization"] == ("ag_qkv_positions_shared_core_rs")
+    assert result.provenance["strict_full_qkv_all_gather"] is True
+    assert result.provenance["strict_position_ids_all_gather"] is True
+    assert result.provenance["fallback"] is False
+
+
+def test_strict_cp_training_rejects_non_autograd_p2p_reference():
+    generator = torch.Generator().manual_seed(29)
+    q = torch.randn(1, 4, 1, 8, generator=generator, dtype=torch.bfloat16).requires_grad_()
+    k = torch.randn(1, 2, 2, 8, generator=generator, dtype=torch.bfloat16).requires_grad_()
+    v = torch.randn(1, 2, 2, 8, generator=generator, dtype=torch.bfloat16).requires_grad_()
+    metadata = types.SimpleNamespace(
+        q_rope_state="pre_rope",
+        k_cache_rope_state="pre_rope",
+        query_position_ids=torch.tensor([[2]], dtype=torch.long),
+        key_position_ids=torch.tensor([[0, 1]], dtype=torch.long),
+    )
+
+    with pytest.raises(FlashInferUnavailable, match="autograd-capable self-owned CUDA AG/RS"):
+        FlashInferQwen3PagedAttentionOp(flashinfer_module=_fake_flashinfer())(
+            q,
+            k,
+            v,
+            metadata,
+            config=FlashInferPagedAttentionConfig(
+                mode="prefill",
+                workspace_size_bytes=1024,
+                cp_comm_plan=_p2p_plan(),
+                require_cp_comm=True,
+                strict_mode=True,
+                cp_communication=_StrictCPCommunication(),
+                deterministic_core=_RecordingStrictCore(),
+                strict_rope_op=_IdentityStrictRoPE(),
+            ),
+        )
+
+
+def test_strict_mode_rejects_split_k_and_unverified_core():
+    with pytest.raises(ValueError, match="Split-KV to be disabled"):
+        FlashInferPagedAttentionConfig(
+            strict_mode=True,
+            split_kv=SplitKVSpec.fixed(2),
+            deterministic_core=_RecordingStrictCore(),
+        ).validate(head_dim=8, query_len=1)
+
+    bad_core = types.SimpleNamespace(
+        core_id="different",
+        forward_with_lse=lambda *_args, **_kwargs: None,
+    )
+    with pytest.raises(ValueError, match="core ID"):
+        FlashInferPagedAttentionConfig(
+            strict_mode=True,
+            deterministic_core=bad_core,
+        ).validate(head_dim=8, query_len=1)
 
 
 def test_flashinfer_pr7_decode_adapter_can_disable_splitk_for_strict_candidate():
@@ -1080,6 +1308,36 @@ def test_cuda_ag_rs_attention_cp_comm_executes_injected_collective(monkeypatch):
     assert torch.equal(shard.lse, merged.lse[:, :, :1])
 
 
+def test_cuda_ag_rs_sequence_collectives_preserve_attention_gradients(monkeypatch):
+    plan = AttentionCPCommunicationPlan(
+        parallel=AttentionParallelSpec(tp_world_size=2, cp_world_size=2),
+        backend="cuda_ag_rs",
+        status="implemented",
+        expected_blocks=(
+            AttentionCPBlockMetadata(0, 0, 2, 0, 0),
+            AttentionCPBlockMetadata(1, 2, 4, 1, 0),
+        ),
+        expected_kv_token_range=(0, 4),
+        query_token_ranges=((0, 1), (1, 2)),
+    )
+    collective = _FakeAutogradCollective()
+    communication = CUDAAGRSAttentionCPCommunication(collective=collective)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    local_q = torch.zeros(1, 2, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    gathered_q = communication.all_gather_query(local_q, plan)
+    gathered_q.float().sum().backward()
+    assert torch.equal(local_q.grad, torch.full_like(local_q, 2))
+    assert collective.reduce_scatter_calls == 1
+
+    full_out = torch.zeros(1, 2, 2, 4, dtype=torch.bfloat16, requires_grad=True)
+    full_lse = torch.zeros(1, 2, 2, dtype=torch.float32)
+    shard = communication.reduce_scatter_strict_result(full_out, full_lse, plan)
+    shard.out.float().sum().backward()
+    assert torch.equal(full_out.grad, torch.ones_like(full_out))
+    assert collective.all_gather_calls == 2
+
+
 def test_cp_manifest_rejects_gap_wrong_owner_and_incomplete_gather():
     with pytest.raises(ValueError, match="gap-free"):
         AttentionCPCommunicationPlan(
@@ -1139,6 +1397,46 @@ def test_p2p_nccl_reference_query_ag_preserves_cp_rank_order():
     assert gathered.shape == (1, 2, 2, 4)
     assert torch.equal(gathered[:, :, :1, :], local_q)
     assert torch.equal(gathered[:, :, 1:, :], remote_q)
+
+
+def test_p2p_nccl_reference_gathers_kv_and_position_ids_in_owner_order():
+    local_k = torch.zeros(1, 2, 2, 4)
+    local_v = torch.ones_like(local_k)
+    remote_k = torch.full_like(local_k, 7)
+    remote_v = torch.full_like(local_v, 9)
+    communication = P2PNCCLAttentionCPCommunication(
+        dist_module=_FakeNCCLDistributed(
+            rank=0,
+            receive_payloads=(remote_k, remote_v),
+        ),
+        validate_cuda_tensors=False,
+    )
+
+    global_k, global_v = communication.all_gather_kv(local_k, local_v, _p2p_plan())
+
+    assert torch.equal(global_k[:, :, :2], local_k)
+    assert torch.equal(global_k[:, :, 2:], remote_k)
+    assert torch.equal(global_v[:, :, :2], local_v)
+    assert torch.equal(global_v[:, :, 2:], remote_v)
+
+    local_q_pos = torch.tensor([[2]], dtype=torch.long)
+    local_k_pos = torch.tensor([[0, 1]], dtype=torch.long)
+    remote_q_pos = torch.tensor([[3]], dtype=torch.long)
+    remote_k_pos = torch.tensor([[2, 3]], dtype=torch.long)
+    communication = P2PNCCLAttentionCPCommunication(
+        dist_module=_FakeNCCLDistributed(
+            rank=0,
+            receive_payloads=(remote_q_pos, remote_k_pos),
+        ),
+        validate_cuda_tensors=False,
+    )
+
+    global_q_pos, global_k_pos = communication.all_gather_position_ids(
+        local_q_pos, local_k_pos, _p2p_plan()
+    )
+
+    assert global_q_pos.tolist() == [[2, 3]]
+    assert global_k_pos.tolist() == [[0, 1, 2, 3]]
 
 
 def test_cp_manifest_allows_sparse_global_block_indices_and_rejects_short_query_state():
@@ -1367,7 +1665,7 @@ def test_pr7_check_writes_not_available_report_for_missing_flashinfer(monkeypatc
     assert report["status"] == "not_available"
     assert report["passed"] is False
     assert report["acceptance_eligible"] is False
-    assert "FlashInfer unavailable" in report["errors"][0]
+    assert "Attention backend unavailable" in report["errors"][0]
 
 
 def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
@@ -1397,6 +1695,35 @@ def test_pr7_check_acceptance_errors_require_all_drift_and_invariance_fields():
     }
 
     assert check_script._acceptance_errors(report, args) == ["batch_invariant_sweep failed"]
+
+
+def test_pr7_check_accepts_strict_shared_core_without_native_flashinfer_arithmetic():
+    args = check_script._parse_args(["--strict", "--device", "cuda"])
+    report = {
+        "device": "cuda:0",
+        "shape": {"q_heads": 16, "kv_heads": 4, "head_dim": 128},
+        "candidate_provenance": {
+            "attention_mode": "decode",
+            "fallback": False,
+            "strict_mode": True,
+            "strict_core_id": STRICT_ATTENTION_CORE_ID,
+            "native_attention_arithmetic": False,
+            "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
+            "rope_backend": "rlkernel.cuda.rope_sm90",
+            "rope_theta": 1_000_000.0,
+            "rotary_dim": 128,
+            "arithmetic_semantics_verified": True,
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    assert check_script._acceptance_errors(report, args) == []
 
 
 def test_pr7_check_rejects_nonfinite_drift_and_wrong_tp_local_shape():
@@ -1444,10 +1771,18 @@ def test_p2p_entrypoint_validates_qwen3_tp_local_shape_before_cuda_math():
             global_rank=0,
             tp_rank=0,
             cp_rank=0,
-            sp_rank=0,
+            replica_index=0,
             cp_group=None,
             device=torch.device("cpu"),
         )
+
+
+def test_strict_shared_core_entrypoint_requires_self_owned_ag_rs():
+    with pytest.raises(SystemExit):
+        p2p_check_script.parse_args(["--strict-shared-core"])
+
+    args = p2p_check_script.parse_args(["--transport", "cuda_ag_rs", "--strict-shared-core"])
+    assert args.strict_shared_core is True
 
 
 @pytest.mark.parametrize(
@@ -1471,7 +1806,7 @@ def test_p2p_entrypoint_rejects_non_acceptance_arguments(argv, message):
             global_rank=0,
             tp_rank=0,
             cp_rank=0,
-            sp_rank=0,
+            replica_index=0,
             cp_group=None,
             device=torch.device("cpu"),
         )

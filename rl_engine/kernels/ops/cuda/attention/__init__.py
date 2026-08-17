@@ -6,6 +6,7 @@ from .cp_comm import (
     AttentionCPCommunicationPlan,
     AttentionCPCommunicationUnavailable,
     AttentionCPMergedState,
+    AttentionCPOutputShard,
     AttentionCPPartialState,
     AttentionParallelSpec,
     CPCommunicationBackend,
@@ -14,7 +15,11 @@ from .cp_comm import (
     P2PNCCLAttentionCPCommunication,
     sort_attention_cp_partial_states,
 )
-from .deterministic_attn import DeterministicAttentionOp
+from .deterministic_attn import (
+    DeterministicAttentionCoreResult,
+    DeterministicAttentionOp,
+    RLKernelDeterministicAttentionCore,
+)
 from .flash_attn import FlashAttentionOp
 from .flashinfer_paged_attention import (
     FlashInferPagedAttentionConfig,
@@ -31,13 +36,16 @@ __all__ = [
     "AttentionCPCommunicationPlan",
     "AttentionCPCommunicationUnavailable",
     "AttentionCPMergedState",
+    "AttentionCPOutputShard",
     "AttentionCPPartialState",
     "AttentionParallelSpec",
     "CPCommunicationBackend",
     "CPCommunicationStatus",
     "CUDAAGRSAttentionCPCommunication",
     "P2PNCCLAttentionCPCommunication",
+    "DeterministicAttentionCoreResult",
     "DeterministicAttentionOp",
+    "RLKernelDeterministicAttentionCore",
     "FlashAttentionOp",
     "FlashInferPagedAttentionConfig",
     "FlashInferQwen3PagedAttentionOp",

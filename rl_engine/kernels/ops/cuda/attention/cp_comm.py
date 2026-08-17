@@ -1,14 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""CP/TP attention communication and a P2P NCCL reference.
+"""CP/TP Attention communication and a P2P NCCL reference.
 
 PR7 evaluates fused attention backends for the #235 target
 ``Qwen3-8B, TP=2, CP=2, BF16``. The self-owned CUDA communication operators are
 AG/RS and compute-communication decoupled. This module adapts the deterministic
 collectives from PR311/PR312 to the Attention partial-state contract.
 
-The production communication path is expected to move attention partial states:
+The strict production path uses one arithmetic graph at every CP size:
+
+```text
+owner-local Q/K/V and position IDs
+  -> deterministic AG(Q/K/V/positions)
+  -> shared no-Split-K CUDA Attention core on full logical Q/K/V
+  -> deterministic RS(Out, LSE)
+  -> owner-local query result
+```
+
+The older partial-state path remains available as a reference interface:
 
 ```text
 owner-local deterministic fallback or TE attention over rank-owned KV blocks
@@ -150,6 +160,26 @@ class AttentionCPMergedState:
 
 
 @dataclass(frozen=True)
+class AttentionCPOutputShard:
+    """Final strict-core output shard after RS."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+
+    def validate(self) -> None:
+        if self.out.ndim != 4 or self.lse.ndim != 3:
+            raise ValueError("strict output must have out [B,Hq,Sq,D] and lse [B,Hq,Sq]")
+        if self.out.shape[:3] != self.lse.shape:
+            raise ValueError("strict output and lse must share [B,Hq,Sq]")
+        if self.out.device != self.lse.device:
+            raise ValueError("strict output and lse must be on the same device")
+        if self.out.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict Attention output must be FP16 or BF16")
+        if self.lse.dtype is not torch.float32:
+            raise ValueError("strict Attention LSE must be FP32")
+
+
+@dataclass(frozen=True)
 class AttentionCPCommunicationPlan:
     """Requested AG/RS communication contract for CP attention partial states."""
 
@@ -208,6 +238,10 @@ class AttentionCPCommunicationPlan:
             "cp_comm_accum_dtype": "fp32",
             "cp_comm_return_lse": self.return_lse,
             "cp_comm_contract": "partial_out_lse_global_block_index",
+            "cp_comm_strict_contract": "ag_qkv_positions_shared_core_rs_out_lse",
+            "cp_comm_strict_kv_communication": "all_gather",
+            "cp_comm_strict_position_communication": "all_gather",
+            "cp_comm_strict_backward": "rs_out_backward_ag_then_ag_qkv_backward_rs",
             "cp_comm_expected_kv_token_range": (
                 None if self.expected_kv_token_range is None else list(self.expected_kv_token_range)
             ),
@@ -228,6 +262,22 @@ class AttentionCPCommunication(Protocol):
     ) -> torch.Tensor:
         """Gather the query sequence shards in logical CP-rank order."""
 
+    def all_gather_kv(
+        self,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather owner-local K/V in logical CP-rank order."""
+
+    def all_gather_position_ids(
+        self,
+        local_query_positions: torch.Tensor,
+        local_key_positions: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather the position IDs paired with owner-local Q/K."""
+
     def all_gather_partial_states(
         self,
         local_states: tuple[AttentionCPPartialState, ...],
@@ -242,9 +292,69 @@ class AttentionCPCommunication(Protocol):
     ) -> AttentionCPMergedState:
         """Run the custom CUDA RS operator and return this rank's output shard."""
 
+    def reduce_scatter_strict_result(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> AttentionCPOutputShard:
+        """RS a shared-core result without changing its output dtype."""
+
+
+class _AllGatherSequence(torch.autograd.Function):
+    """Autograd bridge for the self-owned rank-ordered sequence AllGather."""
+
+    @staticmethod
+    def forward(ctx, local: torch.Tensor, collective: Any, sequence_dim: int) -> torch.Tensor:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        packed = local.movedim(ctx.sequence_dim, 0).contiguous()
+        gathered = collective.all_gather(packed)
+        return gathered.movedim(0, ctx.sequence_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_global: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        packed = grad_global.movedim(ctx.sequence_dim, 0).contiguous()
+        grad_local = ctx.collective.reduce_scatter(packed)
+        return grad_local.movedim(0, ctx.sequence_dim).contiguous(), None, None
+
+
+class _RootReduceScatterSequence(torch.autograd.Function):
+    """Scatter one authoritative full result and gather its gradient back to the root."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        full: torch.Tensor,
+        collective: Any,
+        sequence_dim: int,
+        rank: int,
+        root: int,
+    ) -> torch.Tensor:
+        ctx.collective = collective
+        ctx.sequence_dim = int(sequence_dim)
+        ctx.rank = int(rank)
+        ctx.root = int(root)
+        packed = full.movedim(ctx.sequence_dim, 0).contiguous()
+        if ctx.rank != ctx.root:
+            packed = torch.zeros_like(packed)
+        local = collective.reduce_scatter(packed)
+        return local.movedim(0, ctx.sequence_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_local: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        packed = grad_local.movedim(ctx.sequence_dim, 0).contiguous()
+        grad_full = ctx.collective.all_gather(packed).movedim(0, ctx.sequence_dim).contiguous()
+        if ctx.rank != ctx.root:
+            grad_full.zero_()
+        return grad_full, None, None, None, None
+
 
 class CUDAAGRSAttentionCPCommunication:
     """Deterministic CUDA AG/RS adapter backed by PR311/PR312."""
+
+    backend_id = "cuda_ag_rs"
+    supports_autograd = True
 
     def __init__(self, *, process_group: Any = None, collective: Any = None) -> None:
         self._process_group = process_group
@@ -294,10 +404,48 @@ class CUDAAGRSAttentionCPCommunication:
                 "self-owned CUDA AG requires equal query shard lengths"
             )
         collective = self._get_collective(plan)
-        packed = local_q.permute(2, 0, 1, 3).contiguous()
-        gathered = collective.all_gather(packed)
-        query_tokens, batch, heads, dim = gathered.shape
-        return gathered.reshape(query_tokens, batch, heads, dim).permute(1, 2, 0, 3).contiguous()
+        return self._all_gather_sequence_tensor(local_q, collective, sequence_dim=2)
+
+    def all_gather_kv(
+        self,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_cuda_plan(plan)
+        _validate_local_kv_shard(local_k, local_v, plan)
+        _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
+        collective = self._get_collective(plan)
+        global_k = self._all_gather_sequence_tensor(local_k, collective, sequence_dim=2)
+        global_v = self._all_gather_sequence_tensor(local_v, collective, sequence_dim=2)
+        return global_k, global_v
+
+    def all_gather_position_ids(
+        self,
+        local_query_positions: torch.Tensor,
+        local_key_positions: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_cuda_plan(plan)
+        _validate_local_position_ids(local_query_positions, local_key_positions, plan)
+        _require_equal_kv_owner_widths(plan, "self-owned CUDA AG")
+        collective = self._get_collective(plan)
+        query_positions = self._all_gather_sequence_tensor(
+            local_query_positions, collective, sequence_dim=1
+        )
+        key_positions = self._all_gather_sequence_tensor(
+            local_key_positions, collective, sequence_dim=1
+        )
+        return query_positions, key_positions
+
+    @staticmethod
+    def _all_gather_sequence_tensor(
+        local: torch.Tensor,
+        collective: Any,
+        *,
+        sequence_dim: int,
+    ) -> torch.Tensor:
+        return _AllGatherSequence.apply(local, collective, sequence_dim)
 
     def all_gather_partial_states(
         self,
@@ -351,14 +499,42 @@ class CUDAAGRSAttentionCPCommunication:
         collective = self._get_collective(plan)
         rank = plan.parallel.cp_rank
         root = plan.merge_root_cp_rank
-        out_input = merged_state.out.permute(2, 0, 1, 3).contiguous()
-        lse_input = merged_state.lse.permute(2, 0, 1).contiguous()
-        if rank != root:
-            out_input = torch.zeros_like(out_input)
-            lse_input = torch.zeros_like(lse_input)
-        out_local = collective.reduce_scatter(out_input).permute(1, 2, 0, 3).contiguous()
-        lse_local = collective.reduce_scatter(lse_input).permute(1, 2, 0).contiguous()
+        out_local = _RootReduceScatterSequence.apply(merged_state.out, collective, 2, rank, root)
+        lse_local = _RootReduceScatterSequence.apply(merged_state.lse, collective, 2, rank, root)
         result = AttentionCPMergedState(out=out_local, lse=lse_local)
+        result.validate()
+        return result
+
+    def reduce_scatter_strict_result(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> AttentionCPOutputShard:
+        self._validate_cuda_plan(plan)
+        _validate_strict_full_result(out, lse, plan)
+        ranges = plan.query_token_ranges
+        if len({end - start for start, end in ranges}) != 1:
+            raise AttentionCPCommunicationUnavailable(
+                "self-owned CUDA RS requires equal contiguous query ranges"
+            )
+        collective = self._get_collective(plan)
+        result = AttentionCPOutputShard(
+            out=_RootReduceScatterSequence.apply(
+                out,
+                collective,
+                2,
+                plan.parallel.cp_rank,
+                plan.merge_root_cp_rank,
+            ),
+            lse=_RootReduceScatterSequence.apply(
+                lse,
+                collective,
+                2,
+                plan.parallel.cp_rank,
+                plan.merge_root_cp_rank,
+            ),
+        )
         result.validate()
         return result
 
@@ -390,6 +566,9 @@ class P2PNCCLAttentionCPCommunication:
     ``reduce_scatter_merged_state`` uses a designated root and explicit P2P
     sends so its numerical behavior is easy to compare with a future CUDA RS.
     """
+
+    backend_id = "p2p_nccl_reference"
+    supports_autograd = False
 
     def __init__(
         self,
@@ -444,6 +623,104 @@ class P2PNCCLAttentionCPCommunication:
         return torch.cat(
             [received[rank] for rank in range(plan.parallel.cp_world_size)],
             dim=2,
+        )
+
+    def all_gather_kv(
+        self,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_runtime(plan)
+        _validate_local_kv_shard(local_k, local_v, plan)
+        self._require_cuda(local_k, local_v)
+        ranges = _kv_owner_ranges(plan)
+        local_rank = plan.parallel.cp_rank
+        gathered_k: dict[int, torch.Tensor] = {local_rank: local_k.contiguous()}
+        gathered_v: dict[int, torch.Tensor] = {local_rank: local_v.contiguous()}
+        operations: list[Any] = []
+        for peer_rank, (start, end) in enumerate(ranges):
+            if peer_rank == local_rank:
+                continue
+            peer = self._global_peer(peer_rank)
+            shape = (*local_k.shape[:2], end - start, local_k.size(3))
+            peer_k = torch.empty(shape, dtype=local_k.dtype, device=local_k.device)
+            peer_v = torch.empty(shape, dtype=local_v.dtype, device=local_v.device)
+            gathered_k[peer_rank] = peer_k
+            gathered_v[peer_rank] = peer_v
+            operations.extend(
+                (
+                    self._dist.P2POp(self._dist.irecv, peer_k, peer, group=self._group),
+                    self._dist.P2POp(self._dist.irecv, peer_v, peer, group=self._group),
+                    self._dist.P2POp(
+                        self._dist.isend, local_k.contiguous(), peer, group=self._group
+                    ),
+                    self._dist.P2POp(
+                        self._dist.isend, local_v.contiguous(), peer, group=self._group
+                    ),
+                )
+            )
+        self._run_operations(operations)
+        return (
+            torch.cat([gathered_k[rank] for rank in range(len(ranges))], dim=2),
+            torch.cat([gathered_v[rank] for rank in range(len(ranges))], dim=2),
+        )
+
+    def all_gather_position_ids(
+        self,
+        local_query_positions: torch.Tensor,
+        local_key_positions: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_runtime(plan)
+        _validate_local_position_ids(local_query_positions, local_key_positions, plan)
+        self._require_cuda(local_query_positions, local_key_positions)
+        query_ranges = plan.query_token_ranges
+        key_ranges = _kv_owner_ranges(plan)
+        local_rank = plan.parallel.cp_rank
+        gathered_q = {local_rank: local_query_positions.contiguous()}
+        gathered_k = {local_rank: local_key_positions.contiguous()}
+        operations: list[Any] = []
+        for peer_rank, ((q_start, q_end), (k_start, k_end)) in enumerate(
+            zip(query_ranges, key_ranges, strict=True)
+        ):
+            if peer_rank == local_rank:
+                continue
+            peer = self._global_peer(peer_rank)
+            peer_q = torch.empty(
+                (local_query_positions.size(0), q_end - q_start),
+                dtype=local_query_positions.dtype,
+                device=local_query_positions.device,
+            )
+            peer_k = torch.empty(
+                (local_key_positions.size(0), k_end - k_start),
+                dtype=local_key_positions.dtype,
+                device=local_key_positions.device,
+            )
+            gathered_q[peer_rank] = peer_q
+            gathered_k[peer_rank] = peer_k
+            operations.extend(
+                (
+                    self._dist.P2POp(self._dist.irecv, peer_q, peer, group=self._group),
+                    self._dist.P2POp(self._dist.irecv, peer_k, peer, group=self._group),
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        local_query_positions.contiguous(),
+                        peer,
+                        group=self._group,
+                    ),
+                    self._dist.P2POp(
+                        self._dist.isend,
+                        local_key_positions.contiguous(),
+                        peer,
+                        group=self._group,
+                    ),
+                )
+            )
+        self._run_operations(operations)
+        return (
+            torch.cat([gathered_q[rank] for rank in range(len(query_ranges))], dim=1),
+            torch.cat([gathered_k[rank] for rank in range(len(key_ranges))], dim=1),
         )
 
     def all_gather_partial_states(
@@ -570,7 +847,11 @@ class P2PNCCLAttentionCPCommunication:
                 result.validate()
                 return result
             out = torch.empty(
-                (*merged_state.out.shape[:2], local_query_tokens, merged_state.out.size(3)),
+                (
+                    *merged_state.out.shape[:2],
+                    local_query_tokens,
+                    merged_state.out.size(3),
+                ),
                 dtype=merged_state.out.dtype,
                 device=merged_state.out.device,
             )
@@ -597,6 +878,67 @@ class P2PNCCLAttentionCPCommunication:
                 ]
             )
             result = AttentionCPMergedState(out=out, lse=lse)
+        result.validate()
+        return result
+
+    def reduce_scatter_strict_result(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        plan: AttentionCPCommunicationPlan,
+    ) -> AttentionCPOutputShard:
+        self._validate_runtime(plan)
+        _validate_strict_full_result(out, lse, plan)
+        self._require_cuda(out, lse)
+        rank = plan.parallel.cp_rank
+        root = plan.merge_root_cp_rank
+        local_start, local_end = plan.query_token_ranges[rank]
+        if rank == root:
+            operations: list[Any] = []
+            for peer_rank, (start, end) in enumerate(plan.query_token_ranges):
+                if peer_rank == root or start == end:
+                    continue
+                peer = self._global_peer(peer_rank)
+                operations.extend(
+                    (
+                        self._dist.P2POp(
+                            self._dist.isend,
+                            out[:, :, start:end, :].contiguous(),
+                            peer,
+                            group=self._group,
+                        ),
+                        self._dist.P2POp(
+                            self._dist.isend,
+                            lse[:, :, start:end].contiguous(),
+                            peer,
+                            group=self._group,
+                        ),
+                    )
+                )
+            self._run_operations(operations)
+            result = AttentionCPOutputShard(
+                out=out[:, :, local_start:local_end, :].contiguous(),
+                lse=lse[:, :, local_start:local_end].contiguous(),
+            )
+        else:
+            out_local = torch.empty(
+                (*out.shape[:2], local_end - local_start, out.size(3)),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            lse_local = torch.empty(
+                (*lse.shape[:2], local_end - local_start),
+                dtype=lse.dtype,
+                device=lse.device,
+            )
+            peer = self._global_peer(root)
+            self._run_operations(
+                (
+                    self._dist.P2POp(self._dist.irecv, out_local, peer, group=self._group),
+                    self._dist.P2POp(self._dist.irecv, lse_local, peer, group=self._group),
+                )
+            )
+            result = AttentionCPOutputShard(out=out_local, lse=lse_local)
         result.validate()
         return result
 
@@ -769,6 +1111,94 @@ def _validate_query_shard(
         raise ValueError("local Q sequence length does not match its query_token_range")
 
 
+def _kv_owner_ranges(
+    plan: AttentionCPCommunicationPlan,
+) -> tuple[tuple[int, int], ...]:
+    """Return one gap-free logical KV range for each CP owner."""
+
+    ranges: list[tuple[int, int]] = []
+    for owner_rank in range(plan.parallel.cp_world_size):
+        blocks = _expected_blocks_for_cp_rank(plan, owner_rank)
+        if not blocks:
+            raise ValueError(f"CP block manifest has no blocks for owner rank {owner_rank}")
+        ordered = sorted(blocks, key=lambda block: block.kv_block_start)
+        start = ordered[0].kv_block_start
+        cursor = start
+        for block in ordered:
+            if block.kv_block_start != cursor:
+                raise ValueError("CP owner KV blocks must form a contiguous range")
+            cursor = block.kv_block_end
+        ranges.append((start, cursor))
+    expected = plan.expected_kv_token_range
+    if expected is None or ranges[0][0] != expected[0] or ranges[-1][1] != expected[1]:
+        raise ValueError("CP owner ranges do not cover expected_kv_token_range")
+    for left, right in zip(ranges, ranges[1:], strict=False):
+        if left[1] != right[0]:
+            raise ValueError("CP owner KV ranges must be gap-free and rank ordered")
+    return tuple(ranges)
+
+
+def _require_equal_kv_owner_widths(
+    plan: AttentionCPCommunicationPlan,
+    backend: str,
+) -> None:
+    widths = {end - start for start, end in _kv_owner_ranges(plan)}
+    if len(widths) != 1:
+        raise AttentionCPCommunicationUnavailable(f"{backend} requires equal KV shard lengths")
+
+
+def _validate_local_kv_shard(
+    local_k: torch.Tensor,
+    local_v: torch.Tensor,
+    plan: AttentionCPCommunicationPlan,
+) -> None:
+    if local_k.ndim != 4 or local_v.ndim != 4:
+        raise ValueError("local K/V must have shape [B,Hkv,Skv_local,D]")
+    if local_k.shape != local_v.shape:
+        raise ValueError("local K/V must have matching shapes")
+    if local_k.dtype != local_v.dtype or local_k.device != local_v.device:
+        raise ValueError("local K/V must have matching dtype and device")
+    start, end = _kv_owner_ranges(plan)[plan.parallel.cp_rank]
+    if local_k.size(2) != end - start:
+        raise ValueError("local K/V width does not match the CP owner range")
+
+
+def _validate_local_position_ids(
+    local_query_positions: torch.Tensor,
+    local_key_positions: torch.Tensor,
+    plan: AttentionCPCommunicationPlan,
+) -> None:
+    integer_dtypes = (torch.int32, torch.int64)
+    if local_query_positions.ndim != 2 or local_key_positions.ndim != 2:
+        raise ValueError("local Q/K position IDs must have shape [B,S_local]")
+    if local_query_positions.dtype not in integer_dtypes or (
+        local_key_positions.dtype not in integer_dtypes
+    ):
+        raise ValueError("local Q/K position IDs must contain integers")
+    if local_query_positions.device != local_key_positions.device:
+        raise ValueError("local Q/K position IDs must be on the same device")
+    query_start, query_end = plan.query_token_ranges[plan.parallel.cp_rank]
+    key_start, key_end = _kv_owner_ranges(plan)[plan.parallel.cp_rank]
+    if local_query_positions.size(1) != query_end - query_start:
+        raise ValueError("local query position width does not match query ownership")
+    if local_key_positions.size(1) != key_end - key_start:
+        raise ValueError("local key position width does not match KV ownership")
+    if local_query_positions.size(0) != local_key_positions.size(0):
+        raise ValueError("local Q/K position IDs must share batch size")
+
+
+def _validate_strict_full_result(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    plan: AttentionCPCommunicationPlan,
+) -> None:
+    result = AttentionCPOutputShard(out=out, lse=lse)
+    result.validate()
+    total_queries = plan.query_token_ranges[-1][1]
+    if out.size(2) != total_queries:
+        raise ValueError("strict full result does not cover all query_token_ranges")
+
+
 def _validate_local_partial_states(
     states: tuple[AttentionCPPartialState, ...],
     plan: AttentionCPCommunicationPlan,
@@ -852,6 +1282,7 @@ __all__ = [
     "AttentionCPCommunicationPlan",
     "AttentionCPCommunicationUnavailable",
     "AttentionCPMergedState",
+    "AttentionCPOutputShard",
     "AttentionCPPartialState",
     "AttentionParallelSpec",
     "CPCommunicationBackend",
