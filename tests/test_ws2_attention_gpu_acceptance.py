@@ -85,6 +85,9 @@ def test_dlogp_default_uses_shared_bf16_logprob_tolerance(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
 
     assert args.dlogp_atol == 5.0e-2
+    assert args.pr7_out_atol == 1.0e-2
+    assert args.pr7_lse_atol == 2.0e-3
+    assert args.pr7_dlogp_atol == 2.0e-3
 
 
 def test_native_te_validator_requires_native_kv_ring_and_cp_compare(tmp_path):
@@ -196,9 +199,9 @@ def test_pr7_strict_validation_rejects_requested_only_split_plan(tmp_path):
             "actual_split_kv_plan_set": None,
         },
         "drift": {
-            "out": {"max_abs": 0.0},
-            "lse": {"max_abs": 0.0},
-            "dlogp": {"max_abs": 0.0},
+            "out": {"max_abs": 5.0e-3},
+            "lse": {"max_abs": 1.0e-3},
+            "dlogp": {"max_abs": 1.0e-3},
         },
         "batch_invariant_sweep": {"passed": True},
         "page_layout_invariant_sweep": {"passed": True},
@@ -209,6 +212,13 @@ def test_pr7_strict_validation_rejects_requested_only_split_plan(tmp_path):
     assert any("actual Split-K policy" in error for error in errors)
     assert any("boundaries" in error for error in errors)
     assert any("plan set" in error for error in errors)
+    assert not any(error.startswith("PR7.") for error in errors)
+
+    report["drift"]["out"]["max_abs"] = 2.0e-2
+    assert any(
+        error.startswith("PR7.out")
+        for error in validate_pr7_report(report, args, expected_policy="fixed")
+    )
 
 
 def test_acceptance_report_is_json_serializable(tmp_path):

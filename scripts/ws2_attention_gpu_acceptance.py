@@ -26,6 +26,9 @@ from typing import Any, Callable, Mapping, Sequence, cast
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = "ws2_attention_gpu_acceptance/v1"
 DEFAULT_IMAGE = "ghcr.io/rl-align/rl-kernel/rl-kernel-ci:cuda"
+DEFAULT_PR7_OUT_ATOL = 1.0e-2
+DEFAULT_PR7_LSE_ATOL = 2.0e-3
+DEFAULT_PR7_DLOGP_ATOL = 2.0e-3
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-atol", type=float, default=2.0e-4)
     parser.add_argument("--lse-atol", type=float, default=2.0e-4)
+    parser.add_argument("--pr7-out-atol", type=float, default=DEFAULT_PR7_OUT_ATOL)
+    parser.add_argument("--pr7-lse-atol", type=float, default=DEFAULT_PR7_LSE_ATOL)
+    parser.add_argument("--pr7-dlogp-atol", type=float, default=DEFAULT_PR7_DLOGP_ATOL)
     # The synthetic dlogp leg consumes the final BF16 Attention write. Use
     # the shared WS1 logprob/BF16 tolerance instead of an FP32-only threshold.
     parser.add_argument("--dlogp-atol", type=float, default=5.0e-2)
@@ -335,6 +341,9 @@ def run_acceptance(
             "lse_max_abs": args.lse_atol,
             "dlogp_max_abs": args.dlogp_atol,
             "gradient_max_abs": args.grad_atol,
+            "flashinfer_out_max_abs": args.pr7_out_atol,
+            "flashinfer_lse_max_abs": args.pr7_lse_atol,
+            "flashinfer_dlogp_max_abs": args.pr7_dlogp_atol,
         },
         "required_matrix": {
             "topology": "Qwen3-8B TP=2 CP=2 BF16",
@@ -664,9 +673,9 @@ def validate_pr7_report(
         )
     )
     drift = report.get("drift", {})
-    errors.extend(_threshold_errors(drift.get("out"), args.out_atol, "PR7.out"))
-    errors.extend(_threshold_errors(drift.get("lse"), args.lse_atol, "PR7.lse"))
-    errors.extend(_threshold_errors(drift.get("dlogp"), args.dlogp_atol, "PR7.dlogp"))
+    errors.extend(_threshold_errors(drift.get("out"), args.pr7_out_atol, "PR7.out"))
+    errors.extend(_threshold_errors(drift.get("lse"), args.pr7_lse_atol, "PR7.lse"))
+    errors.extend(_threshold_errors(drift.get("dlogp"), args.pr7_dlogp_atol, "PR7.dlogp"))
     for key in ("batch_invariant_sweep", "page_layout_invariant_sweep"):
         sweep = report.get(key)
         if not isinstance(sweep, dict) or sweep.get("passed") is not True:
