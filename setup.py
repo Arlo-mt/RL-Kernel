@@ -192,7 +192,8 @@ def get_extensions():
                 "csrc/cuda/fused_linear_logp_sm90.cu",  # TMA + WGMMA fused linear log-prob
                 "csrc/cuda/batch_invariant_logp_kernel_sm90.cu",  # TMA batch-invariant logp
                 "csrc/cuda/rope_sm90.cu",  # RoPE rotate-half apply, gated to SM90 build
-                "csrc/cuda/embedding_lm_head_sm90.cu",  # single-card batch-invariant embedding/lm-head
+                # Single-card batch-invariant embedding/lm-head.
+                "csrc/cuda/embedding_lm_head_sm90.cu",
             ]
             enable_sm90 = envs.env_flag(envs.KERNEL_ALIGN_FORCE_SM90)
             present_sm90 = [s for s in sm90_srcs if os.path.exists(s)]
