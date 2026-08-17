@@ -1439,7 +1439,15 @@ def test_p2p_entrypoint_validates_qwen3_tp_local_shape_before_cuda_math():
     args = p2p_check_script.parse_args(["--q-heads", "32", "--kv-heads", "8"])
 
     with pytest.raises(ValueError, match="TP=2 Qwen3-8B local heads"):
-        p2p_check_script.run_check(args, rank=0, device=torch.device("cpu"))
+        p2p_check_script.run_check(
+            args,
+            global_rank=0,
+            tp_rank=0,
+            cp_rank=0,
+            sp_rank=0,
+            cp_group=None,
+            device=torch.device("cpu"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1451,10 +1459,19 @@ def test_p2p_entrypoint_validates_qwen3_tp_local_shape_before_cuda_math():
             ["--final-write-atol", "nan"],
             "final_write_atol must be finite and non-negative",
         ),
+        (["--repeats", "1"], "repeats must be at least 2"),
     ],
 )
 def test_p2p_entrypoint_rejects_non_acceptance_arguments(argv, message):
     args = p2p_check_script.parse_args(argv)
 
     with pytest.raises(ValueError, match=message):
-        p2p_check_script.run_check(args, rank=0, device=torch.device("cpu"))
+        p2p_check_script.run_check(
+            args,
+            global_rank=0,
+            tp_rank=0,
+            cp_rank=0,
+            sp_rank=0,
+            cp_group=None,
+            device=torch.device("cpu"),
+        )
