@@ -45,6 +45,7 @@ from rl_engine.alignment.cross_config.determinism import (
 )
 from rl_engine.alignment.cross_config.schema import MaterializationStatus
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
     AttentionContractError,
     AttentionMode,
     AttentionRole,
@@ -652,6 +653,23 @@ def _readback(materializer, flat, *, source):
     )
 
 
+def _strict_readback(materializer, flat, *, source):
+    readback = _readback(materializer, flat, source=source)
+    contract = replace(readback.contract, split_kv=SplitKVSpec.disabled())
+    actual_knobs = dict(readback.actual_knobs)
+    actual_knobs["attention.split_kv_policy"] = "disabled"
+    return replace(
+        readback,
+        contract=contract,
+        actual_knobs=actual_knobs,
+        split_kv_plan_set=_plan_set(contract, backend=source),
+        strict_mode=True,
+        strict_core_id=STRICT_ATTENTION_CORE_ID,
+        native_attention_arithmetic=False,
+        strict_split_kv_policy="disabled",
+    )
+
+
 def test_configured_contract_without_runtime_readback_is_unobservable():
     normalized = {
         "batch": {"size": 2},
@@ -788,6 +806,70 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
     assert result.provenance["rollout"]["recorded"]["preprocess.qk_rmsnorm"] == (
         MANDATED_ATTENTION_PREPROCESS_BACKENDS["qk_rmsnorm"]
     )
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_code"),
+    [
+        (
+            {"native_attention_arithmetic": True},
+            BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC,
+        ),
+        (
+            {"strict_core_id": "different.core"},
+            BindingErrorCode.ATTENTION_CORE_MISSING,
+        ),
+        (
+            {"strict_split_kv_policy": "fixed"},
+            BindingErrorCode.ATTENTION_CORE_SPLIT_K,
+        ),
+    ],
+)
+def test_strict_runtime_readback_rejects_non_shared_attention_arithmetic(changes, expected_code):
+    rollout = replace(
+        _strict_readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
+        **changes,
+    )
+    training = _strict_readback(
+        MegatronAttentionMaterializer(),
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="rlkernel.cuda.deterministic_attention",
+        training_backend_id="rlkernel.cuda.deterministic_attention",
+    )
+
+    assert not result.passed
+    assert result.issues_by_code(expected_code)
+
+
+def test_strict_runtime_readback_accepts_shared_no_split_k_core():
+    rollout = _strict_readback(
+        VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"
+    )
+    training = _strict_readback(
+        MegatronAttentionMaterializer(),
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="rlkernel.cuda.deterministic_attention",
+        training_backend_id="rlkernel.cuda.deterministic_attention",
+    )
+
+    assert result.passed
+    assert result.provenance["rollout"]["recorded"]["strict.core_id"] == (STRICT_ATTENTION_CORE_ID)
 
 
 def test_strict_runtime_readback_accepts_common_deterministic_preprocess_fallback():

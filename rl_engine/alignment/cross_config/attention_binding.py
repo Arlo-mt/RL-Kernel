@@ -44,6 +44,7 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
@@ -122,6 +123,10 @@ class BindingErrorCode(str, Enum):
     ATTENTION_PREPROCESS_FALLBACK = "ATTENTION_PREPROCESS_FALLBACK"
     ATTENTION_PROJECTION_MISSING = "ATTENTION_PROJECTION_MISSING"
     ATTENTION_PROJECTION_MISMATCH = "ATTENTION_PROJECTION_MISMATCH"
+    ATTENTION_CORE_MISSING = "ATTENTION_CORE_MISSING"
+    ATTENTION_CORE_MISMATCH = "ATTENTION_CORE_MISMATCH"
+    ATTENTION_NATIVE_ARITHMETIC = "ATTENTION_NATIVE_ARITHMETIC"
+    ATTENTION_CORE_SPLIT_K = "ATTENTION_CORE_SPLIT_K"
 
 
 @dataclass(frozen=True)
@@ -139,6 +144,10 @@ class AttentionRuntimeReadback:
     preprocess_probe_id: str = ""
     preprocess_policy_id: str = PREPROCESS_POLICY_ID
     projection_plans: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    strict_mode: bool = False
+    strict_core_id: str | None = None
+    native_attention_arithmetic: bool = True
+    strict_split_kv_policy: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.contract, AttentionContract):
@@ -170,6 +179,20 @@ class AttentionRuntimeReadback:
             raise ValueError("preprocess_policy_id must be a non-empty string")
         if not isinstance(self.projection_plans, Mapping):
             raise TypeError("projection_plans must be a mapping")
+        if not isinstance(self.strict_mode, bool):
+            raise TypeError("strict_mode must be a bool")
+        if self.strict_core_id is not None and (
+            not isinstance(self.strict_core_id, str) or not self.strict_core_id.strip()
+        ):
+            raise ValueError("strict_core_id must be a non-empty string when provided")
+        if not isinstance(self.native_attention_arithmetic, bool):
+            raise TypeError("native_attention_arithmetic must be a bool")
+        if self.strict_split_kv_policy is not None and self.strict_split_kv_policy not in {
+            "disabled",
+            "fixed",
+            "auto",
+        }:
+            raise ValueError("strict_split_kv_policy must be disabled, fixed, or auto")
         normalized_projection_plans: dict[str, Mapping[str, Any]] = {}
         for name, plan in self.projection_plans.items():
             if not isinstance(name, str) or not isinstance(plan, Mapping):
@@ -210,6 +233,12 @@ class AttentionRuntimeReadback:
             },
             "attention_projections": {
                 name: dict(plan) for name, plan in self.projection_plans.items()
+            },
+            "strict_attention": {
+                "enabled": self.strict_mode,
+                "core_id": self.strict_core_id,
+                "native_attention_arithmetic": self.native_attention_arithmetic,
+                "split_kv_policy": self.strict_split_kv_policy,
             },
             "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
         }
@@ -894,6 +923,8 @@ def bind_attention_runtime_readbacks(
             )
         missing_scope_evidence.extend(_attention_preprocess_issues(side, readback))
         missing_scope_evidence.extend(_attention_projection_issues(side, readback))
+        missing_scope_evidence.extend(_strict_attention_core_issues(side, readback))
+    missing_scope_evidence.extend(_strict_attention_core_pair_issues(rollout, training))
     if rollout.preprocess_fallback != training.preprocess_fallback:
         missing_scope_evidence.append(
             BindingIssue(
@@ -987,6 +1018,10 @@ def bind_attention_runtime_readbacks(
             "preprocess.fallback_reason": rollout.preprocess_fallback_reason,
             "preprocess.probe_id": rollout.preprocess_probe_id,
             "preprocess.policy_id": rollout.preprocess_policy_id,
+            "strict.enabled": rollout.strict_mode,
+            "strict.core_id": rollout.strict_core_id,
+            "strict.native_attention_arithmetic": rollout.native_attention_arithmetic,
+            "strict.split_kv_policy": rollout.strict_split_kv_policy,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in rollout.projection_plans.items()
@@ -1001,12 +1036,91 @@ def bind_attention_runtime_readbacks(
             "preprocess.fallback_reason": training.preprocess_fallback_reason,
             "preprocess.probe_id": training.preprocess_probe_id,
             "preprocess.policy_id": training.preprocess_policy_id,
+            "strict.enabled": training.strict_mode,
+            "strict.core_id": training.strict_core_id,
+            "strict.native_attention_arithmetic": training.native_attention_arithmetic,
+            "strict.split_kv_policy": training.strict_split_kv_policy,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in training.projection_plans.items()
             },
         },
     )
+
+
+def _strict_attention_core_issues(
+    side: str,
+    readback: AttentionRuntimeReadback,
+) -> list[BindingIssue]:
+    if not readback.strict_mode:
+        return []
+    issues = []
+    if readback.strict_core_id != STRICT_ATTENTION_CORE_ID:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_MISSING,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.strict.core_id",
+                message=(
+                    f"{side} strict Attention did not execute the shared core "
+                    f"{STRICT_ATTENTION_CORE_ID!r}"
+                ),
+            )
+        )
+    if readback.native_attention_arithmetic:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.strict.native_attention_arithmetic",
+                message=f"{side} strict Attention entered native TE/FlashInfer arithmetic",
+            )
+        )
+    if (
+        readback.strict_split_kv_policy != "disabled"
+        or readback.contract.split_kv.mode.value != "disabled"
+    ):
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_SPLIT_K,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.strict.split_kv_policy",
+                message=(
+                    f"{side} strict Attention did not prove Split-KV disabled "
+                    "in both runtime evidence and AttentionContract"
+                ),
+            )
+        )
+    return issues
+
+
+def _strict_attention_core_pair_issues(
+    rollout: AttentionRuntimeReadback,
+    training: AttentionRuntimeReadback,
+) -> list[BindingIssue]:
+    if rollout.strict_mode != training.strict_mode:
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="strict.enabled",
+                rollout=rollout.strict_mode,
+                training=training.strict_mode,
+                message="training and rollout must use the same strict Attention mode",
+            )
+        ]
+    if rollout.strict_mode and rollout.strict_core_id != training.strict_core_id:
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="strict.core_id",
+                rollout=rollout.strict_core_id,
+                training=training.strict_core_id,
+                message="training and rollout executed different Attention cores",
+            )
+        ]
+    return []
 
 
 def _attention_preprocess_issues(
