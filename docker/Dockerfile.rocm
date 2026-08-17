@@ -15,6 +15,7 @@ ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1150;gfx1151;gfx12
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV MAX_JOBS=8
 
+USER root
 WORKDIR /opt/rl-kernel
 
 COPY pyproject.toml setup.py* requirements*.txt ./
@@ -23,4 +24,5 @@ RUN pip install --no-cache-dir -U pip \
  && pip install --no-cache-dir -r requirements.txt \
  && pip install --no-cache-dir pytest
 
+USER rlkernel
 WORKDIR /workspace/RL-Kernel

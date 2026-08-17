@@ -3,6 +3,7 @@
 
 import importlib.util
 import os
+import warnings
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -24,14 +25,27 @@ envs = _load_envs_module()
 def _load_torch_extension_tools():
     try:
         import torch
-        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    except ImportError:
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch":
+            raise
         return None, None, None
+
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
     # CUDAExtension is also the supported extension entry point for ROCm
     # PyTorch builds. BuildExtension dispatches .cu/.hip sources to hipcc when
     # torch.version.hip is set.
     return torch, BuildExtension, CUDAExtension
+
+
+def _native_extension_required() -> bool:
+    """Whether the caller explicitly requested a native extension build."""
+    return (
+        envs.env_flag(envs.RL_KERNEL_REQUIRE_EXT)
+        or bool(os.environ.get("PYTORCH_ROCM_ARCH", "").strip())
+        or bool(os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip())
+        or envs.env_flag("FORCE_CUDA")
+    )
 
 
 def _cuda_define_from_env(name: str, macro: str) -> list[str]:
@@ -81,6 +95,19 @@ def _filter_rocm_incompatible_nvcc_flags(flags: list[str]) -> list[str]:
 def get_extensions():
     torch, _, CUDAExtension = _load_torch_extension_tools()
     if torch is None:
+        message = (
+            "PyTorch is unavailable, so rl_engine._C cannot be built. Install a matching "
+            "CUDA/ROCm PyTorch build first, then run "
+            "`RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e .`."
+        )
+        if _native_extension_required():
+            raise RuntimeError(message)
+        warnings.warn(
+            f"{message} Continuing with the pure-Python fallback because no native extension "
+            "was explicitly requested.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return []
 
     extensions = []
@@ -233,6 +260,14 @@ def get_extensions():
                 extra_link_args=extra_link_args,
             )
         )
+
+    if _native_extension_required() and not extensions:
+        raise RuntimeError(
+            "rl_engine._C was requested but no CUDA/ROCm build environment is available. "
+            "Use a matching GPU-enabled PyTorch build; for a GPU-less ROCm build, set "
+            "PYTORCH_ROCM_ARCH to the target architecture."
+        )
+
     return extensions
 
 

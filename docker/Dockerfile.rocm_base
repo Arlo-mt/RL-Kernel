@@ -16,6 +16,9 @@ ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1150;gfx1151;gfx12
 # Keep this wheel index aligned with BASE_IMAGE's ROCm release when overriding it.
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/rocm7.2
 ARG PYTORCH_VERSION=2.12.1
+ARG RL_KERNEL_USER=rlkernel
+ARG RL_KERNEL_UID=10001
+ARG RL_KERNEL_GID=10001
 
 ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:${PATH}
 ENV ROCM_PATH=/opt/rocm
@@ -39,6 +42,11 @@ RUN apt-get update -y \
  && python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
  && python3 -m pip install --no-cache-dir --index-url "${PYTORCH_INDEX_URL}" "torch==${PYTORCH_VERSION}" \
  && python3 -c "import torch; assert torch.version.hip is not None, torch.__version__" \
+ && groupadd --gid "${RL_KERNEL_GID}" "${RL_KERNEL_USER}" \
+ && useradd --uid "${RL_KERNEL_UID}" --gid "${RL_KERNEL_GID}" --create-home --shell /bin/bash "${RL_KERNEL_USER}" \
+ && install -d --owner "${RL_KERNEL_USER}" --group "${RL_KERNEL_USER}" /workspace/RL-Kernel \
  && rm -rf /var/lib/apt/lists/*
 
+ENV HOME=/home/${RL_KERNEL_USER}
 WORKDIR /workspace/RL-Kernel
+USER ${RL_KERNEL_USER}
