@@ -80,8 +80,10 @@ class DeterministicAttentionCore:
         self.split_kv = SplitKVSpec.disabled() if split_kv is None else split_kv
         if not isinstance(self.split_kv, SplitKVSpec):
             raise TypeError("split_kv must be a SplitKVSpec")
-        if self.split_kv.mode is SplitKVMode.AUTO:
-            raise ValueError("strict deterministic Attention core does not allow auto Split-KV")
+        if self.split_kv.mode is not SplitKVMode.DISABLED:
+            raise ValueError(
+                "strict deterministic Attention core requires Split-KV to be disabled"
+            )
         self._reference = DeterministicCPAttentionReferenceOp()
 
     def forward_with_lse(
@@ -107,7 +109,7 @@ class DeterministicAttentionCore:
             query_position_offsets=query_position_offsets,
             key_position_offsets=key_position_offsets,
             cp_world_size=1,
-            kv_chunk_size=self.split_kv.fixed_split_size,
+            kv_chunk_size=None,
         )
         resolved_dtype = q.dtype if output_dtype is None else output_dtype
         if resolved_dtype not in (torch.float16, torch.bfloat16):

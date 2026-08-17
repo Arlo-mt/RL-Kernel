@@ -101,9 +101,10 @@ def test_strict_attention_core_freezes_plan_and_final_write():
     assert result.provenance["native_attention_arithmetic"] is False
 
 
-def test_strict_attention_core_rejects_auto_split_kv():
-    with pytest.raises(ValueError, match="does not allow auto Split-KV"):
-        DeterministicAttentionCore(split_kv=SplitKVSpec.auto())
+@pytest.mark.parametrize("split_kv", [SplitKVSpec.fixed(2), SplitKVSpec.auto()])
+def test_strict_attention_core_rejects_split_kv(split_kv):
+    with pytest.raises(ValueError, match="requires Split-KV to be disabled"):
+        DeterministicAttentionCore(split_kv=split_kv)
 
 
 def test_cp1_matches_native_attention_and_exports_lse():
