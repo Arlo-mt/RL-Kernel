@@ -18,6 +18,11 @@ from typing import Any, Iterable, TypeVar
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
+# Stable identity shared by the training and rollout deterministic Attention
+# core.  Backend adapters may differ, but strict mode must report this ID.
+STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+
+
 class AttentionContractError(ValueError):
     """Raised when attention metadata does not describe a valid invocation."""
 
@@ -1297,9 +1302,7 @@ class AttentionContract:
         if self.qkv_projection.name != "qkv":
             raise AttentionContractError("qkv_projection must use name='qkv'")
         if not isinstance(self.output_projection, AttentionProjectionSpec):
-            raise AttentionContractError(
-                "output_projection must be an AttentionProjectionSpec"
-            )
+            raise AttentionContractError("output_projection must be an AttentionProjectionSpec")
         if self.output_projection.name != "o_proj":
             raise AttentionContractError("output_projection must use name='o_proj'")
         if (
@@ -1665,6 +1668,7 @@ __all__ = [
     "SplitKVRuntimePlanEntry",
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
+    "STRICT_ATTENTION_CORE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]
