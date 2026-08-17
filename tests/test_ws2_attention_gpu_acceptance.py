@@ -44,6 +44,25 @@ def test_matrix_contains_required_modes_splitk_and_communication(tmp_path):
     assert "custom_cuda_ag_rs" in names
 
 
+def test_formal_communication_cases_use_four_rank_three_stage_entrypoint(tmp_path):
+    args = parse_args(["--output", str(tmp_path / "acceptance.json")])
+    cases = {case.name: case for case in build_acceptance_cases(args)}
+
+    p2p = cases["p2p_nccl_reference"]
+    assert p2p.command is not None
+    assert "--nproc-per-node=4" in p2p.command
+    assert "--transport" in p2p.command
+    assert "p2p_nccl_reference" in p2p.command
+    assert "--repeats" in p2p.command
+    assert p2p.report_path is not None
+
+    custom = cases["custom_cuda_ag_rs"]
+    assert custom.command is not None
+    assert "--nproc-per-node=4" in custom.command
+    assert "cuda_ag_rs" in custom.command
+    assert custom.report_path is not None
+
+
 def test_native_te_kv_ring_is_optional_diagnostic(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
     case = next(
@@ -295,137 +314,119 @@ def test_pr5_validation_rejects_nonfinite_or_negative_drift(tmp_path):
     assert sum("finite and non-negative" in error for error in errors) == 2
 
 
-def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
-    def row(rank, query_range):
-        manifest = [
-            {
-                "global_block_index": block,
-                "kv_block_start": block * 4,
-                "kv_block_end": block * 4 + 4,
-                "owner_cp_rank": 0 if block < 2 else 1,
-                "owner_tp_rank": 0,
-            }
-            for block in range(4)
-        ]
-        return {
-            "rank": rank,
-            "world_size": 2,
-            "passed": True,
-            "global_failure_count": 0,
-            "transport": "p2p_nccl_reference",
-            "query_ag": "p2p_nccl_reference",
-            "query_ag_max_abs": 0.0,
-            "device": f"cuda:{rank}",
-            "dtype": "bf16",
-            "accum_dtype": "fp32",
-            "downcast_at": "final_write",
-            "final_output_dtype": "bfloat16",
-            "query_range": query_range,
-            "expected_block_manifest": manifest,
-            "gathered_block_indices": [0, 1, 2, 3],
-            "out_max_abs": 0.0,
-            "lse_max_abs": 0.0,
-            "final_out_max_abs": 0.0,
-            "atol": 2.0e-4,
-            "final_write_atol": 2.0e-2,
-        }
-
-    report = {
-        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
-        "backend": "nccl",
-        "world_size": 2,
-        "global_failure_count": 0,
-        "ranks": [row(0, [0, 8]), row(1, [8, 16])],
-    }
-    assert validate_p2p_report(report) == []
-
-    report["ranks"][1]["transport"] = "gloo"
-    report["ranks"][1]["rank"] = 0
-    errors = validate_p2p_report(report)
-    assert any("NCCL reference transport" in error for error in errors)
-    assert any("ranks 0 and 1" in error for error in errors)
-
-
-def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence():
-    report = {
-        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
-        "backend": "nccl",
-        "world_size": 2,
-        "global_failure_count": 0,
-        "ranks": [
+def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
+    tp_world_size = 1 if world_size == 2 else 2
+    manifest_by_tp = {}
+    rows = []
+    for rank in range(world_size):
+        tp_rank = 0 if world_size == 2 else rank // 2
+        cp_rank = rank % 2
+        manifest = manifest_by_tp.setdefault(
+            tp_rank,
+            [
+                {
+                    "global_block_index": block,
+                    "kv_block_start": block * 4,
+                    "kv_block_end": block * 4 + 4,
+                    "owner_cp_rank": 0 if block < 2 else 1,
+                    "owner_tp_rank": tp_rank,
+                }
+                for block in range(4)
+            ],
+        )
+        rows.append(
             {
                 "rank": rank,
-                "world_size": 2,
+                "global_world_size": world_size,
+                "tp_rank": tp_rank,
+                "tp_world_size": 2,
+                "cp_rank": cp_rank,
+                "cp_world_size": 2,
+                "sp_rank": 0,
+                "sp_world_size": 1,
                 "passed": True,
                 "global_failure_count": 0,
-                "transport": "p2p_nccl_reference",
+                "transport": transport,
+                "query_ag": transport,
+                "protocol": "ag_query_local_kv_rs_out_lse",
+                "query_ag_max_abs": 0.0,
                 "device": f"cuda:{rank}",
                 "dtype": "bf16",
                 "accum_dtype": "fp32",
                 "downcast_at": "final_write",
-                "query_range": [rank * 8, (rank + 1) * 8],
-                "gathered_block_indices": [0, 1],
+                "final_output_dtype": "bfloat16",
+                "query_range": [0, 8] if cp_rank == 0 else [8, 16],
+                "expected_block_manifest": manifest,
+                "local_block_indices": [0, 1] if cp_rank == 0 else [2, 3],
+                "gathered_block_indices": [0, 1, 2, 3],
+                "repeat_count": 3,
+                "repeat_query_bitwise": True,
+                "repeat_out_bitwise": True,
+                "repeat_lse_bitwise": True,
+                "repeat_manifest_bitwise": True,
                 "out_max_abs": 0.0,
                 "lse_max_abs": 0.0,
+                "final_out_max_abs": 0.0,
                 "atol": 2.0e-4,
+                "final_write_atol": 2.0e-2,
             }
-            for rank in range(2)
-        ],
+        )
+    return {
+        "schema_version": (
+            "ws2_p2p_nccl_attention_reference/v1"
+            if transport == "p2p_nccl_reference"
+            else "ws2_cuda_ag_rs_attention/v1"
+        ),
+        "backend": "nccl",
+        "transport": transport,
+        "world_size": world_size,
+        "tp_world_size": tp_world_size,
+        "cp_world_size": 2,
+        "sp_world_size": 1,
+        "global_failure_count": 0,
+        "ranks": rows,
     }
 
-    errors = validate_p2p_report(report)
+
+def test_p2p_validation_binds_nccl_rank_and_arithmetic_provenance():
+    report = _valid_p2p_report()
+    assert validate_p2p_report(report, expected_world_size=4) == []
+
+    report["ranks"][1]["transport"] = "gloo"
+    report["ranks"][1]["rank"] = 0
+    errors = validate_p2p_report(report, expected_world_size=4)
+    assert any("p2p_nccl_reference" in error for error in errors)
+    assert any("ranks 0 through 3" in error for error in errors)
+
+
+def test_p2p_validation_accepts_legacy_two_rank_artifact():
+    report = _valid_p2p_report(world_size=2)
+    assert validate_p2p_report(report) == []
+    assert validate_p2p_report(report, expected_world_size=4)
+
+
+def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence():
+    report = _valid_p2p_report()
+    for row in report["ranks"]:
+        row.pop("final_output_dtype")
+        row.pop("expected_block_manifest")
+        row.pop("final_out_max_abs")
+        row.pop("final_write_atol")
+
+    errors = validate_p2p_report(report, expected_world_size=4)
     assert any("final output dtype" in error for error in errors)
     assert any("gathered block order/coverage" in error for error in errors)
     assert any("final_out_max_abs" in error for error in errors)
 
 
 def test_p2p_validation_rejects_forged_manifest_and_rank_query_mapping():
-    def row(rank, query_range):
-        return {
-            "rank": rank,
-            "world_size": 2,
-            "global_failure_count": 0,
-            "passed": True,
-            "transport": "p2p_nccl_reference",
-            "device": f"cuda:{rank}",
-            "dtype": "bf16",
-            "accum_dtype": "fp32",
-            "downcast_at": "final_write",
-            "final_output_dtype": "bfloat16",
-            "query_range": query_range,
-            "expected_block_manifest": [
-                {
-                    "global_block_index": 0,
-                    "kv_block_start": 0,
-                    "kv_block_end": 4,
-                    "owner_cp_rank": 0,
-                    "owner_tp_rank": 0,
-                },
-                {
-                    "global_block_index": 1,
-                    "kv_block_start": 5,
-                    "kv_block_end": 8,
-                    "owner_cp_rank": 3,
-                    "owner_tp_rank": 0,
-                },
-            ],
-            "gathered_block_indices": [0, 1],
-            "out_max_abs": 0.0,
-            "lse_max_abs": 0.0,
-            "final_out_max_abs": 0.0,
-            "atol": 2.0e-4,
-            "final_write_atol": 2.0e-2,
-        }
+    report = _valid_p2p_report()
+    report["ranks"][0]["expected_block_manifest"][1]["kv_block_start"] = 5
+    report["ranks"][0]["expected_block_manifest"][1]["owner_cp_rank"] = 3
+    report["ranks"][0]["query_range"] = [8, 16]
+    report["ranks"][1]["query_range"] = [0, 8]
 
-    report = {
-        "schema_version": "ws2_p2p_nccl_attention_reference/v1",
-        "backend": "nccl",
-        "world_size": 2,
-        "global_failure_count": 0,
-        "ranks": [row(0, [8, 16]), row(1, [0, 8])],
-    }
-
-    errors = validate_p2p_report(report)
+    errors = validate_p2p_report(report, expected_world_size=4)
     assert any("gap-free KV coverage" in error for error in errors)
     assert any("outside the TP-local CP=2 group" in error for error in errors)
     assert any("both CP ranks" in error for error in errors)

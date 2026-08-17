@@ -93,6 +93,15 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     pr7_script = REPO_ROOT / "scripts" / "ws2_pr7_flashinfer_attention_check.py"
     pr7_available = pr7_script.is_file()
     pr7_unavailable = None if pr7_available else "PR7 validation script is absent; integrate #279"
+    p2p_script = REPO_ROOT / "scripts" / "ws2_p2p_nccl_attention_reference_check.py"
+    p2p_report = artifact_dir / "ws2-p2p-nccl-tp2-cp2.json"
+    custom_ag_rs_report = artifact_dir / "ws2-custom-cuda-ag-rs-tp2-cp2.json"
+    p2p_available = p2p_script.is_file()
+    p2p_unavailable = (
+        None
+        if p2p_available
+        else "three-stage Attention communication check is absent; integrate #279"
+    )
     collective_script = REPO_ROOT / "scripts" / "ws2_deterministic_collective_attention_check.py"
     collective_report = artifact_dir / "ws2-self-owned-attention-collectives.json"
     collective_available = collective_script.is_file()
@@ -141,14 +150,30 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
         AcceptanceCase(
             name="p2p_nccl_reference",
             command=(
-                torchrun,
-                "--standalone",
-                "--nproc-per-node=2",
-                str(REPO_ROOT / "scripts" / "ws2_p2p_nccl_attention_reference_check.py"),
-                "--atol",
-                str(args.out_atol),
+                (
+                    torchrun,
+                    "--standalone",
+                    "--nproc-per-node=4",
+                    str(p2p_script),
+                    "--transport",
+                    "p2p_nccl_reference",
+                    "--repeats",
+                    "3",
+                    "--atol",
+                    str(args.out_atol),
+                    "--output",
+                    str(p2p_report),
+                )
+                if p2p_available
+                else None
             ),
-            validator=validate_p2p_report,
+            report_path=p2p_report,
+            validator=lambda report: validate_p2p_report(
+                report,
+                expected_transport="p2p_nccl_reference",
+                expected_world_size=4,
+            ),
+            unavailable_reason=p2p_unavailable,
         ),
         AcceptanceCase(
             name="native_te_kv_ring_cp_compare",
@@ -230,17 +255,27 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
                 (
                     torchrun,
                     "--standalone",
-                    f"--nproc-per-node={args.collective_world_size}",
-                    str(collective_script),
+                    "--nproc-per-node=4",
+                    str(p2p_script),
+                    "--transport",
+                    "cuda_ag_rs",
+                    "--repeats",
+                    "3",
+                    "--atol",
+                    str(args.out_atol),
                     "--output",
-                    str(collective_report),
+                    str(custom_ag_rs_report),
                 )
-                if collective_available
+                if p2p_available
                 else None
             ),
-            report_path=collective_report,
-            validator=lambda report: validate_collective_report(report, args, operation="ag_rs"),
-            unavailable_reason=collective_unavailable,
+            report_path=custom_ag_rs_report,
+            validator=lambda report: validate_p2p_report(
+                report,
+                expected_transport="cuda_ag_rs",
+                expected_world_size=4,
+            ),
+            unavailable_reason=p2p_unavailable,
         )
     )
     cases.append(
@@ -639,42 +674,87 @@ def validate_pr7_report(
     return errors
 
 
-def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
+def validate_p2p_report(
+    report: Mapping[str, Any],
+    *,
+    expected_transport: str = "p2p_nccl_reference",
+    expected_world_size: int | None = None,
+) -> list[str]:
+    """Validate the real three-stage Attention communication report.
+
+    World size 2 is retained for old artifacts.  The acceptance gate passes
+    ``expected_world_size=4`` so a legacy two-rank report cannot accidentally
+    satisfy the formal TP=2, CP=2 gate.
+    """
+
     errors: list[str] = []
-    if report.get("schema_version") != "ws2_p2p_nccl_attention_reference/v1":
+    if expected_transport not in {"p2p_nccl_reference", "cuda_ag_rs"}:
+        return [f"unsupported P2P transport expectation: {expected_transport}"]
+    expected_schema = (
+        "ws2_p2p_nccl_attention_reference/v1"
+        if expected_transport == "p2p_nccl_reference"
+        else "ws2_cuda_ag_rs_attention/v1"
+    )
+    if report.get("schema_version") != expected_schema:
         errors.append("P2P report schema is invalid")
+    if report.get("transport") != expected_transport:
+        errors.append(f"P2P report did not use {expected_transport}")
     if "nccl" not in str(report.get("backend", "")).lower():
         errors.append("P2P report backend is not NCCL")
-    if report.get("world_size") != 2:
-        errors.append("P2P report world size is not 2")
+    world_size = report.get("world_size")
+    if not isinstance(world_size, int) or world_size not in {2, 4}:
+        errors.append("P2P report world size must be the legacy 2 or formal 4")
+        return errors
+    if expected_world_size is not None and world_size != expected_world_size:
+        errors.append(f"P2P report world size is not {expected_world_size}")
+    if report.get("tp_world_size") != (1 if world_size == 2 else 2):
+        errors.append("P2P report TP world size is inconsistent with the rank topology")
+    if report.get("cp_world_size") != 2:
+        errors.append("P2P report CP world size is not 2")
+    if report.get("sp_world_size") != 1:
+        errors.append("P2P report SP world size must be 1 for the Attention gate")
     if report.get("global_failure_count") != 0:
         errors.append("P2P report has global rank failures")
     ranks = report.get("ranks")
-    if not isinstance(ranks, list) or len(ranks) != 2:
-        errors.append("P2P report must contain exactly two rank reports")
+    if not isinstance(ranks, list) or len(ranks) != world_size:
+        errors.append(f"P2P report must contain exactly {world_size} rank reports")
         return errors
+
     seen_ranks: set[int] = set()
-    query_ranges_by_rank: dict[int, list[int]] = {}
-    gathered_manifests: list[list[Mapping[str, Any]]] = []
+    seen_coords: set[tuple[int, int]] = set()
+    query_ranges_by_tp: dict[int, dict[int, list[int]]] = {}
+    manifests_by_tp: dict[int, list[list[Any]]] = {}
     for index, row in enumerate(ranks):
         if not isinstance(row, dict):
             errors.append(f"P2P rank {index} report is invalid")
             continue
         rank = row.get("rank")
+        tp_rank = row.get("tp_rank")
+        cp_rank = row.get("cp_rank")
         if not isinstance(rank, int):
             errors.append(f"P2P row {index} lacks an integer rank")
-        else:
-            seen_ranks.add(rank)
-            if row.get("global_failure_count") != 0:
-                errors.append(f"P2P rank {index} observed global rank failures")
+            continue
+        seen_ranks.add(rank)
+        if rank < 0 or rank >= world_size:
+            errors.append(f"P2P rank {index} is outside the world")
+        expected_tp = 0 if world_size == 2 else rank // 2
+        expected_cp = rank % 2
+        if (tp_rank, cp_rank) != (expected_tp, expected_cp):
+            errors.append(f"P2P rank {index} TP/CP coordinates are inconsistent with rank order")
+        if isinstance(tp_rank, int) and isinstance(cp_rank, int):
+            seen_coords.add((tp_rank, cp_rank))
+        if row.get("global_world_size") != world_size:
+            errors.append(f"P2P rank {index} global world size is inconsistent")
+        if row.get("global_failure_count") != 0:
+            errors.append(f"P2P rank {index} observed global rank failures")
         if row.get("passed") is not True:
             errors.append(f"P2P rank {index} did not pass")
-        if row.get("world_size") != 2:
-            errors.append(f"P2P rank {index} world size is not 2")
-        if row.get("transport") != "p2p_nccl_reference":
-            errors.append(f"P2P rank {index} did not use the NCCL reference transport")
-        if row.get("query_ag") != "p2p_nccl_reference":
-            errors.append(f"P2P rank {index} did not execute the Q AllGather reference")
+        if row.get("transport") != expected_transport:
+            errors.append(f"P2P rank {index} did not use {expected_transport}")
+        if row.get("query_ag") != expected_transport:
+            errors.append(f"P2P rank {index} did not execute the expected Q AllGather")
+        if row.get("protocol") != "ag_query_local_kv_rs_out_lse":
+            errors.append(f"P2P rank {index} did not execute the three-stage protocol")
         if row.get("query_ag_max_abs") != 0.0:
             errors.append(f"P2P rank {index} Q AllGather was not bitwise exact")
         if row.get("dtype") != "bf16" or row.get("accum_dtype") != "fp32":
@@ -685,19 +765,34 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             errors.append(f"P2P rank {index} final output dtype is not BF16")
         if not str(row.get("device", "")).startswith("cuda"):
             errors.append(f"P2P rank {index} was not executed on CUDA")
+        if not isinstance(row.get("repeat_count"), int) or row["repeat_count"] < 2:
+            errors.append(f"P2P rank {index} repeat count is insufficient")
+        for repeat_name in (
+            "repeat_query_bitwise",
+            "repeat_out_bitwise",
+            "repeat_lse_bitwise",
+            "repeat_manifest_bitwise",
+        ):
+            if row.get(repeat_name) is not True:
+                errors.append(f"P2P rank {index} {repeat_name} did not pass")
+
         query_range = row.get("query_range")
         if not (
             isinstance(query_range, list)
             and len(query_range) == 2
-            and all(isinstance(value, int) for value in query_range)
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in query_range)
+            and query_range[0] < query_range[1]
         ):
             errors.append(f"P2P rank {index} query ownership is invalid")
-        else:
-            if isinstance(rank, int):
-                query_ranges_by_rank[rank] = query_range
+        elif isinstance(tp_rank, int) and isinstance(cp_rank, int):
+            query_ranges_by_tp.setdefault(tp_rank, {})[cp_rank] = query_range
+
         gathered_indices = row.get("gathered_block_indices")
         block_manifest = row.get("expected_block_manifest")
-        manifest_errors, manifest_indices = _validate_p2p_block_manifest(block_manifest)
+        manifest_errors, manifest_indices = _validate_p2p_block_manifest(
+            block_manifest,
+            expected_tp_rank=tp_rank if isinstance(tp_rank, int) else None,
+        )
         errors.extend(f"P2P rank {index}: {error}" for error in manifest_errors)
         if not (
             isinstance(gathered_indices, list)
@@ -706,9 +801,21 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
             and manifest_indices == gathered_indices
         ):
             errors.append(f"P2P rank {index} gathered block order/coverage is invalid")
-        else:
-            assert isinstance(block_manifest, list)
-            gathered_manifests.append(block_manifest)
+        if (
+            isinstance(tp_rank, int)
+            and isinstance(cp_rank, int)
+            and isinstance(manifest_indices, list)
+            and isinstance(block_manifest, list)
+        ):
+            local_indices = row.get("local_block_indices")
+            expected_local = [
+                block_index
+                for block_index, block in enumerate(block_manifest or [])
+                if isinstance(block, Mapping) and block.get("owner_cp_rank") == cp_rank
+            ]
+            if local_indices != expected_local:
+                errors.append(f"P2P rank {index} local block ownership is invalid")
+            manifests_by_tp.setdefault(tp_rank, []).append(block_manifest)
         for name in ("out_max_abs", "lse_max_abs"):
             errors.extend(
                 _scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}")
@@ -720,22 +827,37 @@ def validate_p2p_report(report: Mapping[str, Any]) -> list[str]:
                 f"P2P rank {index}.final_out_max_abs",
             )
         )
-    if seen_ranks != {0, 1}:
-        errors.append("P2P report must cover ranks 0 and 1 exactly")
-    ordered_query_ranges = [query_ranges_by_rank.get(rank) for rank in range(2)]
-    if any(bounds is None for bounds in ordered_query_ranges):
-        errors.append("P2P query ownership ranges are not canonical and contiguous")
-    else:
-        first_range, second_range = ordered_query_ranges
-        assert first_range is not None and second_range is not None
+
+    expected_ranks = set(range(world_size))
+    if seen_ranks != expected_ranks:
+        errors.append(f"P2P report must cover ranks 0 through {world_size - 1} exactly")
+    expected_coords = (
+        {(0, cp) for cp in range(2)}
+        if world_size == 2
+        else {(tp, cp) for tp in range(2) for cp in range(2)}
+    )
+    if seen_coords != expected_coords:
+        errors.append("P2P report must cover the canonical TP/CP coordinate grid")
+
+    for tp_rank in range(1 if world_size == 2 else 2):
+        ranges = query_ranges_by_tp.get(tp_rank, {})
+        first_range = ranges.get(0)
+        second_range = ranges.get(1)
         if (
-            first_range[0] != 0
+            first_range is None
+            or second_range is None
+            or first_range[0] != 0
             or first_range[1] != second_range[0]
             or second_range[1] <= second_range[0]
         ):
-            errors.append("P2P query ownership ranges are not canonical and contiguous")
-    if len(gathered_manifests) == 2 and gathered_manifests[0] != gathered_manifests[1]:
-        errors.append("P2P ranks gathered different logical block manifests")
+            errors.append(f"P2P TP group {tp_rank} query ownership is not canonical and contiguous")
+        if tp_rank > 0 and ranges != query_ranges_by_tp.get(0, {}):
+            errors.append("P2P TP groups have different query ownership ranges")
+        manifests = manifests_by_tp.get(tp_rank, [])
+        if len(manifests) != 2:
+            errors.append(f"P2P TP group {tp_rank} must contain both CP rank manifests")
+        elif manifests[0] != manifests[1]:
+            errors.append(f"P2P TP group {tp_rank} gathered different logical block manifests")
     return errors
 
 
@@ -783,7 +905,11 @@ def validate_collective_report(
     return errors
 
 
-def _validate_p2p_block_manifest(manifest: Any) -> tuple[list[str], list[int] | None]:
+def _validate_p2p_block_manifest(
+    manifest: Any,
+    *,
+    expected_tp_rank: int | None,
+) -> tuple[list[str], list[int] | None]:
     if not isinstance(manifest, list) or not manifest:
         return ["expected block manifest is missing"], None
     required = {
@@ -819,7 +945,9 @@ def _validate_p2p_block_manifest(manifest: Any) -> tuple[list[str], list[int] | 
         if start != cursor or end <= start:
             errors.append(f"manifest block {index} does not preserve gap-free KV coverage")
         cursor = end
-        if owner_cp_rank not in {0, 1} or owner_tp_rank != 0:
+        if owner_cp_rank not in {0, 1} or (
+            expected_tp_rank is not None and owner_tp_rank != expected_tp_rank
+        ):
             errors.append(f"manifest block {index} owner is outside the TP-local CP=2 group")
     if owners != {0, 1}:
         errors.append("manifest does not assign KV blocks to both CP ranks")
