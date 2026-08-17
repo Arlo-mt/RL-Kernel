@@ -14,9 +14,12 @@ import math
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
+    STRICT_ATTENTION_CORE_ID,
     compare_cp_attention_backward,
     merge_attention_partial_states,
     split_kv_execution_plan_provenance,
@@ -81,6 +84,26 @@ def _full_lse(q, k, *, causal, scale=None, key_padding_mask=None):
     if key_padding_mask is not None:
         scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
     return torch.logsumexp(scores, dim=-1)
+
+
+def test_strict_attention_core_freezes_plan_and_final_write():
+    q, k, v = _qkv(1, 3, 4, seed=17, dtype=torch.bfloat16)
+    core = DeterministicAttentionCore()
+    result = core.forward_with_lse(q, k, v, output_dtype=torch.bfloat16)
+
+    assert result.out.dtype is torch.bfloat16
+    assert result.lse.dtype is torch.float32
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["merge_order"] == "global_block_index"
+    assert result.provenance["accum_dtype"] == "fp32"
+    assert result.provenance["downcast_at"] == "final_write"
+    assert result.provenance["fallback"] is False
+    assert result.provenance["native_attention_arithmetic"] is False
+
+
+def test_strict_attention_core_rejects_auto_split_kv():
+    with pytest.raises(ValueError, match="does not allow auto Split-KV"):
+        DeterministicAttentionCore(split_kv=SplitKVSpec.auto())
 
 
 def test_cp1_matches_native_attention_and_exports_lse():

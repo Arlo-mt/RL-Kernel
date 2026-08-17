@@ -22,6 +22,8 @@ from rl_engine.kernels.attention_contract import (
     SplitKVRuntimeCoordinate,
     SplitKVRuntimePlanEntry,
     SplitKVRuntimePlanSet,
+    SplitKVSpec,
+    STRICT_ATTENTION_CORE_ID,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
@@ -54,6 +56,78 @@ class AttentionPartialState:
             raise ValueError("block_start must be non-negative")
         if self.block_end < self.block_start:
             raise ValueError("block_end must be >= block_start")
+
+
+@dataclass(frozen=True)
+class DeterministicAttentionCoreResult:
+    """Strict-core output and the exact arithmetic plan used for it."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    provenance: dict[str, object]
+
+
+class DeterministicAttentionCore:
+    """Common FP32 Attention arithmetic used by both train and rollout."""
+
+    core_id = STRICT_ATTENTION_CORE_ID
+    backend_id = "rlkernel.attention.cp_reference"
+    merge_order = "global_block_index"
+    accum_dtype = "fp32"
+    downcast_at = "final_write"
+
+    def __init__(self, *, split_kv: SplitKVSpec | None = None) -> None:
+        self.split_kv = SplitKVSpec.disabled() if split_kv is None else split_kv
+        if not isinstance(self.split_kv, SplitKVSpec):
+            raise TypeError("split_kv must be a SplitKVSpec")
+        if self.split_kv.mode is SplitKVMode.AUTO:
+            raise ValueError("strict deterministic Attention core does not allow auto Split-KV")
+        self._reference = DeterministicCPAttentionReferenceOp()
+
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: float | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        query_position_offsets: torch.Tensor | None = None,
+        key_position_offsets: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        out, lse = self._reference.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=1,
+            kv_chunk_size=self.split_kv.fixed_split_size,
+        )
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict Attention output_dtype must be FP16 or BF16")
+        plan = self.split_kv.resolve(k.size(2), backend=self.backend_id)
+        return DeterministicAttentionCoreResult(
+            out=out.to(dtype=resolved_dtype),
+            lse=lse,
+            provenance={
+                "strict_core_id": self.core_id,
+                "attention_backend": self.backend_id,
+                "split_kv": plan.to_dict(),
+                "merge_order": self.merge_order,
+                "accum_dtype": self.accum_dtype,
+                "downcast_at": self.downcast_at,
+                "fallback": False,
+                "fallback_reason": None,
+                "native_attention_arithmetic": False,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -1103,8 +1177,11 @@ __all__ = [
     "AttentionPartialState",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
+    "DeterministicAttentionCore",
+    "DeterministicAttentionCoreResult",
     "DeterministicCPAttentionReferenceOp",
     "GradientDriftStats",
+    "STRICT_ATTENTION_CORE_ID",
     "compare_cp_attention_backward",
     "merge_attention_partial_states",
     "split_kv_execution_plan_provenance",
