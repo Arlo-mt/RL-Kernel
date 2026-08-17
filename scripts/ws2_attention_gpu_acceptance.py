@@ -20,6 +20,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, cast
 
@@ -100,8 +101,6 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
     pr7_available = pr7_script.is_file()
     pr7_unavailable = None if pr7_available else "PR7 validation script is absent; integrate #279"
     p2p_script = REPO_ROOT / "scripts" / "ws2_p2p_nccl_attention_reference_check.py"
-    p2p_report = artifact_dir / "ws2-p2p-nccl-tp2-cp2.json"
-    custom_ag_rs_report = artifact_dir / "ws2-custom-cuda-ag-rs-tp2-cp2.json"
     p2p_available = p2p_script.is_file()
     p2p_unavailable = (
         None
@@ -154,34 +153,6 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
             validator=lambda report: validate_pr5_report(report, args),
         ),
         AcceptanceCase(
-            name="p2p_nccl_reference",
-            command=(
-                (
-                    torchrun,
-                    "--standalone",
-                    "--nproc-per-node=4",
-                    str(p2p_script),
-                    "--transport",
-                    "p2p_nccl_reference",
-                    "--repeats",
-                    "3",
-                    "--atol",
-                    str(args.out_atol),
-                    "--output",
-                    str(p2p_report),
-                )
-                if p2p_available
-                else None
-            ),
-            report_path=p2p_report,
-            validator=lambda report: validate_p2p_report(
-                report,
-                expected_transport="p2p_nccl_reference",
-                expected_world_size=4,
-            ),
-            unavailable_reason=p2p_unavailable,
-        ),
-        AcceptanceCase(
             name="native_te_kv_ring_cp_compare",
             # TE's native KV ring is a diagnostic/performance baseline.  It
             # currently exposes CP-dependent drift and must not gate the
@@ -214,6 +185,46 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
             unavailable_reason=te_unavailable,
         ),
     ]
+    for transport, prefix in (
+        ("p2p_nccl_reference", "p2p_nccl_reference"),
+        ("cuda_ag_rs", "custom_cuda_ag_rs"),
+    ):
+        for world_size, suffix in ((2, ""), (4, "_tp2_cp2"), (8, "_tp2_cp2_replica2")):
+            name = f"{prefix}{suffix}"
+            report_path = artifact_dir / f"ws2-{name}.json"
+            strict_core_expected = transport == "cuda_ag_rs"
+            command = [
+                torchrun,
+                "--standalone",
+                f"--nproc-per-node={world_size}",
+                str(p2p_script),
+                "--transport",
+                transport,
+                "--repeats",
+                "3",
+                "--atol",
+                str(args.out_atol),
+                "--final-write-atol",
+                str(max(args.out_atol * 100.0, 2.0e-2)),
+                "--output",
+                str(report_path),
+            ]
+            if strict_core_expected:
+                command.append("--strict-shared-core")
+            cases.append(
+                AcceptanceCase(
+                    name=name,
+                    command=tuple(command) if p2p_available else None,
+                    report_path=report_path,
+                    validator=partial(
+                        validate_p2p_report,
+                        expected_transport=transport,
+                        expected_world_size=world_size,
+                        expected_strict_core=strict_core_expected,
+                    ),
+                    unavailable_reason=p2p_unavailable,
+                )
+            )
     for name, mode, query_len, policy, fixed_size in (
         ("decode-disabled", "decode", 1, "disabled", None),
         ("decode-fixed", "decode", 1, "fixed", 4),
@@ -235,55 +246,34 @@ def build_acceptance_cases(args: argparse.Namespace) -> tuple[AcceptanceCase, ..
             "--output",
             str(pr7_reports[name]),
         ]
+        strict_expected = policy == "disabled"
+        if strict_expected:
+            command.append("--strict")
         if fixed_size is not None:
             command.extend(("--fixed-split-size", str(fixed_size)))
 
-        def pr7_validator(report: Mapping[str, Any], expected_policy: str = policy) -> list[str]:
+        def pr7_validator(
+            report: Mapping[str, Any],
+            expected_policy: str = policy,
+            strict: bool = strict_expected,
+        ) -> list[str]:
             return validate_pr7_report(
                 report,
                 args,
                 expected_policy=expected_policy,
+                strict_expected=strict,
             )
 
         cases.append(
             AcceptanceCase(
                 name=f"pr7_flashinfer_{name.replace('-', '_')}",
                 command=tuple(command) if pr7_available else None,
+                required=strict_expected,
                 report_path=pr7_reports[name],
                 validator=pr7_validator,
                 unavailable_reason=pr7_unavailable,
             )
         )
-    cases.append(
-        AcceptanceCase(
-            name="custom_cuda_ag_rs",
-            command=(
-                (
-                    torchrun,
-                    "--standalone",
-                    "--nproc-per-node=4",
-                    str(p2p_script),
-                    "--transport",
-                    "cuda_ag_rs",
-                    "--repeats",
-                    "3",
-                    "--atol",
-                    str(args.out_atol),
-                    "--output",
-                    str(custom_ag_rs_report),
-                )
-                if p2p_available
-                else None
-            ),
-            report_path=custom_ag_rs_report,
-            validator=lambda report: validate_p2p_report(
-                report,
-                expected_transport="cuda_ag_rs",
-                expected_world_size=4,
-            ),
-            unavailable_reason=p2p_unavailable,
-        )
-    )
     cases.append(
         AcceptanceCase(
             name="custom_cuda_allreduce",
@@ -641,6 +631,7 @@ def validate_pr7_report(
     args: argparse.Namespace,
     *,
     expected_policy: str,
+    strict_expected: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     if report.get("status") != "passed" or report.get("passed") is not True:
@@ -651,7 +642,18 @@ def validate_pr7_report(
         return errors
     if provenance.get("arithmetic_semantics_verified") is not True:
         errors.append("PR7 arithmetic semantics are not runtime-verified")
-    plans = provenance.get("actual_split_kv_plans")
+    if strict_expected:
+        if provenance.get("strict_mode") is not True:
+            errors.append("PR7 strict mode was not executed")
+        if provenance.get("strict_core_id") != "rlkernel.attention.deterministic_core.v1":
+            errors.append("PR7 strict core identity is invalid")
+        if provenance.get("native_attention_arithmetic") is not False:
+            errors.append("PR7 strict path entered native FlashInfer Attention arithmetic")
+        if provenance.get("fallback") is not False:
+            errors.append("PR7 strict path used a fallback")
+        plans = provenance.get("strict_core_row_plans")
+    else:
+        plans = provenance.get("actual_split_kv_plans")
     if not isinstance(plans, list) or not plans:
         errors.append("PR7 actual Split-K plans are missing")
     else:
@@ -660,18 +662,19 @@ def validate_pr7_report(
                 errors.append("PR7 actual Split-K policy differs from the requested policy")
             if not plan.get("actual_split_boundaries"):
                 errors.append("PR7 actual Split-K boundaries are missing")
-    plan_set = provenance.get("actual_split_kv_plan_set")
-    shape = report.get("shape", {})
-    errors.extend(
-        _validate_runtime_plan_set(
-            plan_set,
-            expected_batch=_report_positive_int(shape, "batch_size"),
-            expected_tp=2,
-            expected_cp=2,
-            expected_policy=expected_policy,
-            label="PR7 actual Split-KV plan set",
+    if not strict_expected:
+        plan_set = provenance.get("actual_split_kv_plan_set")
+        shape = report.get("shape", {})
+        errors.extend(
+            _validate_runtime_plan_set(
+                plan_set,
+                expected_batch=_report_positive_int(shape, "batch_size"),
+                expected_tp=2,
+                expected_cp=2,
+                expected_policy=expected_policy,
+                label="PR7 actual Split-KV plan set",
+            )
         )
-    )
     drift = report.get("drift", {})
     errors.extend(_threshold_errors(drift.get("out"), args.pr7_out_atol, "PR7.out"))
     errors.extend(_threshold_errors(drift.get("lse"), args.pr7_lse_atol, "PR7.lse"))
@@ -688,13 +691,9 @@ def validate_p2p_report(
     *,
     expected_transport: str = "p2p_nccl_reference",
     expected_world_size: int | None = None,
+    expected_strict_core: bool = False,
 ) -> list[str]:
-    """Validate the real three-stage Attention communication report.
-
-    World size 2 is retained for old artifacts.  The acceptance gate passes
-    ``expected_world_size=4`` so a legacy two-rank report cannot accidentally
-    satisfy the formal TP=2, CP=2 gate.
-    """
+    """Validate CP-only, TP2/CP2, and replicated TP2/CP2 communication runs."""
 
     errors: list[str] = []
     if expected_transport not in {"p2p_nccl_reference", "cuda_ag_rs"}:
@@ -711,17 +710,19 @@ def validate_p2p_report(
     if "nccl" not in str(report.get("backend", "")).lower():
         errors.append("P2P report backend is not NCCL")
     world_size = report.get("world_size")
-    if not isinstance(world_size, int) or world_size not in {2, 4}:
-        errors.append("P2P report world size must be the legacy 2 or formal 4")
+    if not isinstance(world_size, int) or world_size not in {2, 4, 8}:
+        errors.append("P2P report world size must be 2, 4, or 8")
         return errors
     if expected_world_size is not None and world_size != expected_world_size:
         errors.append(f"P2P report world size is not {expected_world_size}")
-    if report.get("tp_world_size") != (1 if world_size == 2 else 2):
+    expected_tp_world_size = 1 if world_size == 2 else 2
+    expected_replica_count = 2 if world_size == 8 else 1
+    if report.get("tp_world_size") != expected_tp_world_size:
         errors.append("P2P report TP world size is inconsistent with the rank topology")
     if report.get("cp_world_size") != 2:
         errors.append("P2P report CP world size is not 2")
-    if report.get("sp_world_size") != 1:
-        errors.append("P2P report SP world size must be 1 for the Attention gate")
+    if report.get("replica_count") != expected_replica_count:
+        errors.append("P2P report replica count is inconsistent with the rank topology")
     if report.get("global_failure_count") != 0:
         errors.append("P2P report has global rank failures")
     ranks = report.get("ranks")
@@ -730,9 +731,9 @@ def validate_p2p_report(
         return errors
 
     seen_ranks: set[int] = set()
-    seen_coords: set[tuple[int, int]] = set()
-    query_ranges_by_tp: dict[int, dict[int, list[int]]] = {}
-    manifests_by_tp: dict[int, list[list[Any]]] = {}
+    seen_coords: set[tuple[int, int, int]] = set()
+    query_ranges_by_group: dict[tuple[int, int], dict[int, list[int]]] = {}
+    manifests_by_group: dict[tuple[int, int], list[list[Any]]] = {}
     for index, row in enumerate(ranks):
         if not isinstance(row, dict):
             errors.append(f"P2P rank {index} report is invalid")
@@ -740,20 +741,31 @@ def validate_p2p_report(
         rank = row.get("rank")
         tp_rank = row.get("tp_rank")
         cp_rank = row.get("cp_rank")
+        replica_index = row.get("replica_index")
         if not isinstance(rank, int):
             errors.append(f"P2P row {index} lacks an integer rank")
             continue
         seen_ranks.add(rank)
         if rank < 0 or rank >= world_size:
             errors.append(f"P2P rank {index} is outside the world")
-        expected_tp = 0 if world_size == 2 else rank // 2
-        expected_cp = rank % 2
-        if (tp_rank, cp_rank) != (expected_tp, expected_cp):
-            errors.append(f"P2P rank {index} TP/CP coordinates are inconsistent with rank order")
-        if isinstance(tp_rank, int) and isinstance(cp_rank, int):
-            seen_coords.add((tp_rank, cp_rank))
+        replica_rank = rank % 4 if world_size == 8 else rank
+        expected_replica = rank // 4 if world_size == 8 else 0
+        expected_tp = 0 if world_size == 2 else replica_rank // 2
+        expected_cp = replica_rank % 2
+        if (replica_index, tp_rank, cp_rank) != (
+            expected_replica,
+            expected_tp,
+            expected_cp,
+        ):
+            errors.append(
+                f"P2P rank {index} replica/TP/CP coordinates are inconsistent with rank order"
+            )
+        if all(isinstance(value, int) for value in (replica_index, tp_rank, cp_rank)):
+            seen_coords.add((replica_index, tp_rank, cp_rank))
         if row.get("global_world_size") != world_size:
             errors.append(f"P2P rank {index} global world size is inconsistent")
+        if row.get("cp_world_size") != 2 or row.get("replica_count") != expected_replica_count:
+            errors.append(f"P2P rank {index} CP/replica topology is inconsistent")
         if row.get("global_failure_count") != 0:
             errors.append(f"P2P rank {index} observed global rank failures")
         if row.get("passed") is not True:
@@ -764,6 +776,15 @@ def validate_p2p_report(
             errors.append(f"P2P rank {index} did not execute the expected Q AllGather")
         if row.get("protocol") != "ag_query_local_kv_rs_out_lse":
             errors.append(f"P2P rank {index} did not execute the three-stage protocol")
+        strict_report = row.get("strict_shared_core")
+        if expected_strict_core:
+            errors.extend(_validate_strict_shared_core_report(strict_report, rank=index))
+            if row.get("strict_protocol") != "ag_qkv_positions_shared_core_rs_out_lse":
+                errors.append(f"P2P rank {index} strict protocol is invalid")
+        elif isinstance(strict_report, Mapping) and strict_report.get("executed") is not False:
+            errors.append(f"P2P rank {index} unexpectedly claimed strict shared-core execution")
+        elif strict_report is not None and not isinstance(strict_report, Mapping):
+            errors.append(f"P2P rank {index} strict shared-core report is invalid")
         if row.get("query_ag_max_abs") != 0.0:
             errors.append(f"P2P rank {index} Q AllGather was not bitwise exact")
         if row.get("dtype") != "bf16" or row.get("accum_dtype") != "fp32":
@@ -793,14 +814,15 @@ def validate_p2p_report(
             and query_range[0] < query_range[1]
         ):
             errors.append(f"P2P rank {index} query ownership is invalid")
-        elif isinstance(tp_rank, int) and isinstance(cp_rank, int):
-            query_ranges_by_tp.setdefault(tp_rank, {})[cp_rank] = query_range
+        elif all(isinstance(value, int) for value in (replica_index, tp_rank, cp_rank)):
+            query_ranges_by_group.setdefault((replica_index, tp_rank), {})[cp_rank] = query_range
 
         gathered_indices = row.get("gathered_block_indices")
         block_manifest = row.get("expected_block_manifest")
         manifest_errors, manifest_indices = _validate_p2p_block_manifest(
             block_manifest,
             expected_tp_rank=tp_rank if isinstance(tp_rank, int) else None,
+            expected_tp_world_size=expected_tp_world_size,
         )
         errors.extend(f"P2P rank {index}: {error}" for error in manifest_errors)
         if not (
@@ -824,7 +846,8 @@ def validate_p2p_report(
             ]
             if local_indices != expected_local:
                 errors.append(f"P2P rank {index} local block ownership is invalid")
-            manifests_by_tp.setdefault(tp_rank, []).append(block_manifest)
+            if isinstance(replica_index, int):
+                manifests_by_group.setdefault((replica_index, tp_rank), []).append(block_manifest)
         for name in ("out_max_abs", "lse_max_abs"):
             errors.extend(
                 _scalar_threshold_errors(row.get(name), row.get("atol"), f"P2P rank {index}.{name}")
@@ -840,33 +863,79 @@ def validate_p2p_report(
     expected_ranks = set(range(world_size))
     if seen_ranks != expected_ranks:
         errors.append(f"P2P report must cover ranks 0 through {world_size - 1} exactly")
-    expected_coords = (
-        {(0, cp) for cp in range(2)}
-        if world_size == 2
-        else {(tp, cp) for tp in range(2) for cp in range(2)}
-    )
+    expected_coords = {
+        (replica_index, tp_rank, cp_rank)
+        for replica_index in range(expected_replica_count)
+        for tp_rank in range(expected_tp_world_size)
+        for cp_rank in range(2)
+    }
     if seen_coords != expected_coords:
-        errors.append("P2P report must cover the canonical TP/CP coordinate grid")
+        errors.append("P2P report must cover the canonical replica/TP/CP coordinate grid")
 
-    for tp_rank in range(1 if world_size == 2 else 2):
-        ranges = query_ranges_by_tp.get(tp_rank, {})
-        first_range = ranges.get(0)
-        second_range = ranges.get(1)
-        if (
-            first_range is None
-            or second_range is None
-            or first_range[0] != 0
-            or first_range[1] != second_range[0]
-            or second_range[1] <= second_range[0]
-        ):
-            errors.append(f"P2P TP group {tp_rank} query ownership is not canonical and contiguous")
-        if tp_rank > 0 and ranges != query_ranges_by_tp.get(0, {}):
-            errors.append("P2P TP groups have different query ownership ranges")
-        manifests = manifests_by_tp.get(tp_rank, [])
-        if len(manifests) != 2:
-            errors.append(f"P2P TP group {tp_rank} must contain both CP rank manifests")
-        elif manifests[0] != manifests[1]:
-            errors.append(f"P2P TP group {tp_rank} gathered different logical block manifests")
+    reference_ranges: dict[int, list[int]] | None = None
+    for replica_index in range(expected_replica_count):
+        for tp_rank in range(expected_tp_world_size):
+            group = (replica_index, tp_rank)
+            ranges = query_ranges_by_group.get(group, {})
+            first_range = ranges.get(0)
+            second_range = ranges.get(1)
+            if (
+                first_range is None
+                or second_range is None
+                or first_range[0] != 0
+                or first_range[1] != second_range[0]
+                or second_range[1] <= second_range[0]
+            ):
+                errors.append(
+                    "P2P group "
+                    f"replica={replica_index}, tp={tp_rank} query ownership is not canonical"
+                )
+            if reference_ranges is None:
+                reference_ranges = ranges
+            elif ranges != reference_ranges:
+                errors.append("P2P replica/TP groups have different query ownership ranges")
+            manifests = manifests_by_group.get(group, [])
+            if len(manifests) != 2:
+                errors.append(
+                    f"P2P group replica={replica_index}, tp={tp_rank} lacks both CP manifests"
+                )
+            elif manifests[0] != manifests[1]:
+                errors.append(
+                    f"P2P group replica={replica_index}, tp={tp_rank} gathered different manifests"
+                )
+    return errors
+
+
+def _validate_strict_shared_core_report(report: Any, *, rank: int) -> list[str]:
+    label = f"P2P rank {rank} strict shared core"
+    if not isinstance(report, Mapping):
+        return [f"{label} report is missing"]
+    errors: list[str] = []
+    expected = {
+        "executed": True,
+        "passed": True,
+        "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+        "strict_mode": True,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "split_kv_policy": "disabled",
+        "communication_autograd": True,
+        "repeat_out_bitwise": True,
+        "repeat_lse_bitwise": True,
+    }
+    for field, value in expected.items():
+        if report.get(field) != value:
+            errors.append(f"{label} has invalid {field}")
+    bitwise = report.get("bitwise")
+    if not isinstance(bitwise, Mapping) or any(
+        bitwise.get(name) is not True for name in ("out", "lse", "dq", "dk", "dv")
+    ):
+        errors.append(f"{label} Out/LSE/gradient bitwise evidence is incomplete")
+    max_abs = report.get("max_abs")
+    if not isinstance(max_abs, Mapping) or any(
+        max_abs.get(name) != 0.0 for name in ("out", "lse", "dq", "dk", "dv")
+    ):
+        errors.append(f"{label} Out/LSE/gradient drift is not exactly zero")
     return errors
 
 
@@ -918,6 +987,7 @@ def _validate_p2p_block_manifest(
     manifest: Any,
     *,
     expected_tp_rank: int | None,
+    expected_tp_world_size: int = 1,
 ) -> tuple[list[str], list[int] | None]:
     if not isinstance(manifest, list) or not manifest:
         return ["expected block manifest is missing"], None
@@ -954,10 +1024,10 @@ def _validate_p2p_block_manifest(
         if start != cursor or end <= start:
             errors.append(f"manifest block {index} does not preserve gap-free KV coverage")
         cursor = end
-        if owner_cp_rank not in {0, 1} or (
-            expected_tp_rank is not None and owner_tp_rank != expected_tp_rank
-        ):
+        if owner_cp_rank not in {0, 1} or not 0 <= owner_tp_rank < expected_tp_world_size:
             errors.append(f"manifest block {index} owner is outside the TP-local CP=2 group")
+        if expected_tp_rank is not None and owner_tp_rank != expected_tp_rank:
+            errors.append(f"manifest block {index} owner TP rank does not match the report")
     if owners != {0, 1}:
         errors.append("manifest does not assign KV blocks to both CP ranks")
     return errors, indices

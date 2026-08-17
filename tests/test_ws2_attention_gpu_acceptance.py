@@ -32,7 +32,8 @@ def test_manifest_fails_closed_for_every_unexecuted_required_case(tmp_path):
 
 def test_matrix_contains_required_modes_splitk_and_communication(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
-    names = {case.name for case in build_acceptance_cases(args)}
+    cases = build_acceptance_cases(args)
+    names = {case.name for case in cases}
 
     assert "pr5_cp_forward_backward_dlogp" in names
     assert "p2p_nccl_reference" in names
@@ -42,13 +43,33 @@ def test_matrix_contains_required_modes_splitk_and_communication(tmp_path):
     assert "pr7_flashinfer_prefill_disabled" in names
     assert "pr7_flashinfer_prefill_fixed" in names
     assert "custom_cuda_ag_rs" in names
+    assert "p2p_nccl_reference_tp2_cp2" in names
+    assert "p2p_nccl_reference_tp2_cp2_replica2" in names
+    assert "custom_cuda_ag_rs_tp2_cp2" in names
+    assert "custom_cuda_ag_rs_tp2_cp2_replica2" in names
+    communication_cases = [
+        case for case in cases if case.name.startswith(("p2p_nccl_reference", "custom_cuda_ag_rs"))
+    ]
+    assert len(communication_cases) == 6
+    assert all(
+        case.command is not None and "--transport" in case.command for case in communication_cases
+    )
+    by_name = {case.name: case for case in cases}
+    assert by_name["pr7_flashinfer_decode_disabled"].required is True
+    strict_command = by_name["pr7_flashinfer_decode_disabled"].command
+    if strict_command is not None:
+        assert "--strict" in strict_command
+    assert by_name["pr7_flashinfer_decode_fixed"].required is False
+    diagnostic_command = by_name["pr7_flashinfer_decode_fixed"].command
+    if diagnostic_command is not None:
+        assert "--strict" not in diagnostic_command
 
 
-def test_formal_communication_cases_use_four_rank_three_stage_entrypoint(tmp_path):
+def test_formal_communication_cases_cover_four_and_eight_rank_entrypoints(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
     cases = {case.name: case for case in build_acceptance_cases(args)}
 
-    p2p = cases["p2p_nccl_reference"]
+    p2p = cases["p2p_nccl_reference_tp2_cp2"]
     assert p2p.command is not None
     assert "--nproc-per-node=4" in p2p.command
     assert "--transport" in p2p.command
@@ -56,11 +77,21 @@ def test_formal_communication_cases_use_four_rank_three_stage_entrypoint(tmp_pat
     assert "--repeats" in p2p.command
     assert p2p.report_path is not None
 
-    custom = cases["custom_cuda_ag_rs"]
+    custom = cases["custom_cuda_ag_rs_tp2_cp2"]
     assert custom.command is not None
     assert "--nproc-per-node=4" in custom.command
     assert "cuda_ag_rs" in custom.command
+    assert "--strict-shared-core" in custom.command
     assert custom.report_path is not None
+
+    replicated = cases["custom_cuda_ag_rs_tp2_cp2_replica2"]
+    assert replicated.command is not None
+    assert "--nproc-per-node=8" in replicated.command
+    assert "--strict-shared-core" in replicated.command
+
+    p2p_replica = cases["p2p_nccl_reference_tp2_cp2_replica2"]
+    assert p2p_replica.command is not None
+    assert "--strict-shared-core" not in p2p_replica.command
 
 
 def test_native_te_kv_ring_is_optional_diagnostic(tmp_path):
@@ -221,6 +252,44 @@ def test_pr7_strict_validation_rejects_requested_only_split_plan(tmp_path):
     )
 
 
+def test_pr7_strict_validation_accepts_shared_no_split_core(tmp_path):
+    args = parse_args(["--output", str(tmp_path / "acceptance.json")])
+    report = {
+        "status": "passed",
+        "passed": True,
+        "candidate_provenance": {
+            "arithmetic_semantics_verified": True,
+            "strict_mode": True,
+            "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+            "native_attention_arithmetic": False,
+            "fallback": False,
+            "strict_core_row_plans": [
+                {
+                    "actual_split_kv_policy": "disabled",
+                    "actual_split_boundaries": [[0, 8]],
+                }
+            ],
+        },
+        "drift": {
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+            "dlogp": {"max_abs": 0.0},
+        },
+        "batch_invariant_sweep": {"passed": True},
+        "page_layout_invariant_sweep": {"passed": True},
+    }
+
+    assert (
+        validate_pr7_report(
+            report,
+            args,
+            expected_policy="disabled",
+            strict_expected=True,
+        )
+        == []
+    )
+
+
 def test_acceptance_report_is_json_serializable(tmp_path):
     args = parse_args(["--output", str(tmp_path / "acceptance.json")])
     json.dumps(run_acceptance(args))
@@ -326,11 +395,14 @@ def test_pr5_validation_rejects_nonfinite_or_negative_drift(tmp_path):
 
 def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
     tp_world_size = 1 if world_size == 2 else 2
+    replica_count = 2 if world_size == 8 else 1
     manifest_by_tp = {}
     rows = []
     for rank in range(world_size):
-        tp_rank = 0 if world_size == 2 else rank // 2
-        cp_rank = rank % 2
+        replica_rank = rank % 4 if world_size == 8 else rank
+        replica_index = rank // 4 if world_size == 8 else 0
+        tp_rank = 0 if world_size == 2 else replica_rank // 2
+        cp_rank = replica_rank % 2
         manifest = manifest_by_tp.setdefault(
             tp_rank,
             [
@@ -352,13 +424,14 @@ def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
                 "tp_world_size": 2,
                 "cp_rank": cp_rank,
                 "cp_world_size": 2,
-                "sp_rank": 0,
-                "sp_world_size": 1,
+                "replica_index": replica_index,
+                "replica_count": replica_count,
                 "passed": True,
                 "global_failure_count": 0,
                 "transport": transport,
                 "query_ag": transport,
                 "protocol": "ag_query_local_kv_rs_out_lse",
+                "strict_protocol": "ag_qkv_positions_shared_core_rs_out_lse",
                 "query_ag_max_abs": 0.0,
                 "device": f"cuda:{rank}",
                 "dtype": "bf16",
@@ -379,6 +452,36 @@ def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
                 "final_out_max_abs": 0.0,
                 "atol": 2.0e-4,
                 "final_write_atol": 2.0e-2,
+                "strict_shared_core": (
+                    {
+                        "executed": True,
+                        "passed": True,
+                        "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+                        "strict_mode": True,
+                        "native_attention_arithmetic": False,
+                        "fallback": False,
+                        "split_kv_policy": "disabled",
+                        "communication_autograd": True,
+                        "bitwise": {
+                            "out": True,
+                            "lse": True,
+                            "dq": True,
+                            "dk": True,
+                            "dv": True,
+                        },
+                        "max_abs": {
+                            "out": 0.0,
+                            "lse": 0.0,
+                            "dq": 0.0,
+                            "dk": 0.0,
+                            "dv": 0.0,
+                        },
+                        "repeat_out_bitwise": True,
+                        "repeat_lse_bitwise": True,
+                    }
+                    if transport == "cuda_ag_rs"
+                    else {"executed": False, "passed": False}
+                ),
             }
         )
     return {
@@ -392,7 +495,7 @@ def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
         "world_size": world_size,
         "tp_world_size": tp_world_size,
         "cp_world_size": 2,
-        "sp_world_size": 1,
+        "replica_count": replica_count,
         "global_failure_count": 0,
         "ranks": rows,
     }
@@ -413,6 +516,33 @@ def test_p2p_validation_accepts_legacy_two_rank_artifact():
     report = _valid_p2p_report(world_size=2)
     assert validate_p2p_report(report) == []
     assert validate_p2p_report(report, expected_world_size=4)
+
+
+def test_cuda_ag_rs_validation_accepts_two_tp2_cp2_replicas():
+    report = _valid_p2p_report(world_size=8, transport="cuda_ag_rs")
+
+    assert (
+        validate_p2p_report(
+            report,
+            expected_transport="cuda_ag_rs",
+            expected_world_size=8,
+            expected_strict_core=True,
+        )
+        == []
+    )
+
+
+def test_cuda_ag_rs_validation_rejects_missing_strict_gradient_bitwise_evidence():
+    report = _valid_p2p_report(world_size=4, transport="cuda_ag_rs")
+    report["ranks"][0]["strict_shared_core"]["bitwise"]["dk"] = False
+
+    errors = validate_p2p_report(
+        report,
+        expected_transport="cuda_ag_rs",
+        expected_world_size=4,
+        expected_strict_core=True,
+    )
+    assert any("gradient bitwise evidence" in error for error in errors)
 
 
 def test_p2p_validation_rejects_claimed_downcast_without_final_output_evidence():
