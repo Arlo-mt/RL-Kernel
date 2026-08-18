@@ -21,6 +21,8 @@ def _args(**overrides):
         "constant_value": 0.5,
         "token_value": 3,
         "normalized_dim": 128,
+        "n_heads": 32,
+        "head_dim": 128,
         "k_dim": 16,
         "n_dim": 32,
         "theta": 1.0e6,
@@ -34,7 +36,10 @@ def _args(**overrides):
     "op_name",
     [
         "rms_norm",
+        "qk_norm",
+        "pack",
         "matmul",
+        "det_gemm",
         "attention",
         "cp_attention",
         "logp",
@@ -89,3 +94,22 @@ def test_constant_linear_logp_inputs_match_operator_contract():
     assert torch.equal(inputs["lm_head_weight"], torch.full((17, 128), 0.51))
     assert torch.equal(inputs["target_ids"], torch.full((1, 2), 3, dtype=torch.long))
     assert inputs["bias"] is None
+
+
+def test_constant_embedding_inputs_match_operator_contract():
+    args = _args(input_mode="constant", constant_value=0.5, token_value=3)
+    inputs = make_operator_inputs("embedding", args, torch.float32, torch.device("cpu"))
+
+    assert torch.equal(inputs["token_ids"], torch.full((1, 2), 3, dtype=torch.long))
+    assert torch.equal(inputs["weight"], torch.full((17, 128), 0.5))
+    assert operator_shape_name("embedding", args) == "1x2x17x128"
+
+
+def test_constant_lm_head_inputs_match_operator_contract():
+    args = _args(input_mode="constant", constant_value=0.5)
+    inputs = make_operator_inputs("lm_head", args, torch.float32, torch.device("cpu"))
+
+    assert torch.equal(inputs["hidden"], torch.full((1, 2, 128), 0.5))
+    assert torch.equal(inputs["weight"], torch.full((17, 128), 0.51))
+    assert inputs["bias"] is None
+    assert operator_shape_name("lm_head", args) == "1x2x128x17"
