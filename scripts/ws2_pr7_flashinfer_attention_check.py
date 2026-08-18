@@ -39,9 +39,16 @@ from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  #
     FlashInferRoPEFusionConfig,
     FlashInferSplitKVPolicy,
     FlashInferUnavailable,
+    _apply_strict_rope,
+    _materialize_strict_logical_kv,
     build_flashinfer_paged_kv_plan,
 )
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
+    RLKernelDeterministicAttentionCore,
+)
+from rl_engine.kernels.ops.cuda.rotary_embedding.rope import RoPESM90Op  # noqa: E402
 from rl_engine.testing.attention_comparison import (  # noqa: E402
+    AttentionPathResult,
     DecodeAttentionInputs,
     DecodeKVCacheMetadata,
     run_decode_full_prefill_reference,
@@ -145,7 +152,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             k_cache_rope_state="pre_rope",
         ),
     )
-    reference = run_decode_full_prefill_reference(reference_inputs)
+    pytorch_reference = run_decode_full_prefill_reference(reference_inputs)
+    reference = (
+        _run_strict_cuda_reference(inputs, config, plan)
+        if config.strict_mode
+        else pytorch_reference
+    )
     out_stats = _drift_stats(candidate.out, reference.out)
     lse_stats = _drift_stats(candidate.lse, reference.lse)
     dlogp_stats = _selected_logprob_drift(
@@ -170,6 +182,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "lse": lse_stats,
         "dlogp": dlogp_stats,
     }
+    report["reference_backend"] = (
+        "rlkernel.cuda.deterministic_attention"
+        if config.strict_mode
+        else "rlkernel.pytorch.full_logical_kv_reference"
+    )
+    if config.strict_mode:
+        report["diagnostic_drift_vs_pytorch"] = {
+            "out": _drift_stats(candidate.out, pytorch_reference.out),
+            "lse": _drift_stats(candidate.lse, pytorch_reference.lse),
+            "dlogp": _selected_logprob_drift(
+                candidate.out,
+                pytorch_reference.out,
+                seed=args.seed + 101,
+                vocab_size=args.vocab_size,
+            ),
+        }
     if config.require_batch_invariant:
         report["batch_invariant_sweep"] = _run_batch_invariance_sweep(
             op,
@@ -363,6 +391,57 @@ def _make_inputs(args: argparse.Namespace, device: torch.device) -> DecodeAttent
         k_cache_rope_state="pre_rope",
     )
     return DecodeAttentionInputs(q=q, k_cache=k_cache, v_cache=v_cache, metadata=metadata)
+
+
+def _run_strict_cuda_reference(
+    inputs: DecodeAttentionInputs,
+    config: FlashInferPagedAttentionConfig,
+    paged_plan: Any,
+) -> AttentionPathResult:
+    """Call the shared CUDA core directly on the logical KV sequence."""
+
+    core = config.deterministic_core or RLKernelDeterministicAttentionCore(
+        split_kv=config.split_kv
+    )
+    rope = config.strict_rope_op or RoPESM90Op()
+    logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
+        inputs.k_cache,
+        inputs.v_cache,
+        inputs.metadata,
+        paged_plan,
+    )
+    query_positions = inputs.metadata.query_position_ids
+    outputs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    for batch_index, seq_len_value in enumerate(paged_plan.kv_seq_lens.tolist()):
+        seq_len = int(seq_len_value)
+        q_row = inputs.q[batch_index : batch_index + 1]
+        k_row = logical_k[batch_index : batch_index + 1, :, :seq_len, :]
+        v_row = logical_v[batch_index : batch_index + 1, :, :seq_len, :]
+        q_pos = query_positions[batch_index : batch_index + 1]
+        k_pos = key_positions[batch_index : batch_index + 1, :seq_len]
+        result = core.forward_with_lse(
+            _apply_strict_rope(rope, q_row, q_pos, config.rope.rope_theta),
+            _apply_strict_rope(rope, k_row, k_pos, config.rope.rope_theta),
+            v_row,
+            causal=config.causal,
+            scale=config.softmax_scale,
+            query_position_ids=q_pos,
+            key_position_ids=k_pos,
+            output_dtype=inputs.q.dtype,
+        )
+        outputs.append(result.out)
+        lses.append(result.lse)
+    return AttentionPathResult(
+        name="direct_rlkernel_cuda_deterministic_attention",
+        out=torch.cat(outputs, dim=0),
+        lse=torch.cat(lses, dim=0),
+        provenance={
+            "strict_core_id": STRICT_ATTENTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            "split_kv_policy": "disabled",
+        },
+    )
 
 
 def _run_batch_invariance_sweep(
