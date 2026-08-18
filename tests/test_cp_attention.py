@@ -749,7 +749,7 @@ def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
         k,
         v,
         cp_world_size=1,
-        kv_chunk_size=3,
+        kv_chunk_size=None,
     )
     cp2_out, cp2_lse = op.forward_with_lse(
         q,
@@ -766,7 +766,7 @@ def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
         k[:1],
         v[:1],
         cp_world_size=1,
-        kv_chunk_size=3,
+        kv_chunk_size=1,
     )
     assert torch.equal(single_out, cp1_out[:1])
     assert torch.equal(single_lse, cp1_lse[:1])
@@ -777,7 +777,7 @@ def test_strict_core_backward_is_bitwise_invariant_to_cp_schedule():
     dout = torch.randn_like(q)
     op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
-    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=3)
+    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=None)
     cp2 = op.backward_reference(q, k, v, dout, cp_world_size=2, kv_chunk_size=3)
     assert torch.equal(cp1.out, cp2.out)
     assert torch.equal(cp1.lse, cp2.lse)

@@ -567,7 +567,6 @@ class DeterministicCPAttentionReferenceOp:
         )
         # The canonical schedule is global.  CP ownership and arrival order
         # must not change which partial states are generated or merged.
-        kv_bounds = _kv_block_bounds(skv, 1, kv_chunk_size)
         out_rows: list[torch.Tensor] = []
         lse_rows: list[torch.Tensor] = []
         for batch_index in range(batch):
@@ -585,41 +584,22 @@ class DeterministicCPAttentionReferenceOp:
             lse_query_rows: list[torch.Tensor] = []
             for query_index in range(sq):
                 q_row = q_batch[:, :, query_index : query_index + 1, :].contiguous()
-                states = [
-                    self.local_partial_state(
-                        q_row,
-                        k_batch[:, :, key_start:key_end, :].contiguous(),
-                        v_batch[:, :, key_start:key_end, :].contiguous(),
-                        q_start=query_index,
-                        k_start=key_start,
-                        total_kv_len=skv,
-                        total_query_len=sq,
-                        causal=causal,
-                        scale=scale,
-                        key_padding_mask=(
-                            None
-                            if pad_batch is None
-                            else pad_batch[:, key_start:key_end].contiguous()
-                        ),
-                        query_position_offsets=query_offset,
-                        key_position_offsets=key_offset,
-                    )
-                    for key_start, key_end in kv_bounds
-                    if key_start != key_end
-                ]
-                if not states:
-                    zero_dep = _zero_dependency(q_row.float(), k_batch.float(), v_batch.float())
-                    merged_out = torch.zeros(
-                        1, hq, 1, dim, device=q.device, dtype=torch.float32
-                    ) + zero_dep
-                    merged_lse = torch.full(
-                        (1, hq, 1), float("-inf"), device=q.device, dtype=torch.float32
-                    ) + zero_dep
-                else:
-                    merged = merge_attention_partial_states(states)
-                    merged_out, merged_lse = merged.out, merged.lse
-                query_rows.append(merged_out)
-                lse_query_rows.append(merged_lse)
+                state = self.local_partial_state(
+                    q_row,
+                    k_batch,
+                    v_batch,
+                    q_start=query_index,
+                    k_start=0,
+                    total_kv_len=skv,
+                    total_query_len=sq,
+                    causal=causal,
+                    scale=scale,
+                    key_padding_mask=pad_batch,
+                    query_position_offsets=query_offset,
+                    key_position_offsets=key_offset,
+                )
+                query_rows.append(state.out)
+                lse_query_rows.append(state.lse)
             out_rows.append(torch.cat(query_rows, dim=2))
             lse_rows.append(torch.cat(lse_query_rows, dim=2))
         return torch.cat(out_rows, dim=0), torch.cat(lse_rows, dim=0)
