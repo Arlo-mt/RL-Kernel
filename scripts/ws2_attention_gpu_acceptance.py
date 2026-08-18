@@ -26,6 +26,8 @@ from typing import Any, Callable, Mapping, Sequence, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = "ws2_attention_gpu_acceptance/v1"
+STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 DEFAULT_IMAGE = "ghcr.io/rl-align/rl-kernel/rl-kernel-ci:cuda"
 DEFAULT_PR7_OUT_ATOL = 1.0e-2
 DEFAULT_PR7_LSE_ATOL = 2.0e-3
@@ -347,6 +349,7 @@ def run_acceptance(
                 "prefix_cache_identity",
                 "global_block_merge_order",
             ],
+            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
             "communication": [
                 "p2p_nccl_reference",
                 "self_owned_cuda_ag_rs",
@@ -645,8 +648,10 @@ def validate_pr7_report(
     if strict_expected:
         if provenance.get("strict_mode") is not True:
             errors.append("PR7 strict mode was not executed")
-        if provenance.get("strict_core_id") != "rlkernel.attention.deterministic_core.v1":
+        if provenance.get("strict_core_id") != STRICT_ATTENTION_CORE_ID:
             errors.append("PR7 strict core identity is invalid")
+        if provenance.get("strict_schedule") != STRICT_ATTENTION_SCHEDULE_ID:
+            errors.append("PR7 strict arithmetic schedule is invalid")
         if provenance.get("native_attention_arithmetic") is not False:
             errors.append("PR7 strict path entered native FlashInfer Attention arithmetic")
         if provenance.get("fallback") is not False:
@@ -676,13 +681,60 @@ def validate_pr7_report(
             )
         )
     drift = report.get("drift", {})
-    errors.extend(_threshold_errors(drift.get("out"), args.pr7_out_atol, "PR7.out"))
-    errors.extend(_threshold_errors(drift.get("lse"), args.pr7_lse_atol, "PR7.lse"))
-    errors.extend(_threshold_errors(drift.get("dlogp"), args.pr7_dlogp_atol, "PR7.dlogp"))
+    errors.extend(
+        _threshold_errors(
+            drift.get("out"),
+            0.0 if strict_expected else args.pr7_out_atol,
+            "PR7.out",
+        )
+    )
+    errors.extend(
+        _threshold_errors(
+            drift.get("lse"),
+            0.0 if strict_expected else args.pr7_lse_atol,
+            "PR7.lse",
+        )
+    )
+    errors.extend(
+        _threshold_errors(
+            drift.get("dlogp"),
+            0.0 if strict_expected else args.pr7_dlogp_atol,
+            "PR7.dlogp",
+        )
+    )
     for key in ("batch_invariant_sweep", "page_layout_invariant_sweep"):
         sweep = report.get(key)
         if not isinstance(sweep, dict) or sweep.get("passed") is not True:
             errors.append(f"PR7 {key} did not pass")
+        elif strict_expected:
+            errors.extend(_validate_strict_invariance_sweep(sweep, label=f"PR7 {key}"))
+    return errors
+
+
+def _validate_strict_invariance_sweep(
+    sweep: Mapping[str, Any],
+    *,
+    label: str,
+) -> list[str]:
+    """Require explicit zero-drift evidence from strict invariance sweeps."""
+
+    errors: list[str] = []
+    scalar_fields = ("out_max_abs", "lse_max_abs")
+    nested_fields = ("out", "lse")
+    observed = False
+    for field in scalar_fields:
+        if field in sweep:
+            observed = True
+            if sweep.get(field) != 0.0:
+                errors.append(f"{label} {field} is not exactly zero")
+    for field in nested_fields:
+        stats = sweep.get(field)
+        if isinstance(stats, Mapping):
+            observed = True
+            if stats.get("max_abs") != 0.0:
+                errors.append(f"{label} {field}.max_abs is not exactly zero")
+    if not observed and sweep.get("status") != "not_applicable":
+        errors.append(f"{label} lacks explicit zero-drift evidence")
     return errors
 
 
@@ -914,7 +966,11 @@ def _validate_strict_shared_core_report(report: Any, *, rank: int) -> list[str]:
     expected = {
         "executed": True,
         "passed": True,
-        "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+        "strict_core_id": STRICT_ATTENTION_CORE_ID,
+        "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+        "actual_backend": "rlkernel.cuda.deterministic_attention",
+        "communication_backend": "self_owned_cuda_ag_rs",
+        "production_ready": True,
         "strict_mode": True,
         "native_attention_arithmetic": False,
         "fallback": False,

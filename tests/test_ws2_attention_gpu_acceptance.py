@@ -261,6 +261,7 @@ def test_pr7_strict_validation_accepts_shared_no_split_core(tmp_path):
             "arithmetic_semantics_verified": True,
             "strict_mode": True,
             "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+            "strict_schedule": "single_batch_single_query_global_kv_blocks",
             "native_attention_arithmetic": False,
             "fallback": False,
             "strict_core_row_plans": [
@@ -275,8 +276,16 @@ def test_pr7_strict_validation_accepts_shared_no_split_core(tmp_path):
             "lse": {"max_abs": 0.0},
             "dlogp": {"max_abs": 0.0},
         },
-        "batch_invariant_sweep": {"passed": True},
-        "page_layout_invariant_sweep": {"passed": True},
+        "batch_invariant_sweep": {
+            "passed": True,
+            "out_max_abs": 0.0,
+            "lse_max_abs": 0.0,
+        },
+        "page_layout_invariant_sweep": {
+            "passed": True,
+            "out": {"max_abs": 0.0},
+            "lse": {"max_abs": 0.0},
+        },
     }
 
     assert (
@@ -287,6 +296,17 @@ def test_pr7_strict_validation_accepts_shared_no_split_core(tmp_path):
             strict_expected=True,
         )
         == []
+    )
+
+    report["candidate_provenance"]["strict_schedule"] = "different_schedule"
+    assert any(
+        "strict arithmetic schedule" in error
+        for error in validate_pr7_report(
+            report,
+            args,
+            expected_policy="disabled",
+            strict_expected=True,
+        )
     )
 
 
@@ -457,6 +477,10 @@ def _valid_p2p_report(world_size=4, transport="p2p_nccl_reference"):
                         "executed": True,
                         "passed": True,
                         "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+                        "strict_schedule": "single_batch_single_query_global_kv_blocks",
+                        "actual_backend": "rlkernel.cuda.deterministic_attention",
+                        "communication_backend": "self_owned_cuda_ag_rs",
+                        "production_ready": True,
                         "strict_mode": True,
                         "native_attention_arithmetic": False,
                         "fallback": False,
