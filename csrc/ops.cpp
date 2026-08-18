@@ -63,6 +63,15 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
                                                  int64_t vocab_start_index);
 // RoPE (rotate-half) apply for SM90; cos/sin precomputed fp32, sin_sign = +1 fwd / -1 bwd.
 torch::Tensor rope_apply_sm90(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, double sin_sign);
+torch::Tensor embedding_sm90_forward(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor embedding_sm90_forward_fp32(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor lm_head_sm90_forward(torch::Tensor hidden,
+                                   torch::Tensor weight,
+                                   torch::optional<torch::Tensor> bias);
+torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
+                                        torch::Tensor weight,
+                                        torch::optional<torch::Tensor> bias);
+torch::Tensor det_gemm_rowwise_fwd_fp32(torch::Tensor a, torch::Tensor b);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -80,10 +89,34 @@ torch::Tensor deterministic_logp_forward_fp32(torch::Tensor logits, torch::Tenso
 torch::Tensor deterministic_logp_forward_indexed_out(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices, torch::Tensor output);
 torch::Tensor deterministic_logp_forward_indexed_fp32(torch::Tensor logits, torch::Tensor token_ids, torch::Tensor row_indices);
 
+// Single-node TP=8 deterministic collectives.
+std::tuple<std::vector<int64_t>, int64_t> deterministic_collective_ipc_meta(
+    torch::Tensor& tensor);
+int64_t deterministic_collective_create(
+    torch::Tensor& staging,
+    const std::vector<std::vector<int64_t>>& handles,
+    const std::vector<int64_t>& offsets,
+    int64_t rank);
+void deterministic_collective_destroy(int64_t handle);
+void deterministic_collective_stage(int64_t handle, torch::Tensor& input);
+void deterministic_collective_all_reduce(int64_t handle, torch::Tensor& output);
+void deterministic_collective_reduce_scatter(int64_t handle, torch::Tensor& output);
+void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
+
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+// SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
+torch::Tensor silu_forward_cuda(torch::Tensor x);
+torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x);
+torch::Tensor swiglu_forward_cuda(torch::Tensor gate, torch::Tensor up);
+std::vector<torch::Tensor> swiglu_backward_cuda(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up);
+
 // RMSNorm Declarations & Wrappers
 
 void rmsnorm_forward_cuda(
@@ -195,8 +228,36 @@ torch::Tensor rmsnorm_backward_dw(
   return dw;
 }
 
+// SiLU / SwiGLU wrappers (WS1 elementwise activations)
+torch::Tensor silu_forward(torch::Tensor x) {
+  return silu_forward_cuda(x);
+}
+
+torch::Tensor silu_backward(torch::Tensor dy, torch::Tensor x) {
+  return silu_backward_cuda(dy, x);
+}
+
+torch::Tensor swiglu_forward(torch::Tensor gate, torch::Tensor up) {
+  return swiglu_forward_cuda(gate, up);
+}
+
+std::vector<torch::Tensor> swiglu_backward(
+    torch::Tensor dy,
+    torch::Tensor gate,
+    torch::Tensor up) {
+  return swiglu_backward_cuda(dy, gate, up);
+}
+
 // Deterministic standard-softmax attention (issue #147)
 std::vector<torch::Tensor> deterministic_attention_forward(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    bool causal,
+    double scale,
+    torch::optional<torch::Tensor> key_padding_mask);
+
+std::vector<torch::Tensor> deterministic_attention_forward_fp32(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -291,9 +352,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
     m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
           "Build bf16 dlogits from bf16 logits and fp32 lse");
-
     // RoPE rotate-half apply, SM90 (forward and backward share the kernel via sin_sign)
     m.def("rope_apply_sm90", &rope_apply_sm90, "RoPE rotate-half apply (GPT-NeoX), SM90");
+    m.def("embedding_sm90_forward", &embedding_sm90_forward,
+          "Single-card SM90 batch-invariant embedding forward");
+    m.def("embedding_sm90_forward_fp32", &embedding_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant embedding forward with fp32 output");
+    m.def("lm_head_sm90_forward", &lm_head_sm90_forward,
+          "Single-card SM90 batch-invariant LM-head forward");
+    m.def("lm_head_sm90_forward_fp32", &lm_head_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant LM-head forward with fp32 output");
+    m.def("det_gemm_rowwise_fwd_fp32", &det_gemm_rowwise_fwd_fp32,
+          "SM90 deterministic rowwise GEMM with FP32 inputs/accumulation/output");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -311,11 +381,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deterministic_logp_forward_indexed_out", &deterministic_logp_forward_indexed_out, "Batch-invariant deterministic logp indexed out");
     m.def("deterministic_logp_forward_indexed_fp32", &deterministic_logp_forward_indexed_fp32, "Batch-invariant deterministic logp indexed fp32");
 
+    // Single-node TP=8 fixed-tree collectives.
+    m.def(
+        "deterministic_collective_ipc_meta",
+        &deterministic_collective_ipc_meta,
+        "Export a CUDA allocation for deterministic collectives");
+    m.def(
+        "deterministic_collective_create",
+        &deterministic_collective_create,
+        "Create a single-node TP=8 deterministic collective state");
+    m.def(
+        "deterministic_collective_destroy",
+        &deterministic_collective_destroy,
+        "Destroy a deterministic collective state");
+    m.def(
+        "deterministic_collective_stage",
+        &deterministic_collective_stage,
+        "Stage one rank's input in symmetric CUDA IPC memory");
+    m.def(
+        "deterministic_collective_all_reduce",
+        &deterministic_collective_all_reduce,
+        "Run the TP=8 deterministic fixed-tree all-reduce kernel");
+    m.def(
+        "deterministic_collective_reduce_scatter",
+        &deterministic_collective_reduce_scatter,
+        "Run the TP=8 deterministic fixed-tree reduce-scatter kernel");
+    m.def(
+        "deterministic_collective_all_gather",
+        &deterministic_collective_all_gather,
+        "Run the TP=8 deterministic rank-ordered all-gather kernel");
+
     // registry Prefix-Shared Attention
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
+    m.def("det_gemm_fwd_fp32", &det_gemm_fwd_fp32,
+          "Batch-invariant deterministic GEMM forward with FP32 output");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
     // registry RMSNorm
@@ -323,11 +425,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
     m.def("rmsnorm_backward_dw", &rmsnorm_backward_dw, "Deterministic RMSNorm backward dweight CUDA");
 
+    // registry SiLU / SwiGLU (elementwise activation)
+    m.def("silu_forward", &silu_forward, "Batch-invariant SiLU forward CUDA");
+    m.def("silu_backward", &silu_backward, "Batch-invariant SiLU backward CUDA");
+    m.def("swiglu_forward", &swiglu_forward, "Batch-invariant SwiGLU forward CUDA");
+    m.def("swiglu_backward", &swiglu_backward, "Batch-invariant SwiGLU backward CUDA");
+
     // Deterministic standard-softmax attention (issue #147)
     m.def(
         "deterministic_attention_forward",
         &deterministic_attention_forward,
         "Deterministic standard softmax attention forward (out, lse)");
+    m.def(
+        "deterministic_attention_forward_fp32",
+        &deterministic_attention_forward_fp32,
+        "Deterministic standard softmax attention forward with FP32 output");
     m.def(
         "deterministic_attention_backward",
         &deterministic_attention_backward,
