@@ -81,7 +81,9 @@ def get_extensions():
             "csrc/cuda/attention/prefix_shared_attention.cu",
             "csrc/cuda/gemm/det_gemm_kernel.cu",
             "csrc/cuda/rmsnorm.cu",
+            "csrc/cuda/activation.cu",
             "csrc/cuda/attention/deterministic_attention.cu",
+            "csrc/cuda/distributed/deterministic_collective.cu",
         ]
 
         cc_major, cc_minor = torch.cuda.get_device_capability()
@@ -146,6 +148,9 @@ def get_extensions():
 
         cxx_flags = ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_CUDA"]
         extra_link_args = list(torch_rpath)
+        if os.name != "nt":
+            # CUDA IPC metadata queries use the driver API (cuPointerGetAttribute).
+            extra_link_args.append("-lcuda")
 
         sm90_srcs = [
             "csrc/cuda/fused_logp_sm90.cu",
@@ -161,7 +166,8 @@ def get_extensions():
             cuda_sources.extend(present_sm90)
             nvcc_flags.append(f"-gencode=arch=compute_{tma_arch},code=sm_{tma_arch}")
             cxx_flags.append("-DKERNEL_ALIGN_WITH_SM90")
-            extra_link_args.append("-lcuda")
+            if "-lcuda" not in extra_link_args:
+                extra_link_args.append("-lcuda")
 
         # det_gemm SM90 (mma.sync + TMA) path: independent of the fused_logp
         # SM90 sources, which currently fail ptxas on CUDA 12.4 (shared::cta in
