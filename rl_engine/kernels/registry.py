@@ -185,6 +185,44 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             fallback_policy=OperatorFallbackPolicy.RUNTIME_MANAGED,
             version_or_build_fingerprint="runtime-native-unresolved-v1",
         ),
+        OperatorBackendDescriptor(
+            semantic_op="attention",
+            backend_id="rlkernel.attention.deterministic.v1",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"cpu", "cuda", "rocm"}),
+            supported_dtypes=frozenset({"float32", "bfloat16", "float16"}),
+            supported_topologies={"*": "*"},
+            determinism_or_alignment_properties={
+                "algorithm": "standard_softmax_attention",
+                "batch_invariant": True,
+                "deterministic": True,
+                "split_kv": "contract_bound",
+                "reduction_order": "global_block_index",
+                "strict_observable": True,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=(
+                "rl_engine.kernels.ops.pytorch.attention.ablation.AttentionAblationOp"
+            ),
+            fallback_policy=OperatorFallbackPolicy.ERROR,
+            version_or_build_fingerprint="AttentionAblationOp-v1",
+        ),
+        OperatorBackendDescriptor(
+            semantic_op="attention",
+            backend_id="native",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"*"}),
+            supported_dtypes=frozenset({"*"}),
+            supported_topologies={"*": "*"},
+            determinism_or_alignment_properties={
+                "selection": "runtime_native",
+                "strict_observable": False,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=None,
+            fallback_policy=OperatorFallbackPolicy.RUNTIME_MANAGED,
+            version_or_build_fingerprint="runtime-native-attention-unresolved-v1",
+        ),
     )
 
 
