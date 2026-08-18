@@ -21,6 +21,7 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 # Stable identity shared by the training and rollout deterministic Attention
 # core.  Backend adapters may differ, but strict mode must report this ID.
 STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 
 
 class AttentionContractError(ValueError):
@@ -1669,6 +1670,7 @@ __all__ = [
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
     "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

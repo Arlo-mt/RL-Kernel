@@ -11,6 +11,8 @@ from dataclasses import replace
 import pytest
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionBackendCapability,
     AttentionContract,
     AttentionContractError,
@@ -32,6 +34,11 @@ from rl_engine.kernels.attention_contract import (
     validate_split_kv_plan_set_alignment,
 )
 from rl_engine.kernels.registry import KernelRegistry, OpBackend
+
+
+def test_strict_attention_identity_pins_core_and_arithmetic_schedule():
+    assert STRICT_ATTENTION_CORE_ID == "rlkernel.attention.deterministic_core.v1"
+    assert STRICT_ATTENTION_SCHEDULE_ID == "single_batch_single_query_global_kv_blocks"
 
 
 def _sharding(
