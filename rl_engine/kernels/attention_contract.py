@@ -21,6 +21,7 @@ _EnumT = TypeVar("_EnumT", bound=Enum)
 # Stable identity for the CUDA Attention arithmetic shared by training and
 # rollout. Backend adapters may differ, but strict runtime evidence must not.
 STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 
 
 class AttentionContractError(ValueError):
@@ -1453,6 +1454,7 @@ __all__ = [
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
     "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

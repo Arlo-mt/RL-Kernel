@@ -14,6 +14,13 @@ import math
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+    RLKernelDeterministicAttentionCore,
+)
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
@@ -688,3 +695,18 @@ def test_gapped_partial_ranges_raise():
 
 def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
+
+
+def test_shared_strict_core_reports_canonical_schedule_without_cuda_extension():
+    q, k, v = _qkv(1, 3, 4, seed=41, heads=4, kv_heads=2, dim=8)
+    q_positions = torch.arange(1, 4).view(1, -1)
+    k_positions = torch.arange(4).view(1, -1)
+    result = RLKernelDeterministicAttentionCore().forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=q_positions,
+        key_position_ids=k_positions,
+    )
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID

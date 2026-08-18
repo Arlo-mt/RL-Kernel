@@ -18,7 +18,12 @@ import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
-from rl_engine.kernels.attention_contract import STRICT_ATTENTION_CORE_ID, SplitKVMode, SplitKVSpec
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+    SplitKVMode,
+    SplitKVSpec,
+)
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     DeterministicCPAttentionReferenceOp,
@@ -321,7 +326,7 @@ class RLKernelDeterministicAttentionCore:
                 "fallback_reason": None,
                 "native_attention_arithmetic": self.native_attention_arithmetic,
                 "strict_schedule": (
-                    "single_batch_single_query_global_kv_blocks"
+                    STRICT_ATTENTION_SCHEDULE_ID
                     if self.strict_bitwise
                     else "cuda_fixed_grid"
                 ),
