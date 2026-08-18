@@ -24,6 +24,7 @@ from torch import Tensor
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
@@ -50,6 +51,7 @@ class AttentionAblationConfig:
     return_lse: bool = True
     return_gradients: bool = False
     strict_core_id: str = STRICT_ATTENTION_CORE_ID
+    strict_schedule: str = STRICT_ATTENTION_SCHEDULE_ID
     validate: bool = True
 
     def __post_init__(self) -> None:
@@ -64,6 +66,8 @@ class AttentionAblationConfig:
                 raise AttentionContractError(f"{name} must be a bool")
         if not isinstance(self.strict_core_id, str) or not self.strict_core_id.strip():
             raise AttentionContractError("strict_core_id must be a non-empty string")
+        if not isinstance(self.strict_schedule, str) or not self.strict_schedule.strip():
+            raise AttentionContractError("strict_schedule must be a non-empty string")
         object.__setattr__(self, "backend", self.backend.strip().lower())
         object.__setattr__(self, "communication_backend", self.communication_backend.strip())
 
@@ -229,6 +233,15 @@ class AttentionAblationOp:
             raise AttentionContractError(
                 "deterministic Attention cannot use runtime-dependent Split-KV=auto"
             )
+        if cfg.deterministic and (
+            cfg.strict_core_id != STRICT_ATTENTION_CORE_ID
+            or cfg.strict_schedule != STRICT_ATTENTION_SCHEDULE_ID
+        ):
+            raise AttentionContractError(
+                "strict deterministic Attention requires the canonical core and schedule"
+            )
+        if cfg.deterministic and not cfg.return_lse:
+            raise AttentionContractError("strict deterministic Attention must return LSE")
         if cfg.return_gradients and dout is None:
             raise AttentionContractError("dout is required when return_gradients=True")
         if dout is not None and dout.shape != q.shape:
@@ -240,6 +253,16 @@ class AttentionAblationOp:
             raise AttentionContractError(
                 "deterministic=True cannot execute an unverified native Attention backend"
             )
+        selected_core_id = getattr(selected, "core_id", None)
+        selected_schedule = getattr(selected, "strict_schedule", None)
+        if cfg.deterministic and selected_id not in {BACKEND_ID, REFERENCE_BACKEND_ID}:
+            if (
+                selected_core_id != cfg.strict_core_id
+                or selected_schedule != cfg.strict_schedule
+            ):
+                raise AttentionContractError(
+                    "deterministic Attention requires the shared strict core and schedule"
+                )
 
         call_kwargs = dict(kwargs)
         call_kwargs.setdefault("causal", contract.causal)
@@ -262,14 +285,23 @@ class AttentionAblationOp:
             "deterministic": cfg.deterministic,
             "strict_core_id": (
                 cfg.strict_core_id
-                if cfg.deterministic and selected_id == BACKEND_ID
+                if cfg.deterministic
                 else None
             ),
-            "core_id": selected_id,
-            "backend_deterministic": selected_id in {BACKEND_ID, REFERENCE_BACKEND_ID},
+            "strict_schedule": cfg.strict_schedule if cfg.deterministic else None,
+            "core_id": cfg.strict_core_id if cfg.deterministic else selected_id,
+            "backend_deterministic": cfg.deterministic,
+            "native_attention_arithmetic": False if cfg.deterministic else selected_id == "native",
             "communication_backend": cfg.communication_backend,
+            "communication_executed": bool(
+                getattr(selected, "communication_executed", False)
+            ),
             "split_kv": contract.split_kv.to_dict(),
-            "actual_split_kv": _actual_split_provenance(contract, backend=selected_id),
+            "actual_split_kv": _actual_split_provenance(
+                contract,
+                total_kv_tokens=k.size(2),
+                backend=selected_id,
+            ),
             "reduction": _reduction_provenance(contract),
             "contract_fingerprint": _contract_fingerprint(contract),
             "return_lse": cfg.return_lse,
@@ -330,7 +362,7 @@ class AttentionAblationOp:
                 DeterministicCPAttentionReferenceOp,
             )
 
-            self.reference = DeterministicCPAttentionReferenceOp()
+            self.reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
         return self.reference
 
     @staticmethod
@@ -461,6 +493,7 @@ def _resolve_config(
                 "return_lse",
                 "return_gradients",
                 "strict_core_id",
+                "strict_schedule",
                 "validate",
             )
         }
@@ -493,10 +526,11 @@ def _callable_backend_id(value: Any) -> str:
 def _actual_split_provenance(
     contract: AttentionContract,
     *,
+    total_kv_tokens: int,
     backend: str = BACKEND_ID,
 ) -> dict[str, Any]:
     plan = contract.split_kv.resolve(
-        contract.sharding.global_sequence_length,
+        total_kv_tokens,
         backend=backend,
     )
     return plan.to_dict()

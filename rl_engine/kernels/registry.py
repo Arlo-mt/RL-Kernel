@@ -198,6 +198,7 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
                 "deterministic": True,
                 "split_kv": "contract_bound",
                 "reduction_order": "global_block_index",
+                "strict_schedule": "single_batch_single_query_global_kv_blocks",
                 "strict_observable": True,
             },
             lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
@@ -205,7 +206,7 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
                 "rl_engine.kernels.ops.pytorch.attention.ablation.AttentionAblationOp"
             ),
             fallback_policy=OperatorFallbackPolicy.ERROR,
-            version_or_build_fingerprint="AttentionAblationOp-v1",
+            version_or_build_fingerprint="AttentionAblationOp-bitwise-v2",
         ),
         OperatorBackendDescriptor(
             semantic_op="attention",

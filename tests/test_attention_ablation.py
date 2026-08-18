@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
@@ -75,6 +77,8 @@ def test_attention_wrapper_has_unified_result_and_provenance():
     assert result.lse.dtype is torch.float32
     assert result.provenance["semantic_operator"] == "attention"
     assert result.provenance["split_kv"]["mode"] == "disabled"
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
     assert result.readback()["out_shape"] == list(q.shape)
 
 
@@ -88,7 +92,14 @@ def test_attention_wrapper_supports_explicit_injected_backend():
             del k, v, causal, scale
             return q.clone(), torch.zeros(q.shape[:3], dtype=torch.float32)
 
-    result = AttentionAblationOp()(q, k, v, contract=_contract(), backend=FakeBackend())
+    result = AttentionAblationOp()(
+        q,
+        k,
+        v,
+        contract=_contract(),
+        backend=FakeBackend(),
+        deterministic=False,
+    )
     assert result.backend_id == "test.attention.backend"
     assert torch.equal(result.out, q)
 
@@ -142,3 +153,31 @@ def test_attention_backend_is_registered_for_pr230_semantic_resolution():
     assert isinstance(instance, AttentionAblationOp)
     provenance = session.instance_provenance(resolution, instance)
     assert provenance.backend_id == BACKEND_ID
+
+
+def test_strict_wrapper_is_bitwise_invariant_to_batch_shape():
+    q, k, v = _qkv()
+    noise_q, noise_k, noise_v = _qkv()
+    contract = _contract()
+    batch_contract = AttentionContract(
+        role=contract.role,
+        mode=contract.mode,
+        dtype=contract.dtype,
+        batch_size=2,
+        query_sequence_length=contract.query_sequence_length,
+        head_dim=contract.head_dim,
+        causal=contract.causal,
+        causal_offsets=(0, 0),
+        sharding=contract.sharding,
+        reduction=contract.reduction,
+        split_kv=contract.split_kv,
+    )
+    single = AttentionAblationOp()(q, k, v, contract=contract)
+    batched = AttentionAblationOp()(
+        torch.cat((q, noise_q), dim=0),
+        torch.cat((k, noise_k), dim=0),
+        torch.cat((v, noise_v), dim=0),
+        contract=batch_contract,
+    )
+    assert torch.equal(single.out[0], batched.out[0])
+    assert torch.equal(single.lse[0], batched.lse[0])

@@ -45,6 +45,7 @@ from typing import Any, Optional
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
@@ -125,6 +126,7 @@ class BindingErrorCode(str, Enum):
     ATTENTION_PROJECTION_MISMATCH = "ATTENTION_PROJECTION_MISMATCH"
     ATTENTION_CORE_MISSING = "ATTENTION_CORE_MISSING"
     ATTENTION_CORE_MISMATCH = "ATTENTION_CORE_MISMATCH"
+    ATTENTION_CORE_SCHEDULE = "ATTENTION_CORE_SCHEDULE"
     ATTENTION_NATIVE_ARITHMETIC = "ATTENTION_NATIVE_ARITHMETIC"
     ATTENTION_CORE_SPLIT_K = "ATTENTION_CORE_SPLIT_K"
 
@@ -146,6 +148,7 @@ class AttentionRuntimeReadback:
     projection_plans: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     strict_mode: bool = False
     strict_core_id: str | None = None
+    strict_schedule: str | None = None
     native_attention_arithmetic: bool = True
     strict_split_kv_policy: str | None = None
 
@@ -185,6 +188,10 @@ class AttentionRuntimeReadback:
             not isinstance(self.strict_core_id, str) or not self.strict_core_id.strip()
         ):
             raise ValueError("strict_core_id must be a non-empty string when provided")
+        if self.strict_schedule is not None and (
+            not isinstance(self.strict_schedule, str) or not self.strict_schedule.strip()
+        ):
+            raise ValueError("strict_schedule must be a non-empty string when provided")
         if not isinstance(self.native_attention_arithmetic, bool):
             raise TypeError("native_attention_arithmetic must be a bool")
         if self.strict_split_kv_policy is not None and self.strict_split_kv_policy not in {
@@ -237,6 +244,7 @@ class AttentionRuntimeReadback:
             "strict_attention": {
                 "enabled": self.strict_mode,
                 "core_id": self.strict_core_id,
+                "schedule": self.strict_schedule,
                 "native_attention_arithmetic": self.native_attention_arithmetic,
                 "split_kv_policy": self.strict_split_kv_policy,
             },
@@ -1020,6 +1028,7 @@ def bind_attention_runtime_readbacks(
             "preprocess.policy_id": rollout.preprocess_policy_id,
             "strict.enabled": rollout.strict_mode,
             "strict.core_id": rollout.strict_core_id,
+            "strict.schedule": rollout.strict_schedule,
             "strict.native_attention_arithmetic": rollout.native_attention_arithmetic,
             "strict.split_kv_policy": rollout.strict_split_kv_policy,
             **{
@@ -1038,6 +1047,7 @@ def bind_attention_runtime_readbacks(
             "preprocess.policy_id": training.preprocess_policy_id,
             "strict.enabled": training.strict_mode,
             "strict.core_id": training.strict_core_id,
+            "strict.schedule": training.strict_schedule,
             "strict.native_attention_arithmetic": training.native_attention_arithmetic,
             "strict.split_kv_policy": training.strict_split_kv_policy,
             **{
@@ -1064,6 +1074,18 @@ def _strict_attention_core_issues(
                 message=(
                     f"{side} strict Attention did not execute the shared core "
                     f"{STRICT_ATTENTION_CORE_ID!r}"
+                ),
+            )
+        )
+    if readback.strict_schedule != STRICT_ATTENTION_SCHEDULE_ID:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_SCHEDULE,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.strict.schedule",
+                message=(
+                    f"{side} strict Attention did not execute the canonical schedule "
+                    f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
                 ),
             )
         )
@@ -1118,6 +1140,17 @@ def _strict_attention_core_pair_issues(
                 rollout=rollout.strict_core_id,
                 training=training.strict_core_id,
                 message="training and rollout executed different Attention cores",
+            )
+        ]
+    if rollout.strict_mode and rollout.strict_schedule != training.strict_schedule:
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_SCHEDULE,
+                tier=BindingTier.SEMANTIC,
+                field="strict.schedule",
+                rollout=rollout.strict_schedule,
+                training=training.strict_schedule,
+                message="training and rollout executed different strict Attention schedules",
             )
         ]
     return []

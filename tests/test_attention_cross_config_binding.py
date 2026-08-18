@@ -46,6 +46,7 @@ from rl_engine.alignment.cross_config.determinism import (
 from rl_engine.alignment.cross_config.schema import MaterializationStatus
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContractError,
     AttentionMode,
     AttentionRole,
@@ -665,6 +666,7 @@ def _strict_readback(materializer, flat, *, source):
         split_kv_plan_set=_plan_set(contract, backend=source),
         strict_mode=True,
         strict_core_id=STRICT_ATTENTION_CORE_ID,
+        strict_schedule=STRICT_ATTENTION_SCHEDULE_ID,
         native_attention_arithmetic=False,
         strict_split_kv_policy="disabled",
     )
@@ -818,6 +820,10 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
         (
             {"strict_core_id": "different.core"},
             BindingErrorCode.ATTENTION_CORE_MISSING,
+        ),
+        (
+            {"strict_schedule": "different_schedule"},
+            BindingErrorCode.ATTENTION_CORE_SCHEDULE,
         ),
         (
             {"strict_split_kv_policy": "fixed"},
