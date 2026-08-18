@@ -129,6 +129,8 @@ class BindingErrorCode(str, Enum):
     ATTENTION_CORE_SCHEDULE = "ATTENTION_CORE_SCHEDULE"
     ATTENTION_NATIVE_ARITHMETIC = "ATTENTION_NATIVE_ARITHMETIC"
     ATTENTION_CORE_SPLIT_K = "ATTENTION_CORE_SPLIT_K"
+    ATTENTION_BACKEND_MISSING = "ATTENTION_BACKEND_MISSING"
+    ATTENTION_NOT_PRODUCTION_READY = "ATTENTION_NOT_PRODUCTION_READY"
 
 
 @dataclass(frozen=True)
@@ -151,6 +153,9 @@ class AttentionRuntimeReadback:
     strict_schedule: str | None = None
     native_attention_arithmetic: bool = True
     strict_split_kv_policy: str | None = None
+    actual_backend: str | None = None
+    communication_backend: str | None = None
+    production_ready: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.contract, AttentionContract):
@@ -200,6 +205,14 @@ class AttentionRuntimeReadback:
             "auto",
         }:
             raise ValueError("strict_split_kv_policy must be disabled, fixed, or auto")
+        for name, value in (
+            ("actual_backend", self.actual_backend),
+            ("communication_backend", self.communication_backend),
+        ):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be a non-empty string when provided")
+        if not isinstance(self.production_ready, bool):
+            raise TypeError("production_ready must be a bool")
         normalized_projection_plans: dict[str, Mapping[str, Any]] = {}
         for name, plan in self.projection_plans.items():
             if not isinstance(name, str) or not isinstance(plan, Mapping):
@@ -247,6 +260,11 @@ class AttentionRuntimeReadback:
                 "schedule": self.strict_schedule,
                 "native_attention_arithmetic": self.native_attention_arithmetic,
                 "split_kv_policy": self.strict_split_kv_policy,
+            },
+            "runtime_backend": {
+                "actual_backend": self.actual_backend,
+                "communication_backend": self.communication_backend,
+                "production_ready": self.production_ready,
             },
             "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
         }
@@ -1031,6 +1049,9 @@ def bind_attention_runtime_readbacks(
             "strict.schedule": rollout.strict_schedule,
             "strict.native_attention_arithmetic": rollout.native_attention_arithmetic,
             "strict.split_kv_policy": rollout.strict_split_kv_policy,
+            "runtime.actual_backend": rollout.actual_backend,
+            "runtime.communication_backend": rollout.communication_backend,
+            "runtime.production_ready": rollout.production_ready,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in rollout.projection_plans.items()
@@ -1050,6 +1071,9 @@ def bind_attention_runtime_readbacks(
             "strict.schedule": training.strict_schedule,
             "strict.native_attention_arithmetic": training.native_attention_arithmetic,
             "strict.split_kv_policy": training.strict_split_kv_policy,
+            "runtime.actual_backend": training.actual_backend,
+            "runtime.communication_backend": training.communication_backend,
+            "runtime.production_ready": training.production_ready,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in training.projection_plans.items()
@@ -1065,6 +1089,45 @@ def _strict_attention_core_issues(
     if not readback.strict_mode:
         return []
     issues = []
+    if readback.actual_backend != "rlkernel.cuda.deterministic_attention":
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_BACKEND_MISSING,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.runtime.actual_backend",
+                rollout=readback.actual_backend if side == "rollout" else None,
+                training=readback.actual_backend if side == "training" else None,
+                message=(
+                    f"{side} strict Attention did not execute the CUDA deterministic core"
+                ),
+            )
+        )
+    if readback.communication_backend != "self_owned_cuda_ag_rs":
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_BACKEND_MISSING,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.runtime.communication_backend",
+                rollout=readback.communication_backend if side == "rollout" else None,
+                training=readback.communication_backend if side == "training" else None,
+                message=(
+                    f"{side} strict CP Attention did not execute the self-owned CUDA AG/RS path"
+                ),
+            )
+        )
+    if not readback.production_ready:
+        issues.append(
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_NOT_PRODUCTION_READY,
+                tier=BindingTier.SEMANTIC,
+                field=f"{side}.runtime.production_ready",
+                rollout=False if side == "rollout" else None,
+                training=False if side == "training" else None,
+                message=(
+                    f"{side} evidence is reference-only and cannot close the production gate"
+                ),
+            )
+        )
     if readback.strict_core_id != STRICT_ATTENTION_CORE_ID:
         issues.append(
             BindingIssue(
@@ -1151,6 +1214,28 @@ def _strict_attention_core_pair_issues(
                 rollout=rollout.strict_schedule,
                 training=training.strict_schedule,
                 message="training and rollout executed different strict Attention schedules",
+            )
+        ]
+    if rollout.strict_mode and rollout.actual_backend != training.actual_backend:
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="runtime.actual_backend",
+                rollout=rollout.actual_backend,
+                training=training.actual_backend,
+                message="training and rollout executed different Attention backends",
+            )
+        ]
+    if rollout.strict_mode and rollout.communication_backend != training.communication_backend:
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_CORE_MISMATCH,
+                tier=BindingTier.SEMANTIC,
+                field="runtime.communication_backend",
+                rollout=rollout.communication_backend,
+                training=training.communication_backend,
+                message="training and rollout executed different Attention communication backends",
             )
         ]
     return []

@@ -148,6 +148,7 @@ class AttentionAblationOp:
         core: Any | None = None,
         reference: Any | None = None,
         native: Any | None = None,
+        cp_backend: Any | None = None,
         communication_backend: str = "none",
     ) -> None:
         if not isinstance(communication_backend, str) or not communication_backend.strip():
@@ -155,6 +156,10 @@ class AttentionAblationOp:
         self.core = core
         self.reference = reference
         self.native = native
+        # CP production execution is injected by the runtime adapter.  Keeping
+        # it separate from the single-device core prevents an accidental
+        # fallback to the PyTorch reference when AG/RS is required.
+        self.cp_backend = cp_backend
         self.communication_backend = communication_backend.strip()
 
     def __call__(
@@ -248,7 +253,12 @@ class AttentionAblationOp:
             raise AttentionContractError("dout must have the same shape as q")
 
         requested = backend_request if backend_request is not None else cfg.backend
-        selected, selected_id = self._select_backend(requested, q, contract)
+        selected, selected_id = self._select_backend(
+            requested,
+            q,
+            contract,
+            communication_backend=cfg.communication_backend,
+        )
         if cfg.deterministic and selected_id == "native":
             raise AttentionContractError(
                 "deterministic=True cannot execute an unverified native Attention backend"
@@ -270,9 +280,17 @@ class AttentionAblationOp:
         call_kwargs.setdefault("cp_world_size", contract.sharding.cp_world_size)
         if contract.split_kv.mode is SplitKVMode.FIXED:
             call_kwargs.setdefault("kv_chunk_size", contract.split_kv.fixed_split_size)
-        out, lse = self._invoke(selected, q, k, v, call_kwargs, contract)
+        out, lse, backend_provenance = self._invoke(
+            selected, q, k, v, call_kwargs, contract
+        )
         if cfg.validate:
             self._validate_outputs(out, lse, q, contract)
+        _validate_runtime_provenance(
+            selected,
+            selected_id,
+            backend_provenance,
+            cfg,
+        )
 
         dq = dk = dv = None
         if cfg.return_gradients:
@@ -307,6 +325,10 @@ class AttentionAblationOp:
             "return_lse": cfg.return_lse,
             "return_gradients": cfg.return_gradients,
         }
+        provenance.update(backend_provenance)
+        provenance.setdefault("actual_backend", selected_id)
+        provenance.setdefault("communication_backend", cfg.communication_backend)
+        provenance.setdefault("production_ready", False)
         return AttentionAblationResult(
             out=out,
             lse=lse if cfg.return_lse else None,
@@ -328,6 +350,8 @@ class AttentionAblationOp:
         requested: str | Callable[..., Any],
         q: Tensor,
         contract: AttentionContract,
+        *,
+        communication_backend: str,
     ) -> tuple[Any, str]:
         if callable(requested) or hasattr(requested, "forward_with_lse") or hasattr(requested, "apply"):
             return requested, _callable_backend_id(requested)
@@ -342,11 +366,15 @@ class AttentionAblationOp:
             return self._reference_backend(), REFERENCE_BACKEND_ID
         if normalized not in {"auto", "deterministic", "rlkernel"}:
             raise AttentionContractError(f"unsupported Attention backend {requested!r}")
-        if (
-            contract.sharding.cp_world_size > 1
-            or q.device.type != "cuda"
-            or torch.version.hip is not None
-        ):
+        if contract.sharding.cp_world_size > 1:
+            if communication_backend == "self_owned_cuda_ag_rs":
+                if self.cp_backend is None:
+                    raise AttentionContractError(
+                        "CP production Attention requires an injected AG/RS backend"
+                    )
+                return self.cp_backend, _callable_backend_id(self.cp_backend)
+            return self._reference_backend(), REFERENCE_BACKEND_ID
+        if q.device.type != "cuda" or torch.version.hip is not None:
             return self._reference_backend(), REFERENCE_BACKEND_ID
         if self.core is None:
             from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
@@ -420,7 +448,7 @@ class AttentionAblationOp:
         v: Tensor,
         kwargs: Mapping[str, Any],
         contract: AttentionContract,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, dict[str, Any]]:
         method = getattr(backend, "forward_with_lse", None)
         if not callable(method):
             method = getattr(backend, "apply", None)
@@ -436,17 +464,27 @@ class AttentionAblationOp:
                 "CP>1 requires an Attention backend that explicitly accepts cp_world_size"
             )
         result = method(q, k, v, **accepted)
+        backend_provenance: dict[str, Any] = {}
         if isinstance(result, AttentionAblationResult):
             out, lse = result.out, result.lse
         elif isinstance(result, tuple) and len(result) == 2:
             out, lse = result
         else:
-            raise AttentionContractError(
-                "Attention backend must return (out, lse) or AttentionAblationResult"
-            )
+            out = getattr(result, "out", None)
+            lse = getattr(result, "lse", None)
+            raw_provenance = getattr(result, "provenance", {})
+            if isinstance(raw_provenance, Mapping):
+                backend_provenance = dict(raw_provenance)
+            if out is None or lse is None:
+                raise AttentionContractError(
+                    "Attention backend must return (out, lse), AttentionAblationResult, "
+                    "or an object with out/lse/provenance"
+                )
+        if isinstance(result, AttentionAblationResult):
+            backend_provenance = dict(result.provenance)
         if not isinstance(out, Tensor) or not isinstance(lse, Tensor):
             raise AttentionContractError("Attention backend returned non-tensor output or LSE")
-        return out, lse
+        return out, lse, backend_provenance
 
     @staticmethod
     def _backward(
@@ -521,6 +559,52 @@ def _callable_backend_id(value: Any) -> str:
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     return f"injected.{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _validate_runtime_provenance(
+    selected: Any,
+    selected_id: str,
+    runtime: Mapping[str, Any],
+    config: AttentionAblationConfig,
+) -> None:
+    """Fail closed when a production strict backend did not prove its identity."""
+
+    if not config.deterministic:
+        return
+    if selected_id == "native":
+        raise AttentionContractError(
+            "deterministic Attention cannot execute native Attention arithmetic"
+        )
+
+    actual_core = runtime.get("strict_core_id", getattr(selected, "core_id", None))
+    actual_schedule = runtime.get("strict_schedule", getattr(selected, "strict_schedule", None))
+    if selected_id != REFERENCE_BACKEND_ID and (
+        actual_core != config.strict_core_id or actual_schedule != config.strict_schedule
+    ):
+        raise AttentionContractError(
+            "deterministic Attention backend did not prove the shared strict core and schedule"
+        )
+
+    if config.communication_backend != "self_owned_cuda_ag_rs":
+        return
+
+    expected = {
+        "strict_core_id": config.strict_core_id,
+        "strict_schedule": config.strict_schedule,
+        "actual_backend": "rlkernel.cuda.deterministic_attention",
+        "communication_backend": "self_owned_cuda_ag_rs",
+        "production_ready": True,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+    }
+    mismatches = [
+        name for name, value in expected.items() if runtime.get(name) != value
+    ]
+    if mismatches:
+        raise AttentionContractError(
+            "CP production Attention runtime provenance is incomplete or mismatched: "
+            + ", ".join(mismatches)
+        )
 
 
 def _actual_split_provenance(

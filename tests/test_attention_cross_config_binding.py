@@ -651,6 +651,9 @@ def _readback(materializer, flat, *, source):
         preprocess_backends=MANDATED_ATTENTION_PREPROCESS_BACKENDS,
         preprocess_fallback=False,
         projection_plans=projection_plans,
+        actual_backend=f"reference.{source}",
+        communication_backend="none",
+        production_ready=False,
     )
 
 
@@ -669,6 +672,9 @@ def _strict_readback(materializer, flat, *, source):
         strict_schedule=STRICT_ATTENTION_SCHEDULE_ID,
         native_attention_arithmetic=False,
         strict_split_kv_policy="disabled",
+        actual_backend="rlkernel.cuda.deterministic_attention",
+        communication_backend="self_owned_cuda_ag_rs",
+        production_ready=True,
     )
 
 
@@ -876,6 +882,51 @@ def test_strict_runtime_readback_accepts_shared_no_split_k_core():
 
     assert result.passed
     assert result.provenance["rollout"]["recorded"]["strict.core_id"] == (STRICT_ATTENTION_CORE_ID)
+    assert result.provenance["rollout"]["recorded"]["runtime.actual_backend"] == (
+        "rlkernel.cuda.deterministic_attention"
+    )
+    assert result.provenance["rollout"]["recorded"]["runtime.communication_backend"] == (
+        "self_owned_cuda_ag_rs"
+    )
+    assert result.provenance["rollout"]["recorded"]["runtime.production_ready"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        (
+            "actual_backend",
+            "rlkernel.attention.cp_reference",
+            BindingErrorCode.ATTENTION_BACKEND_MISSING,
+        ),
+        (
+            "communication_backend",
+            "p2p_nccl_reference",
+            BindingErrorCode.ATTENTION_BACKEND_MISSING,
+        ),
+        ("production_ready", False, BindingErrorCode.ATTENTION_NOT_PRODUCTION_READY),
+    ],
+)
+def test_strict_runtime_readback_rejects_reference_only_evidence(field, value, error_code):
+    rollout = replace(
+        _strict_readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
+        **{field: value},
+    )
+    training = _strict_readback(
+        MegatronAttentionMaterializer(),
+        TRAINING_KNOBS,
+        source="megatron.runtime_readback",
+    )
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id="rlkernel.cuda.deterministic_attention",
+        training_backend_id="rlkernel.cuda.deterministic_attention",
+    )
+    assert not result.passed
+    assert result.issues_by_code(error_code)
 
 
 def test_strict_runtime_readback_accepts_common_deterministic_preprocess_fallback():
