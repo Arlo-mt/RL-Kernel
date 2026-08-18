@@ -260,10 +260,16 @@ class AttentionAblationOp:
             "semantic_operator": "attention",
             "backend_id": selected_id,
             "deterministic": cfg.deterministic,
-            "strict_core_id": cfg.strict_core_id if cfg.deterministic else None,
+            "strict_core_id": (
+                cfg.strict_core_id
+                if cfg.deterministic and selected_id == BACKEND_ID
+                else None
+            ),
+            "core_id": selected_id,
+            "backend_deterministic": selected_id in {BACKEND_ID, REFERENCE_BACKEND_ID},
             "communication_backend": cfg.communication_backend,
             "split_kv": contract.split_kv.to_dict(),
-            "actual_split_kv": _actual_split_provenance(contract),
+            "actual_split_kv": _actual_split_provenance(contract, backend=selected_id),
             "reduction": _reduction_provenance(contract),
             "contract_fingerprint": _contract_fingerprint(contract),
             "return_lse": cfg.return_lse,
@@ -484,10 +490,14 @@ def _callable_backend_id(value: Any) -> str:
     return f"injected.{type(value).__module__}.{type(value).__qualname__}"
 
 
-def _actual_split_provenance(contract: AttentionContract) -> dict[str, Any]:
+def _actual_split_provenance(
+    contract: AttentionContract,
+    *,
+    backend: str = BACKEND_ID,
+) -> dict[str, Any]:
     plan = contract.split_kv.resolve(
         contract.sharding.global_sequence_length,
-        backend=BACKEND_ID,
+        backend=backend,
     )
     return plan.to_dict()
 
