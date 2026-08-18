@@ -20,6 +20,7 @@ from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     compare_cp_attention_backward,
     merge_attention_partial_states,
     split_kv_execution_plan_provenance,
@@ -94,6 +95,7 @@ def test_strict_attention_core_freezes_plan_and_final_write():
     assert result.out.dtype is torch.bfloat16
     assert result.lse.dtype is torch.float32
     assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
     assert result.provenance["merge_order"] == "global_block_index"
     assert result.provenance["accum_dtype"] == "fp32"
     assert result.provenance["downcast_at"] == "final_write"

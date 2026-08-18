@@ -24,6 +24,7 @@ from rl_engine.kernels.attention_contract import (
     SplitKVRuntimePlanSet,
     SplitKVSpec,
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
@@ -128,7 +129,7 @@ class DeterministicAttentionCore:
                 "fallback": False,
                 "fallback_reason": None,
                 "native_attention_arithmetic": False,
-                "strict_schedule": "single_batch_single_query_global_kv_blocks",
+                "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
             },
         )
 
@@ -1318,6 +1319,7 @@ __all__ = [
     "DeterministicCPAttentionReferenceOp",
     "GradientDriftStats",
     "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "compare_cp_attention_backward",
     "merge_attention_partial_states",
     "split_kv_execution_plan_provenance",
