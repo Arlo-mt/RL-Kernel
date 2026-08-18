@@ -263,12 +263,19 @@ def compare_decode_kv_replay(
     inputs: DecodeAttentionInputs,
     *,
     include_transformer_engine: bool = False,
+    strict_bitwise: bool = False,
 ) -> AttentionComparisonReport:
     """Compare paged decode replay with a logical full-KV teacher-forcing view."""
 
     _validate_decode_inputs(inputs)
-    reference = _run_decode_full_prefill_reference(inputs)
-    candidates = [_run_decode_kv_replay(inputs, merge_backend="rl_kernel")]
+    if strict_bitwise:
+        reference = _run_decode_strict_shared_core(inputs, materialization="logical_prefill")
+        candidates = [
+            _run_decode_strict_shared_core(inputs, materialization="paged_kv_layout")
+        ]
+    else:
+        reference = _run_decode_full_prefill_reference(inputs)
+        candidates = [_run_decode_kv_replay(inputs, merge_backend="rl_kernel")]
     unavailable: list[str] = []
     if include_transformer_engine:
         try:
@@ -280,6 +287,86 @@ def compare_decode_kv_replay(
         reference_name=reference.name,
         drifts=drifts,
         unavailable=tuple(unavailable),
+    )
+
+
+def run_decode_strict_shared_core(
+    inputs: DecodeAttentionInputs,
+) -> AttentionPathResult:
+    """Run decode through the same fixed one-query arithmetic schedule."""
+
+    _validate_decode_inputs(inputs)
+    return _run_decode_strict_shared_core(inputs, materialization="paged_kv_layout")
+
+
+def _run_decode_strict_shared_core(
+    inputs: DecodeAttentionInputs,
+    *,
+    materialization: str,
+) -> AttentionPathResult:
+    outs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    for batch_index in range(inputs.q.size(0)):
+        q, k, v, logical_positions = _decode_logical_qkv(inputs, batch_index)
+        batch_out: list[torch.Tensor] = []
+        batch_lse: list[torch.Tensor] = []
+        for query_index in range(q.size(2)):
+            query_position = int(inputs.metadata.cache_position[batch_index, query_index].item())
+            visible = logical_positions <= query_position
+            if not bool(visible.any()):
+                raise ValueError("each decode query must have at least one visible KV token")
+            out, lse = _strict_decode_attention_with_lse(
+                q[:, :, query_index : query_index + 1, :],
+                k[:, :, visible, :],
+                v[:, :, visible, :],
+                output_dtype=inputs.output_dtype,
+            )
+            batch_out.append(out)
+            batch_lse.append(lse)
+        outs.append(torch.cat(batch_out, dim=2))
+        lses.append(torch.cat(batch_lse, dim=2))
+    return AttentionPathResult(
+        name=f"strict_shared_core_{materialization}",
+        out=torch.cat(outs, dim=0),
+        lse=torch.cat(lses, dim=0),
+        provenance={
+            "attention_mode": "decode",
+            "materialization": materialization,
+            "execution_scope": "single_device_strict_shared_core",
+            "runtime_verified": False,
+            "actual_backend": "rlkernel.pytorch.strict_attention_reference",
+            "communication_backend": "none",
+            "production_ready": False,
+            "supports_backward": False,
+            "communication": "none",
+            "strict_mode": True,
+            "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+            "strict_schedule": "single_batch_single_query_global_kv_blocks",
+            "native_attention_arithmetic": False,
+            "fallback": False,
+            "fallback_reason": None,
+            "split_kv_policy": "disabled",
+            "merge_order": "global_block_index",
+            "lse_domain": "attention",
+            "lse_exported": True,
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "cache_execution_fingerprint": _decode_cache_fingerprint(
+                inputs,
+                token_counts=tuple(int(length) for length in inputs.metadata.kv_seq_lens.tolist()),
+                domain="strict_shared_core_decode",
+            ),
+            "kv_cache_identity_fingerprint": _decode_cache_fingerprint(
+                inputs,
+                token_counts=tuple(int(length) for length in inputs.metadata.kv_seq_lens.tolist()),
+                domain="strict_shared_core_decode",
+            ),
+            "rope_identity_fingerprint": decode_rope_identity_fingerprint(inputs),
+            "query_position_ids": inputs.metadata.query_position_ids.tolist(),
+            "key_position_ids": inputs.metadata.key_position_ids.tolist(),
+            "block_table": inputs.metadata.block_table.tolist(),
+            "page_size": inputs.metadata.page_size,
+        },
     )
 
 
@@ -976,6 +1063,36 @@ def _rope_attention_provenance(
         "fusion_boundary": fusion_boundary,
         "lse_domain": "attention",
     }
+
+
+def _strict_decode_attention_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Canonical one-query score/softmax/value schedule for decode replay."""
+
+    qf, kf, vf = q.float(), k.float(), v.float()
+    hq, hkv = qf.size(1), kf.size(1)
+    if hq % hkv:
+        raise ValueError("strict decode Attention requires GQA-compatible head counts")
+    if hq != hkv:
+        kf = kf.repeat_interleave(hq // hkv, dim=1)
+        vf = vf.repeat_interleave(hq // hkv, dim=1)
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) / math.sqrt(qf.size(-1))
+    row_max = scores.amax(dim=-1, keepdim=True)
+    finite = torch.isfinite(row_max)
+    exp_scores = torch.where(finite, torch.exp(scores - row_max), torch.zeros_like(scores))
+    row_sum = exp_scores.sum(dim=-1, keepdim=True)
+    lse = torch.where(
+        row_sum > 0,
+        row_max + torch.log(row_sum),
+        torch.full_like(row_sum, float("-inf")),
+    )
+    weights = torch.where(row_sum > 0, exp_scores / row_sum, torch.zeros_like(exp_scores))
+    return torch.matmul(weights, vf).to(output_dtype), lse.squeeze(-1)
 
 
 def _attention_with_lse(

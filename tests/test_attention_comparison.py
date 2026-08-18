@@ -300,6 +300,23 @@ def test_decode_replay_matches_full_prefill_for_single_and_few_query():
     assert single_report.drifts[0].lse.max_abs <= 1.0e-6
 
 
+def test_strict_decode_replay_is_bitwise_across_logical_and_paged_materialization():
+    report = compare_decode_kv_replay(_decode_inputs(page_order=(2, 0, 1)), strict_bitwise=True)
+    assert report.reference_name == "strict_shared_core_logical_prefill"
+    assert len(report.drifts) == 1
+    drift = report.drifts[0]
+    assert drift.candidate_name == "strict_shared_core_paged_kv_layout"
+    assert drift.out.max_abs == 0.0
+    assert drift.lse.max_abs == 0.0
+    assert drift.provenance["strict_core_id"] == (
+        "rlkernel.attention.deterministic_core.v1"
+    )
+    assert drift.provenance["strict_schedule"] == (
+        "single_batch_single_query_global_kv_blocks"
+    )
+    assert drift.provenance["split_kv_policy"] == "disabled"
+
+
 def test_decode_replay_is_invariant_to_physical_page_and_prefix_layout():
     contiguous = run_decode_kv_replay(_decode_inputs())
     permuted_inputs = _decode_inputs(page_order=(2, 0, 1), prefix_cache_enabled=True)
