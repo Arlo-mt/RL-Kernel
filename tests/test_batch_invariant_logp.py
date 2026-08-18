@@ -863,13 +863,23 @@ class TestCudaSM90Correctness:
         assert torch.allclose(out, ref, atol=2e-3)
 
     def test_unaligned_vocab(self):
-        # V not a multiple of the TMA box: exercises the global-read tail path.
+        # V is 16-byte aligned (TMA row stride) but not a TMA box multiple,
+        # so the kernel's global-read tail path runs. 50257 is *not* aligned
+        # (V*2 % 16 != 0) and is rejected before launch.
         op = self._get_op()
-        logits = torch.randn(8, 50257, device="cuda", dtype=torch.bfloat16)
-        target = torch.randint(0, 50257, (8,), device="cuda")
+        vocab = 50264
+        logits = torch.randn(8, vocab, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, vocab, (8,), device="cuda")
         out = op(logits, target)
         ref = _reference_logp(logits.float(), target)
         assert torch.allclose(out, ref, atol=2e-3)
+
+    def test_unaligned_row_stride_is_rejected(self):
+        op = self._get_op()
+        logits = torch.randn(8, 50257, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 50257, (8,), device="cuda")
+        with pytest.raises(RuntimeError, match="16-byte-aligned"):
+            op(logits, target)
 
     def test_single_token(self):
         op = self._get_op()
@@ -996,21 +1006,20 @@ class TestCudaSM90IgnoreIndex:
 
 
 @requires_sm90
-class TestCudaSM90Fallback:
-    """Inputs the TMA path can't take must silently fall back and stay correct."""
+class TestCudaSM90UnsupportedInputs:
+    """WS1 SM90 logp does not silently fall back to Triton or Native."""
 
     def _get_op(self):
         from rl_engine.kernels.ops.cuda.loss.batch_invariant_logp import BatchInvariantLogpSM90Op
 
         return BatchInvariantLogpSM90Op()
 
-    def test_fp16_falls_back(self):
+    def test_fp16_is_rejected(self):
         op = self._get_op()
         logits = torch.randn(8, _VC, device="cuda", dtype=torch.float16)
         target = torch.randint(0, _VC, (8,), device="cuda")
-        out = op(logits, target)
-        ref = _reference_logp(logits.float(), target)
-        assert torch.allclose(out, ref, atol=1e-3)
+        with pytest.raises(RuntimeError, match="fallback is forbidden"):
+            op(logits, target)
 
 
 # ---------------------------------------------------------------------------
