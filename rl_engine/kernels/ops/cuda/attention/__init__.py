@@ -1,49 +1,62 @@
-# File: rl_engine/kernels/ops/cuda/attention/__init__.py
-
-from .cp_comm import (
-    AttentionCPBlockMetadata,
-    AttentionCPCommunication,
-    AttentionCPCommunicationPlan,
-    AttentionCPCommunicationUnavailable,
-    AttentionCPMergedState,
-    AttentionCPPartialState,
-    AttentionParallelSpec,
-    CPCommunicationBackend,
-    CPCommunicationStatus,
-    CUDAAGRSAttentionCPCommunication,
-    P2PNCCLAttentionCPCommunication,
-    sort_attention_cp_partial_states,
-)
 from .deterministic_attn import DeterministicAttentionOp
 from .flash_attn import FlashAttentionOp
-from .flashinfer_paged_attention import (
-    FlashInferPagedAttentionConfig,
-    FlashInferQwen3PagedAttentionOp,
-    FlashInferRoPEFusionConfig,
-    FlashInferSplitKVPolicy,
-    FlashInferUnavailable,
-)
 from .prefix_shared_attn import PrefixSharedAttentionOp
 
-__all__ = [
-    "AttentionCPBlockMetadata",
-    "AttentionCPCommunication",
-    "AttentionCPCommunicationPlan",
-    "AttentionCPCommunicationUnavailable",
-    "AttentionCPMergedState",
-    "AttentionCPPartialState",
-    "AttentionParallelSpec",
-    "CPCommunicationBackend",
-    "CPCommunicationStatus",
-    "CUDAAGRSAttentionCPCommunication",
-    "P2PNCCLAttentionCPCommunication",
-    "DeterministicAttentionOp",
-    "FlashAttentionOp",
-    "FlashInferPagedAttentionConfig",
-    "FlashInferQwen3PagedAttentionOp",
-    "FlashInferRoPEFusionConfig",
-    "FlashInferSplitKVPolicy",
-    "FlashInferUnavailable",
-    "PrefixSharedAttentionOp",
-    "sort_attention_cp_partial_states",
-]
+__all__ = ["DeterministicAttentionOp", "FlashAttentionOp", "PrefixSharedAttentionOp"]
+
+# CP communication and FlashInfer are optional layers owned by later WS2 PRs.
+# Keep the base Attention package importable while those PRs are developed or
+# tested independently, then expose their symbols automatically when present.
+try:
+    from .cp_comm import (
+        AttentionCPBlockMetadata,
+        AttentionCPCommunication,
+        AttentionCPCommunicationPlan,
+        AttentionCPCommunicationUnavailable,
+        AttentionCPMergedState,
+        AttentionCPPartialState,
+        AttentionParallelSpec,
+        CPCommunicationBackend,
+        CPCommunicationStatus,
+        CUDAAGRSAttentionCPCommunication,
+        P2PNCCLAttentionCPCommunication,
+        sort_attention_cp_partial_states,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != f"{__package__}.cp_comm":
+        raise
+else:
+    __all__ += [
+        "AttentionCPBlockMetadata",
+        "AttentionCPCommunication",
+        "AttentionCPCommunicationPlan",
+        "AttentionCPCommunicationUnavailable",
+        "AttentionCPMergedState",
+        "AttentionCPPartialState",
+        "AttentionParallelSpec",
+        "CPCommunicationBackend",
+        "CPCommunicationStatus",
+        "CUDAAGRSAttentionCPCommunication",
+        "P2PNCCLAttentionCPCommunication",
+        "sort_attention_cp_partial_states",
+    ]
+
+try:
+    from .flashinfer_paged_attention import (
+        FlashInferPagedAttentionConfig,
+        FlashInferQwen3PagedAttentionOp,
+        FlashInferRoPEFusionConfig,
+        FlashInferSplitKVPolicy,
+        FlashInferUnavailable,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != f"{__package__}.flashinfer_paged_attention":
+        raise
+else:
+    __all__ += [
+        "FlashInferPagedAttentionConfig",
+        "FlashInferQwen3PagedAttentionOp",
+        "FlashInferRoPEFusionConfig",
+        "FlashInferSplitKVPolicy",
+        "FlashInferUnavailable",
+    ]
