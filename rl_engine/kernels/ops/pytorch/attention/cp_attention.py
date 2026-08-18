@@ -84,7 +84,7 @@ class DeterministicAttentionCore:
             raise ValueError(
                 "strict deterministic Attention core requires Split-KV to be disabled"
             )
-        self._reference = DeterministicCPAttentionReferenceOp()
+        self._reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
     def forward_with_lse(
         self,
@@ -128,6 +128,7 @@ class DeterministicAttentionCore:
                 "fallback": False,
                 "fallback_reason": None,
                 "native_attention_arithmetic": False,
+                "strict_schedule": "single_batch_single_query_global_kv_blocks",
             },
         )
 
@@ -283,6 +284,19 @@ class DeterministicCPAttentionReferenceOp:
     """
 
     op_class = "attention"
+
+    def __init__(self, *, strict_bitwise: bool = False) -> None:
+        """Create the reference op.
+
+        ``strict_bitwise`` uses a canonical schedule that is independent of
+        batch size and CP ownership.  The regular path remains vectorized for
+        drift/performance experiments; the strict path is intentionally slower
+        because it is the shared arithmetic reference for train and rollout.
+        """
+
+        if not isinstance(strict_bitwise, bool):
+            raise TypeError("strict_bitwise must be a bool")
+        self.strict_bitwise = strict_bitwise
 
     @staticmethod
     def split_kv_execution_plans(
@@ -444,18 +458,31 @@ class DeterministicCPAttentionReferenceOp:
 
         resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
         _validate_output_dtype(resolved_output_dtype)
-        out, lse = self._forward_impl(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
-        )
+        if self.strict_bitwise:
+            out, lse = self._forward_strict_bitwise(
+                q,
+                k,
+                v,
+                causal=causal,
+                scale=scale,
+                key_padding_mask=key_padding_mask,
+                query_position_offsets=query_position_offsets,
+                key_position_offsets=key_position_offsets,
+                kv_chunk_size=kv_chunk_size,
+            )
+        else:
+            out, lse = self._forward_impl(
+                q,
+                k,
+                v,
+                causal=causal,
+                scale=scale,
+                key_padding_mask=key_padding_mask,
+                query_position_offsets=query_position_offsets,
+                key_position_offsets=key_position_offsets,
+                cp_world_size=cp_world_size,
+                kv_chunk_size=kv_chunk_size,
+            )
         out = out.to(resolved_output_dtype)
         return out, lse
 
@@ -488,6 +515,113 @@ class DeterministicCPAttentionReferenceOp:
             kv_chunk_size=kv_chunk_size,
             output_dtype=torch.float32,
         )
+
+    def _forward_strict_bitwise(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool,
+        scale: Optional[float],
+        key_padding_mask: Optional[torch.Tensor],
+        query_position_offsets: Optional[torch.Tensor],
+        key_position_offsets: Optional[torch.Tensor],
+        kv_chunk_size: Optional[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one canonical arithmetic schedule for every caller.
+
+        The regular implementation changes GEMM shapes when batch/CP changes;
+        that is numerically valid but cannot be bitwise invariant.  Strict mode
+        fixes every matmul to ``[1, H, 1, D]`` by processing one batch row and
+        one query position at a time.  KV blocks are global and independent of
+        ``cp_world_size``; communication only determines ownership outside this
+        reference.  Both training and rollout therefore execute the same
+        score, softmax, value and LSE-merge operations in the same order.
+        """
+
+        _validate_qkv(q, k, v)
+        _validate_scale(scale)
+        batch, hq, sq, dim = q.shape
+        skv = k.size(2)
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != (batch, skv):
+                raise ValueError("key_padding_mask must have shape [B, Skv]")
+            if key_padding_mask.dtype != torch.bool:
+                raise ValueError("key_padding_mask must be bool")
+
+        query_offsets = _normalize_position_offsets(
+            query_position_offsets,
+            batch,
+            q.device,
+            default=skv - sq,
+            name="query_position_offsets",
+        )
+        key_offsets = _normalize_position_offsets(
+            key_position_offsets,
+            batch,
+            q.device,
+            default=0,
+            name="key_position_offsets",
+        )
+        # The canonical schedule is global.  CP ownership and arrival order
+        # must not change which partial states are generated or merged.
+        kv_bounds = _kv_block_bounds(skv, 1, kv_chunk_size)
+        out_rows: list[torch.Tensor] = []
+        lse_rows: list[torch.Tensor] = []
+        for batch_index in range(batch):
+            q_batch = q[batch_index : batch_index + 1].contiguous()
+            k_batch = k[batch_index : batch_index + 1].contiguous()
+            v_batch = v[batch_index : batch_index + 1].contiguous()
+            pad_batch = (
+                None
+                if key_padding_mask is None
+                else key_padding_mask[batch_index : batch_index + 1].contiguous()
+            )
+            query_offset = query_offsets[batch_index : batch_index + 1]
+            key_offset = key_offsets[batch_index : batch_index + 1]
+            query_rows: list[torch.Tensor] = []
+            lse_query_rows: list[torch.Tensor] = []
+            for query_index in range(sq):
+                q_row = q_batch[:, :, query_index : query_index + 1, :].contiguous()
+                states = [
+                    self.local_partial_state(
+                        q_row,
+                        k_batch[:, :, key_start:key_end, :].contiguous(),
+                        v_batch[:, :, key_start:key_end, :].contiguous(),
+                        q_start=query_index,
+                        k_start=key_start,
+                        total_kv_len=skv,
+                        total_query_len=sq,
+                        causal=causal,
+                        scale=scale,
+                        key_padding_mask=(
+                            None
+                            if pad_batch is None
+                            else pad_batch[:, key_start:key_end].contiguous()
+                        ),
+                        query_position_offsets=query_offset,
+                        key_position_offsets=key_offset,
+                    )
+                    for key_start, key_end in kv_bounds
+                    if key_start != key_end
+                ]
+                if not states:
+                    zero_dep = _zero_dependency(q_row.float(), k_batch.float(), v_batch.float())
+                    merged_out = torch.zeros(
+                        1, hq, 1, dim, device=q.device, dtype=torch.float32
+                    ) + zero_dep
+                    merged_lse = torch.full(
+                        (1, hq, 1), float("-inf"), device=q.device, dtype=torch.float32
+                    ) + zero_dep
+                else:
+                    merged = merge_attention_partial_states(states)
+                    merged_out, merged_lse = merged.out, merged.lse
+                query_rows.append(merged_out)
+                lse_query_rows.append(merged_lse)
+            out_rows.append(torch.cat(query_rows, dim=2))
+            lse_rows.append(torch.cat(lse_query_rows, dim=2))
+        return torch.cat(out_rows, dim=0), torch.cat(lse_rows, dim=0)
 
     def backward_reference(
         self,

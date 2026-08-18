@@ -733,3 +733,52 @@ def test_gapped_partial_ranges_raise():
 
 def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
+    """The strict candidate must not change arithmetic with batch/CP shape."""
+
+    q, k, v = _qkv(2, 5, 9, seed=41, dtype=dtype, heads=4, kv_heads=2, dim=8)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    cp1_out, cp1_lse = op.forward_with_lse(
+        q,
+        k,
+        v,
+        cp_world_size=1,
+        kv_chunk_size=3,
+    )
+    cp2_out, cp2_lse = op.forward_with_lse(
+        q,
+        k,
+        v,
+        cp_world_size=2,
+        kv_chunk_size=3,
+    )
+    assert torch.equal(cp1_out, cp2_out)
+    assert torch.equal(cp1_lse, cp2_lse)
+
+    single_out, single_lse = op.forward_with_lse(
+        q[:1],
+        k[:1],
+        v[:1],
+        cp_world_size=1,
+        kv_chunk_size=3,
+    )
+    assert torch.equal(single_out, cp1_out[:1])
+    assert torch.equal(single_lse, cp1_lse[:1])
+
+
+def test_strict_core_backward_is_bitwise_invariant_to_cp_schedule():
+    q, k, v = _qkv(1, 4, 8, seed=42, dtype=torch.float32, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn_like(q)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=3)
+    cp2 = op.backward_reference(q, k, v, dout, cp_world_size=2, kv_chunk_size=3)
+    assert torch.equal(cp1.out, cp2.out)
+    assert torch.equal(cp1.lse, cp2.lse)
+    assert torch.equal(cp1.gradients.dq, cp2.gradients.dq)
+    assert torch.equal(cp1.gradients.dk, cp2.gradients.dk)
+    assert torch.equal(cp1.gradients.dv, cp2.gradients.dv)
