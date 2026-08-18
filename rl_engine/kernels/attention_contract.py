@@ -17,6 +17,9 @@ from typing import Any, Iterable, TypeVar
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
+STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
+
 
 class AttentionContractError(ValueError):
     """Raised when attention metadata does not describe a valid invocation."""
@@ -1589,6 +1592,8 @@ __all__ = [
     "SplitKVRuntimePlanEntry",
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
+    "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

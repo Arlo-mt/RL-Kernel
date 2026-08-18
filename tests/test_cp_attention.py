@@ -14,6 +14,10 @@ import math
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     AttentionSavedForwardState,
@@ -872,3 +876,90 @@ def test_gapped_partial_ranges_raise():
 
 def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_strict_forward_is_bitwise_invariant_to_batch_cp_and_chunk(dtype):
+    q, k, v = _qkv(2, 5, 9, seed=41, dtype=dtype, heads=4, kv_heads=2, dim=8)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    full_out, full_lse = op.forward_with_lse(q, k, v, cp_world_size=1)
+    chunked_out, chunked_lse = op.forward_with_lse(
+        q,
+        k,
+        v,
+        cp_world_size=2,
+        kv_chunk_size=3,
+    )
+    single_out, single_lse = op.forward_with_lse(
+        q[:1],
+        k[:1],
+        v[:1],
+        cp_world_size=4,
+        kv_chunk_size=1,
+    )
+
+    assert torch.equal(full_out, chunked_out)
+    assert torch.equal(full_lse, chunked_lse)
+    assert torch.equal(full_out[:1], single_out)
+    assert torch.equal(full_lse[:1], single_lse)
+
+
+def test_strict_backward_is_bitwise_invariant_to_batch_cp_and_chunk():
+    q, k, v = _qkv(2, 5, 9, seed=42, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn(q.shape, generator=torch.Generator().manual_seed(43))
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    full = op.backward_reference(q, k, v, dout, cp_world_size=1)
+    chunked = op.backward_reference(
+        q,
+        k,
+        v,
+        dout,
+        cp_world_size=2,
+        kv_chunk_size=3,
+    )
+    single = op.backward_reference(
+        q[:1],
+        k[:1],
+        v[:1],
+        dout[:1],
+        cp_world_size=4,
+        kv_chunk_size=1,
+    )
+
+    for full_tensor, chunked_tensor, single_tensor in (
+        (full.out, chunked.out, single.out),
+        (full.lse, chunked.lse, single.lse),
+        (full.gradients.dq, chunked.gradients.dq, single.gradients.dq),
+        (full.gradients.dk, chunked.gradients.dk, single.gradients.dk),
+        (full.gradients.dv, chunked.gradients.dv, single.gradients.dv),
+    ):
+        assert torch.equal(full_tensor, chunked_tensor)
+        assert torch.equal(full_tensor[:1], single_tensor)
+
+    assert chunked.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert chunked.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
+    assert chunked.provenance["actual_split_kv_policy"] == "disabled"
+    assert chunked.provenance["backward_algorithm"] == (
+        "saved_out_lse_canonical_row_reference"
+    )
+    assert all(
+        plan["actual_split_kv_policy"] == "disabled"
+        and plan["actual_split_boundaries"] == [[0, k.size(2)]]
+        for plan in chunked.provenance["actual_split_kv_plans"]
+    )
+
+
+def test_strict_backward_rejects_non_strict_saved_forward_state():
+    q, k, v = _qkv(1, 4, 6, seed=44, heads=4, kv_heads=2, dim=8)
+    state = DeterministicCPAttentionReferenceOp().save_forward_state(q, k, v)
+
+    with pytest.raises(ValueError, match="strict_bitwise"):
+        DeterministicCPAttentionReferenceOp(strict_bitwise=True).backward_reference(
+            q,
+            k,
+            v,
+            torch.ones_like(q),
+            saved_forward_state=state,
+        )
