@@ -210,6 +210,7 @@ def compare_single_gpu_attention(
     query_chunk_size: int | None = None,
     kv_page_size: int | None = None,
     include_transformer_engine: bool = False,
+    strict_bitwise: bool = False,
 ) -> AttentionComparisonReport:
     """Compare full attention with chunked/paged single-GPU materializations.
 
@@ -219,11 +220,20 @@ def compare_single_gpu_attention(
     """
 
     _validate_comparison_inputs(inputs)
-    reference = run_full_attention(inputs)
-    candidates = [
-        run_chunked_query_attention(inputs, query_chunk_size=query_chunk_size),
-        run_paged_kv_attention(inputs, kv_page_size=kv_page_size, merge_backend="rl_kernel"),
-    ]
+    if strict_bitwise:
+        reference = run_strict_shared_core_attention(inputs)
+        candidates = [
+            run_strict_shared_core_chunked_attention(
+                inputs, query_chunk_size=query_chunk_size
+            ),
+            run_strict_shared_core_paged_layout_attention(inputs, kv_page_size=kv_page_size),
+        ]
+    else:
+        reference = run_full_attention(inputs)
+        candidates = [
+            run_chunked_query_attention(inputs, query_chunk_size=query_chunk_size),
+            run_paged_kv_attention(inputs, kv_page_size=kv_page_size, merge_backend="rl_kernel"),
+        ]
     unavailable: list[str] = []
     if include_transformer_engine:
         try:
@@ -242,6 +252,129 @@ def compare_single_gpu_attention(
         reference_name=reference.name,
         drifts=drifts,
         unavailable=tuple(unavailable),
+    )
+
+
+def run_strict_shared_core_attention(inputs: AttentionComparisonInputs) -> AttentionPathResult:
+    """Run the canonical single-row arithmetic schedule for the full path."""
+
+    _validate_comparison_inputs(inputs)
+    out, lse = _strict_attention_with_lse(
+        inputs.q,
+        inputs.k,
+        inputs.v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=inputs.q.size(2),
+        total_kv_len=inputs.k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="strict_shared_core_full_prefill",
+        out=out,
+        lse=lse,
+        provenance=_strict_shared_core_provenance(
+            inputs, materialization="full_logical_kv_shared_core"
+        ),
+    )
+
+
+def run_strict_shared_core_chunked_attention(
+    inputs: AttentionComparisonInputs,
+    *,
+    query_chunk_size: int | None,
+) -> AttentionPathResult:
+    """Replay query chunks through the same one-row schedule as full prefill."""
+
+    _validate_comparison_inputs(inputs)
+    chunk_size = (
+        inputs.q.size(2)
+        if query_chunk_size is None
+        else _positive_int(query_chunk_size, "query_chunk_size")
+    )
+    bounds = _chunk_bounds(inputs.q.size(2), chunk_size)
+    outs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    for q_start, q_end in bounds:
+        out, lse = _strict_attention_with_lse(
+            inputs.q[:, :, q_start:q_end, :],
+            inputs.k,
+            inputs.v,
+            causal=inputs.causal,
+            scale=inputs.scale,
+            key_padding_mask=inputs.key_padding_mask,
+            q_start=q_start,
+            k_start=0,
+            total_query_len=inputs.q.size(2),
+            total_kv_len=inputs.k.size(2),
+            output_dtype=inputs.output_dtype,
+        )
+        outs.append(out)
+        lses.append(lse)
+    return AttentionPathResult(
+        name="strict_shared_core_chunked_prefill",
+        out=torch.cat(outs, dim=2),
+        lse=torch.cat(lses, dim=2),
+        provenance={
+            **_strict_shared_core_provenance(
+                inputs, materialization="query_chunks_shared_core"
+            ),
+            "query_chunk_size": chunk_size,
+            "chunk_bounds": [list(bound) for bound in bounds],
+        },
+    )
+
+
+def run_strict_shared_core_paged_layout_attention(
+    inputs: AttentionComparisonInputs,
+    *,
+    kv_page_size: int | None,
+) -> AttentionPathResult:
+    """Restore paged KV to logical order, then call the shared core once.
+
+    Strict mode deliberately does not create per-page partial states: page size
+    is a storage detail, while Split-KV is disabled in the arithmetic contract.
+    """
+
+    _validate_comparison_inputs(inputs)
+    page_size = (
+        inputs.k.size(2)
+        if kv_page_size is None
+        else _positive_int(kv_page_size, "kv_page_size")
+    )
+    pages = [
+        (start, end)
+        for start, end in _chunk_bounds(inputs.k.size(2), page_size)
+    ]
+    logical_k = torch.cat([inputs.k[:, :, start:end, :] for start, end in pages], dim=2)
+    logical_v = torch.cat([inputs.v[:, :, start:end, :] for start, end in pages], dim=2)
+    out, lse = _strict_attention_with_lse(
+        inputs.q,
+        logical_k,
+        logical_v,
+        causal=inputs.causal,
+        scale=inputs.scale,
+        key_padding_mask=inputs.key_padding_mask,
+        q_start=0,
+        k_start=0,
+        total_query_len=inputs.q.size(2),
+        total_kv_len=inputs.k.size(2),
+        output_dtype=inputs.output_dtype,
+    )
+    return AttentionPathResult(
+        name="strict_shared_core_paged_kv",
+        out=out,
+        lse=lse,
+        provenance={
+            **_strict_shared_core_provenance(
+                inputs, materialization="paged_kv_layout_shared_core"
+            ),
+            "kv_page_size": page_size,
+            "kv_page_bounds": [list(bound) for bound in pages],
+        },
     )
 
 
@@ -465,6 +598,13 @@ def _run_decode_kv_replay(
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
+        provenance.update(
+            {
+                "actual_backend": "te_context_parallel_merge_helpers",
+                "communication_backend": "none",
+                "production_ready": False,
+            }
+        )
     return AttentionPathResult(
         name=f"{merge_backend}_decode_kv_replay",
         out=torch.cat(outs, dim=0),
@@ -672,6 +812,13 @@ def run_paged_kv_attention(
     }
     if merge_backend == "transformer_engine":
         provenance.update(_te_context_parallel_provenance())
+        provenance.update(
+            {
+                "actual_backend": "te_context_parallel_merge_helpers",
+                "communication_backend": "none",
+                "production_ready": False,
+            }
+        )
     return AttentionPathResult(
         name=f"{merge_backend}_paged_kv",
         out=out.to(inputs.output_dtype),
@@ -916,6 +1063,9 @@ def _single_gpu_reference_provenance() -> dict[str, Any]:
     return {
         "execution_scope": "single_device_correctness_reference",
         "runtime_verified": False,
+        "actual_backend": "rlkernel.pytorch.attention_reference",
+        "communication_backend": "none",
+        "production_ready": False,
         "preprocess_policy": "reference_only_not_production",
         "native_backend_executed": False,
         "preprocess_fallback": True,
@@ -927,6 +1077,117 @@ def _single_gpu_reference_provenance() -> dict[str, Any]:
         "output_projection_executed": False,
         "communication": "none",
     }
+
+
+def _strict_shared_core_provenance(
+    inputs: AttentionComparisonInputs,
+    *,
+    materialization: str,
+) -> dict[str, Any]:
+    return {
+        "execution_scope": "single_device_strict_shared_core",
+        "runtime_verified": False,
+        "actual_backend": "rlkernel.pytorch.strict_attention_reference",
+        "communication_backend": "none",
+        "production_ready": False,
+        "strict_core_id": "rlkernel.attention.deterministic_core.v1",
+        "strict_schedule": "single_batch_single_query_global_kv_blocks",
+        "strict_mode": True,
+        "native_backend_executed": False,
+        "native_attention_arithmetic": False,
+        "fallback": False,
+        "fallback_reason": None,
+        "materialization": materialization,
+        "attention_mode": "prefill",
+        "qkv_input_boundary": "projected_qkv",
+        "qkv_projection_executed": False,
+        "output_projection_executed": False,
+        "communication": "none",
+        "split_kv_policy": "disabled",
+        "merge_order": "global_block_index",
+        "accum_dtype": "fp32",
+        "downcast_at": "final_write",
+        "lse_domain": "attention",
+        "lse_exported": True,
+        "dtype": str(inputs.q.dtype).replace("torch.", ""),
+    }
+
+
+def _strict_attention_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool,
+    scale: float | None,
+    key_padding_mask: torch.Tensor | None,
+    q_start: int,
+    k_start: int,
+    total_query_len: int,
+    total_kv_len: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed one-batch/one-query arithmetic schedule locally.
+
+    PR2 must remain independently runnable before PR3 is merged, so this small
+    reference intentionally mirrors the PR3 schedule instead of importing its
+    implementation.  The contract is the same: no Split-KV, FP32 intermediates,
+    logical position offsets, and one reduction per query row.
+    """
+
+    if q.shape[0] != k.shape[0] or k.shape[:1] != v.shape[:1] or k.shape[2:] != v.shape[2:]:
+        raise ValueError("strict Attention q/k/v batch and KV shapes must match")
+    hq, hkv = q.size(1), k.size(1)
+    if hq % hkv:
+        raise ValueError("strict Attention requires GQA-compatible head counts")
+    scale_value = 1.0 / math.sqrt(q.size(-1)) if scale is None else float(scale)
+    output_rows: list[torch.Tensor] = []
+    lse_rows: list[torch.Tensor] = []
+    for batch_index in range(q.size(0)):
+        q_rows: list[torch.Tensor] = []
+        lse_batch: list[torch.Tensor] = []
+        k_batch = k[batch_index : batch_index + 1].float()
+        v_batch = v[batch_index : batch_index + 1].float()
+        if hq != hkv:
+            k_batch = k_batch.repeat_interleave(hq // hkv, dim=1)
+            v_batch = v_batch.repeat_interleave(hq // hkv, dim=1)
+        for query_index in range(q.size(2)):
+            q_row = q[batch_index : batch_index + 1, :, query_index : query_index + 1, :].float()
+            scores = torch.matmul(q_row, k_batch.transpose(-1, -2)) * scale_value
+            if causal:
+                query_position = total_kv_len - total_query_len + q_start + query_index
+                key_positions = torch.arange(
+                    k.size(2), device=q.device, dtype=torch.long
+                ) + k_start
+                scores = scores.masked_fill(
+                    key_positions.view(1, 1, 1, -1) > query_position,
+                    float("-inf"),
+                )
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(
+                    ~key_padding_mask[batch_index : batch_index + 1]
+                    .view(1, 1, 1, -1),
+                    float("-inf"),
+                )
+            row_max = scores.amax(dim=-1, keepdim=True)
+            finite = torch.isfinite(row_max)
+            exp_scores = torch.where(
+                finite,
+                torch.exp(scores - row_max),
+                torch.zeros_like(scores),
+            )
+            row_sum = exp_scores.sum(dim=-1, keepdim=True)
+            lse = torch.where(
+                row_sum > 0,
+                row_max + torch.log(row_sum),
+                torch.full_like(row_sum, float("-inf")),
+            )
+            weights = torch.where(row_sum > 0, exp_scores / row_sum, torch.zeros_like(exp_scores))
+            q_rows.append(torch.matmul(weights, v_batch).to(output_dtype))
+            lse_batch.append(lse.squeeze(-1))
+        output_rows.append(torch.cat(q_rows, dim=2))
+        lse_rows.append(torch.cat(lse_batch, dim=2))
+    return torch.cat(output_rows, dim=0), torch.cat(lse_rows, dim=0)
 
 
 def _attention_with_lse(

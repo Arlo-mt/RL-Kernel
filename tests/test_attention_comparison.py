@@ -153,6 +153,32 @@ def test_single_gpu_attention_harness_reports_out_lse_and_dlogp_drift():
     json.dumps(payload)
 
 
+def test_strict_shared_core_is_bitwise_across_full_chunked_and_paged_layouts():
+    report = compare_single_gpu_attention(
+        _comparison_inputs(),
+        query_chunk_size=2,
+        kv_page_size=3,
+        strict_bitwise=True,
+    )
+
+    assert report.reference_name == "strict_shared_core_full_prefill"
+    by_name = {drift.candidate_name: drift for drift in report.drifts}
+    assert set(by_name) == {
+        "strict_shared_core_chunked_prefill",
+        "strict_shared_core_paged_kv",
+    }
+    for drift in by_name.values():
+        assert drift.out.max_abs == 0.0
+        assert drift.lse.max_abs == 0.0
+        assert drift.provenance["strict_core_id"] == (
+            "rlkernel.attention.deterministic_core.v1"
+        )
+        assert drift.provenance["strict_schedule"] == (
+            "single_batch_single_query_global_kv_blocks"
+        )
+        assert drift.provenance["split_kv_policy"] == "disabled"
+
+
 def test_single_gpu_attention_harness_preserves_key_padding_mask():
     q, k, v = _qkv(seed=3)
     key_padding_mask = torch.tensor(
