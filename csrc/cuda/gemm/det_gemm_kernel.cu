@@ -8,7 +8,7 @@
 //               fixed K order, NO split-K -> batch-invariant.
 //   Fallback  : naive FP32 scalar kernel (also the correctness ground truth).
 //
-// Both: BF16 in / FP32 accum / no TF32 / no split-K.
+// Both: BF16 in / FP32 accum / BF16 store / no TF32 / no split-K.
 //   fwd: C = A @ B   |   dA = dC @ B^T   |   dB = A^T @ dC
 // Backward reuses the forward kernel on transposed operands.
 
@@ -301,7 +301,8 @@ torch::Tensor det_gemm_fwd_fp32(torch::Tensor a, torch::Tensor b) {
   a = a.contiguous(); b = b.contiguous();
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "det_gemm_fwd_fp32: expect 2D [M,K]@[K,N]");
   TORCH_CHECK(b.size(0) == a.size(1), "det_gemm_fwd_fp32: K mismatch");
-  return gemm_dispatch(a, b, true);
+  // Keep the FP32 running sum; only the final store is BF16.
+  return gemm_dispatch(a, b);
 }
 
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b) {
