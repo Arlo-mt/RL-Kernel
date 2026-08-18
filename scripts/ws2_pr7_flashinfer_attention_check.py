@@ -29,6 +29,10 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
+from rl_engine.kernels.attention_contract import (  # noqa: E402
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -568,8 +572,10 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
     if args.strict:
         if provenance.get("strict_mode") is not True:
             errors.append("strict runtime did not execute the shared Attention core")
-        if provenance.get("strict_core_id") != "rlkernel.attention.deterministic_core.v1":
+        if provenance.get("strict_core_id") != STRICT_ATTENTION_CORE_ID:
             errors.append("strict runtime core identity is invalid")
+        if provenance.get("strict_schedule") != STRICT_ATTENTION_SCHEDULE_ID:
+            errors.append("strict runtime arithmetic schedule is invalid")
         if provenance.get("native_attention_arithmetic") is not False:
             errors.append("strict runtime entered native FlashInfer Attention arithmetic")
         strict_plans = provenance.get("strict_core_row_plans")

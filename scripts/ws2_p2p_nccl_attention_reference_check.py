@@ -27,6 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from rl_engine.kernels.attention_contract import (  # noqa: E402
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
@@ -434,7 +438,8 @@ def _run_strict_shared_core_check(
 
     provenance = distributed.provenance
     identity_valid = (
-        provenance.get("strict_core_id") == "rlkernel.attention.deterministic_core.v1"
+        provenance.get("strict_core_id") == STRICT_ATTENTION_CORE_ID
+        and provenance.get("strict_schedule") == STRICT_ATTENTION_SCHEDULE_ID
         and provenance.get("strict_mode") is True
         and provenance.get("native_attention_arithmetic") is False
         and provenance.get("fallback") is False
@@ -447,6 +452,10 @@ def _run_strict_shared_core_check(
             all(bitwise.values()) and repeat_out_bitwise and repeat_lse_bitwise and identity_valid
         ),
         "strict_core_id": provenance.get("strict_core_id"),
+        "strict_schedule": provenance.get("strict_schedule"),
+        "actual_backend": provenance.get("actual_backend"),
+        "communication_backend": provenance.get("communication_backend"),
+        "production_ready": provenance.get("production_ready"),
         "strict_mode": provenance.get("strict_mode"),
         "native_attention_arithmetic": provenance.get("native_attention_arithmetic"),
         "fallback": provenance.get("fallback"),

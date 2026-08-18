@@ -10,7 +10,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from rl_engine.kernels.attention_contract import STRICT_ATTENTION_CORE_ID, SplitKVSpec
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+    SplitKVSpec,
+)
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPBlockMetadata,
     AttentionCPCommunicationPlan,
@@ -358,6 +362,7 @@ class _IdentityStrictRoPE:
 
 class _RecordingStrictCore:
     core_id = STRICT_ATTENTION_CORE_ID
+    strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
     backend_id = "test.strict_cuda_core"
     merge_order = "global_block_index"
     accum_dtype = "fp32"
@@ -392,6 +397,7 @@ class _RecordingStrictCore:
             lse=torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device),
             provenance={
                 "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
                 "attention_backend": self.backend_id,
                 "split_kv": {
                     "actual_split_kv_policy": "disabled",
@@ -1707,6 +1713,7 @@ def test_pr7_check_accepts_strict_shared_core_without_native_flashinfer_arithmet
             "fallback": False,
             "strict_mode": True,
             "strict_core_id": STRICT_ATTENTION_CORE_ID,
+            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
             "native_attention_arithmetic": False,
             "strict_core_row_plans": [{"actual_split_kv_policy": "disabled"}],
             "rope_backend": "rlkernel.cuda.rope_sm90",

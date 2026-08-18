@@ -25,9 +25,6 @@ from rl_engine.kernels.attention_contract import (
     SplitKVSpec,
 )
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
-from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
-    DeterministicCPAttentionReferenceOp,
-)
 from rl_engine.utils.logger import logger
 
 _HEAD_DIM = 128
@@ -229,6 +226,7 @@ class RLKernelDeterministicAttentionCore:
     """
 
     core_id = STRICT_ATTENTION_CORE_ID
+    strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
     backend_id = "rlkernel.cuda.deterministic_attention"
     merge_order = "global_block_index"
     accum_dtype = "fp32"
@@ -240,19 +238,14 @@ class RLKernelDeterministicAttentionCore:
         self,
         *,
         split_kv: SplitKVSpec | None = None,
-        strict_bitwise: bool = True,
     ) -> None:
         requested = SplitKVSpec.disabled() if split_kv is None else split_kv
         if not isinstance(requested, SplitKVSpec):
             raise TypeError("split_kv must be a SplitKVSpec")
         if requested.mode is not SplitKVMode.DISABLED:
             raise ValueError("the strict CUDA Attention core requires Split-KV to be disabled")
-        if not isinstance(strict_bitwise, bool):
-            raise TypeError("strict_bitwise must be a bool")
         self.split_kv = requested
-        self.strict_bitwise = strict_bitwise
-        self._strict_reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
-        self._op = None if strict_bitwise else DeterministicAttentionOp()
+        self._op = DeterministicAttentionOp()
 
     def __call__(
         self,
@@ -286,32 +279,14 @@ class RLKernelDeterministicAttentionCore:
         resolved_dtype = q.dtype if output_dtype is None else output_dtype
         if resolved_dtype != q.dtype:
             raise ValueError("strict Attention output_dtype must match the Q/K/V input dtype")
-        if self.strict_bitwise:
-            query_offsets = (
-                None if query_position_ids is None else query_position_ids[:, 0]
-            )
-            key_offsets = None if key_position_ids is None else key_position_ids[:, 0]
-            out, lse = self._strict_reference.forward_fp32_with_lse(
-                q,
-                k,
-                v,
-                causal=causal,
-                scale=scale,
-                key_padding_mask=key_padding_mask,
-                query_position_offsets=query_offsets,
-                key_position_offsets=key_offsets,
-            )
-            out = out.to(dtype=resolved_dtype)
-        else:
-            assert self._op is not None
-            out, lse = self._op.forward_with_lse(
-                q,
-                k,
-                v,
-                causal=causal,
-                scale=scale,
-                key_padding_mask=key_padding_mask,
-            )
+        out, lse = self._op.forward_with_lse(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+        )
         return DeterministicAttentionCoreResult(
             out=out,
             lse=lse,
@@ -325,11 +300,7 @@ class RLKernelDeterministicAttentionCore:
                 "fallback": self.fallback,
                 "fallback_reason": None,
                 "native_attention_arithmetic": self.native_attention_arithmetic,
-                "strict_schedule": (
-                    STRICT_ATTENTION_SCHEDULE_ID
-                    if self.strict_bitwise
-                    else "cuda_fixed_grid"
-                ),
+                "strict_schedule": self.strict_schedule,
             },
         )
 

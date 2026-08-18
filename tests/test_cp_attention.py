@@ -21,6 +21,7 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
     RLKernelDeterministicAttentionCore,
 )
+from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     DeterministicCPAttentionReferenceOp,
@@ -697,7 +698,21 @@ def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
 
 
-def test_shared_strict_core_reports_canonical_schedule_without_cuda_extension():
+def test_shared_strict_core_reports_canonical_cuda_schedule(monkeypatch):
+    class FakeCUDAAttentionOp:
+        @staticmethod
+        def forward_with_lse(q, k, v, **_kwargs):
+            del k, v
+            return (
+                torch.zeros_like(q),
+                torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device),
+            )
+
+    monkeypatch.setattr(
+        deterministic_attn_module,
+        "DeterministicAttentionOp",
+        FakeCUDAAttentionOp,
+    )
     q, k, v = _qkv(1, 3, 4, seed=41, heads=4, kv_heads=2, dim=8)
     q_positions = torch.arange(1, 4).view(1, -1)
     k_positions = torch.arange(4).view(1, -1)

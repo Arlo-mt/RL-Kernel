@@ -26,6 +26,7 @@ import torch
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContractError,
     SplitKVExecutionPlan,
     SplitKVMode,
@@ -1454,6 +1455,11 @@ def _validate_strict_core(core: Any) -> None:
         raise ValueError("strict deterministic core must implement forward_with_lse")
     if getattr(core, "core_id", None) != STRICT_ATTENTION_CORE_ID:
         raise ValueError("strict deterministic core ID must be " f"{STRICT_ATTENTION_CORE_ID!r}")
+    if getattr(core, "strict_schedule", None) != STRICT_ATTENTION_SCHEDULE_ID:
+        raise ValueError(
+            "strict deterministic core schedule must be "
+            f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
+        )
     required = {
         "merge_order": "global_block_index",
         "accum_dtype": "fp32",
@@ -1485,6 +1491,7 @@ def _validate_strict_core_result(
         raise FlashInferUnavailable("strict deterministic core LSE must be FP32")
     expected = {
         "strict_core_id": core.core_id,
+        "strict_schedule": core.strict_schedule,
         "attention_backend": core.backend_id,
         "merge_order": core.merge_order,
         "accum_dtype": core.accum_dtype,
@@ -1672,6 +1679,7 @@ def _strict_attention_provenance(
         "lse_dtype": "fp32",
         "strict_mode": True,
         "strict_core_id": core_provenance["strict_core_id"],
+        "strict_schedule": core_provenance["strict_schedule"],
         "accum_dtype": core_provenance["accum_dtype"],
         "downcast_at": core_provenance["downcast_at"],
         "arithmetic_plan_source": "rlkernel_deterministic_cuda_core",
@@ -1688,6 +1696,14 @@ def _strict_attention_provenance(
         "k_cache_rope_state": "post_rope",
         "batch_invariant_claim": "strict_runtime_verified",
         "cp_comm_required": cp_required,
+        "communication_backend": (
+            "self_owned_cuda_ag_rs" if cp_required else "none"
+        ),
+        "production_ready": bool(
+            cp_required
+            and core_provenance.get("attention_backend")
+            == "rlkernel.cuda.deterministic_attention"
+        ),
     }
 
 
