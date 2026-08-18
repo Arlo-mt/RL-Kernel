@@ -18,67 +18,94 @@ from rl_engine.utils.logger import logger
 
 
 def _build_cos_sin(positions: Tensor, half: int, theta: float, device: torch.device):
-    """fp32 cos/sin rows, identical math to NativeRoPEOp."""
+    """fp32 cos/sin caches of shape [S, half], identical math to NativeRoPEOp."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=device) / half))
     pos = positions.to(device=device, dtype=torch.float32).reshape(-1, 1)
     freqs = pos * inv_freq  # [S, half]
     return freqs.cos().contiguous(), freqs.sin().contiguous()
 
 
+def _rope_table(x: Tensor, positions: Tensor, theta: float) -> tuple[Tensor, Tensor, Tensor]:
+    """Build (x_2d, cos, sin) for [S] or [B, S] positions. See Triton RoPE."""
+    D = x.shape[-1]
+    if D % 2 != 0:
+        raise ValueError(f"RoPE head_dim must be even, got {D}")
+    if positions.dim() == 1:
+        table_len = int(positions.shape[0])
+        x_2d = x.contiguous().reshape(-1, D)
+        if x_2d.shape[0] % table_len != 0:
+            raise ValueError(
+                f"row count {x_2d.shape[0]} not divisible by seq length {table_len}; "
+                "expected a [..., S, D] contiguous layout."
+            )
+        cos, sin = _build_cos_sin(positions, D // 2, float(theta), x.device)
+        return x_2d, cos, sin
+    if positions.dim() != 2:
+        raise ValueError(f"positions must be [S] or [B, S], got shape {tuple(positions.shape)}")
+    batch, seq = positions.shape
+    if x.shape[0] != batch or x.shape[-2] != seq:
+        raise ValueError(
+            f"positions {tuple(positions.shape)} is incompatible with x {tuple(x.shape)}; "
+            "expected x [B, ..., S, D]"
+        )
+    if x.dim() == 4:
+        x_2d = x.permute(1, 0, 2, 3).contiguous().reshape(-1, D)
+    elif x.dim() == 3:
+        x_2d = x.contiguous().reshape(-1, D)
+    else:
+        raise ValueError(
+            f"RoPE [B, S] positions require x [B, S, D] or [B, H, S, D], got {x.dim()}D"
+        )
+    table_len = batch * seq
+    if x_2d.shape[0] % table_len != 0:
+        raise ValueError(f"row count {x_2d.shape[0]} not divisible by B*S={table_len}")
+    cos, sin = _build_cos_sin(positions.reshape(-1), D // 2, float(theta), x.device)
+    return x_2d, cos, sin
+
+
+def _restore_rope(out_2d: Tensor, x: Tensor, positions: Tensor) -> Tensor:
+    if positions.dim() == 1 or x.dim() != 4:
+        return out_2d.reshape(x.shape)
+    heads, batch, seq, dim = x.shape[1], x.shape[0], x.shape[2], x.shape[3]
+    return out_2d.reshape(heads, batch, seq, dim).permute(1, 0, 2, 3).contiguous()
+
+
 class _RoPEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, positions: Tensor, theta: float) -> Tensor:
-        D = x.shape[-1]
-        if D % 2 != 0:
-            raise ValueError(f"RoPE head_dim must be even, got {D}")
-        if positions.dim() not in (1, 2):
-            raise ValueError("positions must have shape [S] or [B, S]")
-        S = positions.shape[-1]
-        if S == 0:
-            raise ValueError("positions must not be empty")
-        if x.shape[-2] != S:
-            raise ValueError(f"x sequence length {x.shape[-2]} does not match positions length {S}")
-        x_2d = x.contiguous().reshape(-1, D)
-        n_rows = x_2d.shape[0]
-        if positions.dim() == 2:
-            batch = positions.shape[0]
-            if x.dim() < 3 or x.shape[0] != batch:
-                raise ValueError(
-                    f"x batch size {x.shape[0]} does not match positions batch size {batch}"
-                )
-            rows_per_token = n_rows // (batch * S)
-            if rows_per_token * batch * S != n_rows:
-                raise ValueError("x rows are incompatible with [B, S] positions")
-            # The CUDA kernel accepts one fp32 cos/sin row per flattened x row.
-            # Expanding positions preserves arbitrary global/zigzag indices while
-            # keeping the arithmetic inside the precompiled deterministic kernel.
-            kernel_positions = (
-                positions[:, None, :].expand(batch, rows_per_token, S).contiguous().reshape(-1)
-            )
-        else:
-            kernel_positions = positions
-        if n_rows % kernel_positions.numel() != 0:
-            raise ValueError(
-                f"row count {n_rows} not divisible by position rows "
-                f"{kernel_positions.numel()}; "
-                "expected a [..., S, D] contiguous layout."
-            )
-        cos, sin = _build_cos_sin(kernel_positions, D // 2, float(theta), x.device)
+        x_2d, cos, sin = _rope_table(x, positions, theta)
         ctx.save_for_backward(cos, sin)
-        out = _C.rope_apply_sm90(x_2d, cos, sin, 1.0)
-        return out.reshape(x.shape)
+        ctx.x_shape = tuple(x.shape)
+        ctx.pos_dim = positions.dim()
+        out_2d = _C.rope_apply_sm90(x_2d, cos, sin, 1.0)
+        return _restore_rope(out_2d, x, positions)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         cos, sin = ctx.saved_tensors
         grad_x = None
         if ctx.needs_input_grad[0]:
-            D = grad_out.shape[-1]
-            g_2d = grad_out.contiguous().reshape(-1, D)
-            # Inverse rotation: same kernel with the sine negated.
-            grad_x = _C.rope_apply_sm90(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
-        # Inputs: x, positions, theta.
+            if ctx.pos_dim == 2 and len(ctx.x_shape) == 4:
+                g_2d = grad_out.permute(1, 0, 2, 3).contiguous().reshape(-1, ctx.x_shape[-1])
+                out_2d = _C.rope_apply_sm90(g_2d, cos, sin, -1.0)
+                heads, batch, seq, dim = (
+                    ctx.x_shape[1],
+                    ctx.x_shape[0],
+                    ctx.x_shape[2],
+                    ctx.x_shape[3],
+                )
+                grad_x = out_2d.reshape(heads, batch, seq, dim).permute(1, 0, 2, 3).contiguous()
+            else:
+                g_2d = grad_out.contiguous().reshape(-1, grad_out.shape[-1])
+                grad_x = _C.rope_apply_sm90(g_2d, cos, sin, -1.0).reshape(grad_out.shape)
         return grad_x, None, None
+
+
+def _is_hopper(device: torch.device) -> bool:
+    try:
+        return torch.cuda.get_device_capability(device)[0] == 9
+    except Exception:
+        return False
 
 
 class RoPESM90Op:
@@ -90,7 +117,6 @@ class RoPESM90Op:
     """
 
     op_class = "elementwise"
-    backend_id = "rlkernel.cuda.rope_sm90"
 
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "rope_apply_sm90"):
@@ -106,4 +132,9 @@ class RoPESM90Op:
     def forward(self, x: Tensor, positions: Tensor, *, theta: float = 1_000_000.0) -> Tensor:
         if x.device.type != "cuda":
             raise RuntimeError(f"RoPESM90Op requires a CUDA tensor, got device '{x.device}'.")
+        if not _is_hopper(x.device):
+            raise RuntimeError(
+                "RoPESM90Op requires Hopper (SM90) CUDA; "
+                f"got compute capability {torch.cuda.get_device_capability(x.device)}"
+            )
         return _RoPEFunction.apply(x, positions, theta)
