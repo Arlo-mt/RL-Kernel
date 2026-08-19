@@ -18,12 +18,13 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
 )
+from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
 from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
     RLKernelDeterministicAttentionCore,
 )
-from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionRingSchedule,
     DeterministicCPAttentionReferenceOp,
     compare_cp_attention_backward,
     merge_attention_partial_states,
@@ -38,6 +39,17 @@ _N_KV = 8
 _HEAD_DIM = 128
 _ATOL = 3.0e-6
 _GRAD_ATOL = 1.0e-5
+
+
+def test_ring_schedule_separates_compute_and_merge_order():
+    schedule = AttentionRingSchedule.build(12, cp_world_size=2, kv_chunk_size=2)
+
+    assert schedule.schedule_id == "rlkernel.attention.strict_ring_state.v1"
+    assert schedule.compute_communication == "decoupled"
+    assert schedule.overlap == "disabled"
+    assert schedule.merge_order == tuple(range(6))
+    assert schedule.compute_order == (0, 5, 1, 4, 2, 3)
+    assert [block.owner_cp_rank for block in schedule.blocks] == [0, 0, 0, 1, 1, 1]
 
 
 @contextlib.contextmanager

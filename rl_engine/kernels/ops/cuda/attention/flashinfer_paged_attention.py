@@ -49,6 +49,7 @@ from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
 )
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionRingSchedule,
     DeterministicCPAttentionReferenceOp,
     build_reference_split_kv_runtime_plan_set,
     merge_attention_partial_states,
@@ -804,6 +805,11 @@ class FlashInferQwen3PagedAttentionOp:
         if expected_kv_range is None:
             raise FlashInferUnavailable("strict CP Attention requires an expected KV range")
         expected_k_tokens = expected_kv_range[1] - expected_kv_range[0]
+        ring_schedule = AttentionRingSchedule.build(
+            expected_k_tokens,
+            cp_world_size=plan.parallel.cp_world_size,
+            kv_chunk_size=None,
+        )
         if global_q.size(2) != expected_q_tokens:
             raise FlashInferUnavailable("strict AG(Q) returned the wrong global width")
         if global_k.size(2) != expected_k_tokens or global_v.shape != global_k.shape:
@@ -854,6 +860,9 @@ class FlashInferQwen3PagedAttentionOp:
                 "strict_comm_autograd": bool(getattr(communication, "supports_autograd", False)),
                 "strict_local_query_range": [query_start, query_end],
                 "strict_local_kv_range": [key_start, key_end],
+                **ring_schedule.provenance(),
+                "ring_schedule_default": True,
+                "ring_partial_arithmetic": False,
             }
         )
         return FlashInferAttentionResult(
@@ -1457,8 +1466,7 @@ def _validate_strict_core(core: Any) -> None:
         raise ValueError("strict deterministic core ID must be " f"{STRICT_ATTENTION_CORE_ID!r}")
     if getattr(core, "strict_schedule", None) != STRICT_ATTENTION_SCHEDULE_ID:
         raise ValueError(
-            "strict deterministic core schedule must be "
-            f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
+            "strict deterministic core schedule must be " f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
         )
     required = {
         "merge_order": "global_block_index",
@@ -1696,13 +1704,10 @@ def _strict_attention_provenance(
         "k_cache_rope_state": "post_rope",
         "batch_invariant_claim": "strict_runtime_verified",
         "cp_comm_required": cp_required,
-        "communication_backend": (
-            "self_owned_cuda_ag_rs" if cp_required else "none"
-        ),
+        "communication_backend": ("self_owned_cuda_ag_rs" if cp_required else "none"),
         "production_ready": bool(
             cp_required
-            and core_provenance.get("attention_backend")
-            == "rlkernel.cuda.deterministic_attention"
+            and core_provenance.get("attention_backend") == "rlkernel.cuda.deterministic_attention"
         ),
     }
 
