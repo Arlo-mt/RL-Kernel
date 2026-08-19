@@ -8,6 +8,15 @@ import os
 from enum import Enum, EnumMeta
 from typing import Any, Dict, Optional, Set, Type
 
+from rl_engine.kernels.attention_contract import (
+    AttentionBackendCapability,
+    AttentionContract,
+    AttentionContractError,
+    AttentionDispatchResult,
+    AttentionDType,
+    AttentionMode,
+    AttentionRole,
+)
 from rl_engine.kernels.semantic_registry import (
     OperatorBackendDescriptor,
     OperatorFallbackPolicy,
@@ -107,6 +116,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     PYTORCH_NATIVE_KV_CACHE_ATTN = (
         "rl_engine.kernels.ops.pytorch.attention.kv_cache.NativeKVCacheAttnOp"
     )
+    PYTORCH_CP_ATTENTION = (
+        "rl_engine.kernels.ops.pytorch.attention.cp_attention."
+        "DeterministicCPAttentionReferenceOp"
+    )
     # WS1 pure-PyTorch ground-truth linear ops
     PYTORCH_NATIVE_LM_HEAD = "rl_engine.kernels.ops.pytorch.linear.lm_head.NativeLMHeadOp"
     # WS1 pure-PyTorch ground-truth embedding ops
@@ -160,6 +173,45 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             implementation_class_or_factory=None,
             fallback_policy=OperatorFallbackPolicy.RUNTIME_MANAGED,
             version_or_build_fingerprint="runtime-native-unresolved-v1",
+        ),
+        OperatorBackendDescriptor(
+            semantic_op="attention",
+            backend_id="rlkernel.attention.deterministic.v1",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"cpu", "cuda", "rocm"}),
+            supported_dtypes=frozenset({"float32", "bfloat16", "float16"}),
+            supported_topologies={"*": "*"},
+            determinism_or_alignment_properties={
+                "algorithm": "standard_softmax_attention",
+                "batch_invariant": True,
+                "deterministic": True,
+                "split_kv": "contract_bound",
+                "reduction_order": "global_block_index",
+                "strict_schedule": "single_batch_single_query_global_kv_blocks",
+                "strict_observable": True,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=(
+                "rl_engine.kernels.ops.pytorch.attention.ablation.AttentionAblationOp"
+            ),
+            fallback_policy=OperatorFallbackPolicy.ERROR,
+            version_or_build_fingerprint="AttentionAblationOp-bitwise-v2",
+        ),
+        OperatorBackendDescriptor(
+            semantic_op="attention",
+            backend_id="native",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"*"}),
+            supported_dtypes=frozenset({"*"}),
+            supported_topologies={"*": "*"},
+            determinism_or_alignment_properties={
+                "selection": "runtime_native",
+                "strict_observable": False,
+            },
+            lifecycle=OperatorLifecycle.ENGINE_CONSTRUCTION,
+            implementation_class_or_factory=None,
+            fallback_policy=OperatorFallbackPolicy.RUNTIME_MANAGED,
+            version_or_build_fingerprint="runtime-native-attention-unresolved-v1",
         ),
     )
 
@@ -219,6 +271,54 @@ class KernelRegistry:
         self._failed_backends: Set[str] = set()
         self.semantic = SemanticOperatorCatalog(_default_semantic_descriptors())
 
+        common_roles = frozenset({AttentionRole.TRAIN, AttentionRole.INFER})
+        common_dtypes = frozenset({AttentionDType.BF16, AttentionDType.FP16, AttentionDType.FP32})
+        self._attention_capabilities = {
+            OpBackend.PYTORCH_NATIVE_ATTENTION: AttentionBackendCapability(
+                backend_id="pytorch-native-attention-ws1",
+                roles=common_roles,
+                modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+                dtypes=common_dtypes,
+                cp_world_sizes=(1,),
+                exports_attention_lse=False,
+                deterministic_cp_merge=False,
+                supports_packed_varlen=False,
+                supports_kv_cache=False,
+                implementation_kind="reference",
+            ),
+            OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN: AttentionBackendCapability(
+                backend_id="pytorch-native-kv-cache-attention-ws1",
+                roles=common_roles,
+                modes=frozenset({AttentionMode.DECODE}),
+                dtypes=common_dtypes,
+                cp_world_sizes=(1,),
+                exports_attention_lse=False,
+                deterministic_cp_merge=False,
+                supports_packed_varlen=False,
+                supports_kv_cache=False,
+                implementation_kind="reference",
+            ),
+            OpBackend.PYTORCH_CP_ATTENTION: AttentionBackendCapability(
+                backend_id="pytorch-deterministic-cp-attention-reference",
+                roles=common_roles,
+                modes=frozenset({AttentionMode.PREFILL, AttentionMode.CHUNKED_PREFILL}),
+                dtypes=common_dtypes,
+                tp_world_sizes=(1, 2),
+                cp_world_sizes=(1, 2),
+                exports_attention_lse=True,
+                deterministic_cp_merge=True,
+                supports_packed_varlen=False,
+                supports_kv_cache=False,
+                supports_rope_metadata=False,
+                supports_fused_rope_attention=False,
+                supports_split_kv_disabled=True,
+                supports_split_kv_fixed=True,
+                supports_split_kv_auto=False,
+                reports_actual_split_kv_plan=True,
+                implementation_kind="deterministic",
+            ),
+        }
+
         self._priority_map = {
             "cuda": {
                 "logp": [
@@ -249,6 +349,12 @@ class KernelRegistry:
                 ],
                 "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
                 "attention": [
+                    OpBackend.CUDA_DETERMINISTIC_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
                     OpBackend.CUDA_DETERMINISTIC_ATTENTION,
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
                 ],
@@ -291,6 +397,11 @@ class KernelRegistry:
                     OpBackend.TRITON_GENERIC,
                 ],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
@@ -315,6 +426,11 @@ class KernelRegistry:
                 "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "cp_attention": [OpBackend.PYTORCH_CP_ATTENTION],
+                "ws2_attention": [
+                    OpBackend.PYTORCH_CP_ATTENTION,
+                    OpBackend.PYTORCH_NATIVE_ATTENTION,
+                ],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
@@ -431,6 +547,114 @@ class KernelRegistry:
                 self._failed_backends.add(backend.name)
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
+
+    def get_attention_op(
+        self,
+        contract: AttentionContract,
+        *,
+        requested_backend: str = "deterministic",
+    ) -> AttentionDispatchResult:
+        """Resolve only a backend that explicitly supports the WS2 contract."""
+
+        if not isinstance(contract, AttentionContract):
+            raise AttentionContractError("contract must be an AttentionContract")
+        if not isinstance(requested_backend, str) or not requested_backend.strip():
+            raise AttentionContractError("requested_backend must be a non-empty string")
+        requested_backend = requested_backend.strip().lower()
+
+        platform = self._platform()
+        candidates = self._priority_map.get(platform, {}).get("ws2_attention", [])
+        rejected: list[str] = []
+
+        for backend in candidates:
+            capability = self._attention_capabilities.get(backend)
+            if capability is None:
+                rejected.append(f"{backend.name}: no AttentionBackendCapability declared")
+                continue
+            incompatibilities = list(capability.incompatibilities(contract))
+            policy_mismatch = self._attention_policy_mismatch(requested_backend, capability)
+            if policy_mismatch is not None:
+                incompatibilities.append(policy_mismatch)
+            if incompatibilities:
+                rejected.append(f"{backend.name}: " + "; ".join(incompatibilities))
+                continue
+
+            op = self._get_or_create_backend(backend)
+            if op is None:
+                rejected.append(f"{backend.name}: backend could not be loaded or instantiated")
+                continue
+
+            return AttentionDispatchResult(
+                op=op,
+                capability=capability,
+                provenance={
+                    "requested_backend": requested_backend,
+                    "actual_backend": capability.backend_id,
+                    "backend_enum": backend.name,
+                    "platform": platform,
+                    "fallback": bool(rejected),
+                    "prior_rejections": list(rejected),
+                    "contract": contract.to_dict(),
+                    "capability": capability.to_dict(),
+                },
+            )
+
+        details = " | ".join(rejected) if rejected else "no candidates registered"
+        requested = contract.to_dict()
+        raise RuntimeError(
+            "No attention backend supports the requested WS2 contract on "
+            f"{platform}: role={requested['role']}, mode={requested['mode']}, "
+            f"dtype={requested['dtype']}, TP={contract.sharding.tp_world_size}, "
+            f"CP={contract.sharding.cp_world_size}. Rejections: {details}"
+        )
+
+    @staticmethod
+    def _attention_policy_mismatch(
+        requested_backend: str,
+        capability: AttentionBackendCapability,
+    ) -> Optional[str]:
+        if requested_backend == "auto":
+            return None
+        if requested_backend in {"production", "reference", "deterministic"}:
+            if capability.implementation_kind == requested_backend:
+                return None
+            return (
+                f"implementation_kind={capability.implementation_kind} does not satisfy "
+                f"requested_backend={requested_backend}"
+            )
+        if capability.backend_id == requested_backend:
+            return None
+        return (
+            f"backend_id={capability.backend_id} does not match "
+            f"requested_backend={requested_backend}"
+        )
+
+    @staticmethod
+    def _platform() -> str:
+        if device_ctx.is_rocm:
+            return "rocm"
+        if device_ctx.device_type == "cuda":
+            return "cuda"
+        return "cpu"
+
+    def _get_or_create_backend(self, backend: OpBackend) -> Optional[Any]:
+        if backend.name in self._instance_cache:
+            return self._instance_cache[backend.name]
+        if backend.name in self._failed_backends:
+            return None
+
+        op_class = self._load_backend(backend)
+        if op_class is None:
+            self._failed_backends.add(backend.name)
+            return None
+        try:
+            op = op_class()
+        except Exception as exc:
+            logger.error(f"Failed to instantiate {backend.name}: {exc}")
+            self._failed_backends.add(backend.name)
+            return None
+        self._instance_cache[backend.name] = op
+        return op
 
     def _load_backend(self, backend: OpBackend) -> Optional[Type]:
         """Import a legacy backend and distinguish wrapper bugs from absence."""

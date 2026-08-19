@@ -47,4 +47,5 @@ follow_imports = "silent"
 [tool.pytest.ini_options]
 markers = [
     "smoke_operator: temporary smoke-only operator plumbing tests",
+    "unit: CPU-safe unit tests",
 ]
