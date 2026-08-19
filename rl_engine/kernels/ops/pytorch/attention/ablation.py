@@ -17,7 +17,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 import torch
 from torch import Tensor
@@ -470,6 +470,8 @@ class AttentionAblationOp:
             )
         result = method(q, k, v, **accepted)
         backend_provenance: dict[str, Any] = {}
+        out: Any
+        lse: Any
         if isinstance(result, AttentionAblationResult):
             out, lse = result.out, result.lse
         elif isinstance(result, tuple) and len(result) == 2:
@@ -507,16 +509,21 @@ class AttentionAblationOp:
             gradients = getattr(result, "gradients", None)
             if gradients is not None:
                 return gradients.dq, gradients.dk, gradients.dv
+        if dout is None:
+            raise AttentionContractError("dout is required to compute Attention gradients")
         if not out.requires_grad:
             raise AttentionContractError(
                 "Attention backend did not retain an autograd graph for gradients"
             )
-        return torch.autograd.grad(
-            out,
-            (q, k, v),
-            grad_outputs=dout.to(dtype=out.dtype),
-            allow_unused=False,
-            retain_graph=True,
+        return cast(
+            tuple[Tensor, Tensor, Tensor],
+            torch.autograd.grad(
+                out,
+                (q, k, v),
+                grad_outputs=dout.to(dtype=out.dtype),
+                allow_unused=False,
+                retain_graph=True,
+            ),
         )
 
 

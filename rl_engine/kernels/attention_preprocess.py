@@ -159,8 +159,8 @@ class H100AttentionPreprocessor:
         _validate_inputs(q, k, q_weight, k_weight, positions, self.device)
         q_norm_det = self.rmsnorm(q, q_weight, eps=eps)
         k_norm_det = self.rmsnorm(k, k_weight, eps=eps)
-        q_det = self.rope(q_norm_det, positions, theta=theta)
-        k_det = self.rope(k_norm_det, positions, theta=theta)
+        q_det = _apply_deterministic_rope(self.rope, q_norm_det, positions, theta)
+        k_det = _apply_deterministic_rope(self.rope, k_norm_det, positions, theta)
 
         native_qk_norm = self.native_qk_norm
         native_rope = self.native_rope
@@ -208,6 +208,22 @@ class H100AttentionPreprocessor:
             probe_id=probe_id,
             policy_id=self.policy_id,
         )
+
+
+def _apply_deterministic_rope(
+    rope: Callable[..., Tensor],
+    x: Tensor,
+    positions: Tensor,
+    theta: float,
+) -> Tensor:
+    """Adapt per-sample positions to the CUDA RoPE operator's 1-D contract."""
+
+    if positions.dim() == 1:
+        return rope(x, positions, theta=theta)
+    return torch.cat(
+        [rope(x[index : index + 1], positions[index], theta=theta) for index in range(x.shape[0])],
+        dim=0,
+    )
 
 
 def _probe_id(
