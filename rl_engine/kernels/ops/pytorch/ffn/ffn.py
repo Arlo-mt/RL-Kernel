@@ -14,24 +14,45 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 QWEN3_8B_HIDDEN_SIZE = 4096
 QWEN3_8B_INTERMEDIATE_SIZE = 12288
 
-_REQUIRED_SYMBOLS = (
+_DET_GEMM_SYMBOLS = (
     "det_gemm_fwd",
     "det_gemm_db",
+)
+_SWIGLU_SYMBOLS = (
     "swiglu_forward",
     "swiglu_backward",
 )
+_REQUIRED_SYMBOLS = _DET_GEMM_SYMBOLS + _SWIGLU_SYMBOLS
 _COLLECTIVE_MIN_CAPACITY_BYTES = 64 * 1024 * 1024
 _COLLECTIVES: dict[tuple[int, int, int, int], Any] = {}
 
 
-def _require_ffn_kernels() -> None:
-    missing = [name for name in _REQUIRED_SYMBOLS if not hasattr(_C, name)]
+def _require_ffn_kernels(*, disable_split_k: bool) -> None:
+    required = _REQUIRED_SYMBOLS if disable_split_k else _SWIGLU_SYMBOLS
+    missing = [name for name in required if not hasattr(_C, name)]
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
-        raise RuntimeError(
-            "qwen3_ffn requires the compiled deterministic GEMM and "
-            f"SwiGLU CUDA kernels.{suffix}"
+        needed = (
+            "compiled deterministic GEMM and SwiGLU CUDA kernels"
+            if disable_split_k
+            else "compiled SwiGLU CUDA kernels"
         )
+        raise RuntimeError(f"qwen3_ffn requires the {needed}.{suffix}")
+
+
+def _gemm_fwd(a: Tensor, b: Tensor, *, disable_split_k: bool) -> Tensor:
+    if disable_split_k:
+        return _C.det_gemm_fwd(a, b)
+    # cuBLASLt / CUTLASS: may use split-K. Detach so Autograd.Function owns backward.
+    with torch.no_grad():
+        return torch.matmul(a, b)
+
+
+def _gemm_db(a: Tensor, grad_output: Tensor, *, disable_split_k: bool) -> Tensor:
+    if disable_split_k:
+        return _C.det_gemm_db(a, grad_output)
+    with torch.no_grad():
+        return torch.matmul(a.t().contiguous(), grad_output)
 
 
 def _require_parallel_group(group: Any, name: str):
@@ -156,6 +177,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_group: Any,
         cp_group: Any,
         sequence_parallel: bool,
+        disable_split_k: bool,
     ) -> Tensor:
         tp_dist = _require_parallel_group(tp_group, "tensor")
         _require_parallel_group(cp_group, "context")
@@ -182,10 +204,16 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             rmsnorm_output_2d = _all_gather_tokens(rmsnorm_output_2d, tp_collective)
 
         # The model stores projection weights as [out, in]; GEMM consumes [K, N].
-        gate = _C.det_gemm_fwd(rmsnorm_output_2d, gate_weight.t().contiguous())
-        up = _C.det_gemm_fwd(rmsnorm_output_2d, up_weight.t().contiguous())
+        gate = _gemm_fwd(
+            rmsnorm_output_2d, gate_weight.t().contiguous(), disable_split_k=disable_split_k
+        )
+        up = _gemm_fwd(
+            rmsnorm_output_2d, up_weight.t().contiguous(), disable_split_k=disable_split_k
+        )
         activated = _C.swiglu_forward(gate, up)
-        output = _C.det_gemm_fwd(activated, down_weight.t().contiguous())
+        output = _gemm_fwd(
+            activated, down_weight.t().contiguous(), disable_split_k=disable_split_k
+        )
 
         if sequence_parallel:
             output = _reduce_scatter_tokens(output, tp_collective)
@@ -205,6 +233,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         ctx.tp_collective = tp_collective
         ctx.cp_collective = cp_collective
         ctx.sequence_parallel = sequence_parallel
+        ctx.disable_split_k = disable_split_k
         return output.reshape(*input_shape[:-1], output.size(-1))
 
     @staticmethod
@@ -220,6 +249,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
         tp_collective = ctx.tp_collective
         cp_collective = ctx.cp_collective
+        disable_split_k = ctx.disable_split_k
         grad_output = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
         if ctx.sequence_parallel:
             grad_output = _all_gather_tokens(grad_output, tp_collective)
@@ -230,26 +260,42 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         if cp_collective is not None:
             activated_full = _all_gather_tokens(activated, cp_collective)
             grad_output_full = _all_gather_tokens(grad_output, cp_collective)
-            grad_down_weight = _C.det_gemm_db(activated_full, grad_output_full).t().contiguous()
+            grad_down_weight = _gemm_db(
+                activated_full, grad_output_full, disable_split_k=disable_split_k
+            ).t().contiguous()
         else:
-            grad_down_weight = _C.det_gemm_db(activated, grad_output).t().contiguous()
+            grad_down_weight = _gemm_db(
+                activated, grad_output, disable_split_k=disable_split_k
+            ).t().contiguous()
 
         # Down input-gradient shards concatenate across TP; no TP reduction.
-        grad_activated = _C.det_gemm_fwd(grad_output, down_weight)
+        grad_activated = _gemm_fwd(
+            grad_output, down_weight, disable_split_k=disable_split_k
+        )
         grad_gate, grad_up = _C.swiglu_backward(grad_activated, gate, up)
 
         if cp_collective is not None:
             rmsnorm_full = _all_gather_tokens(rmsnorm_output, cp_collective)
             grad_gate_full = _all_gather_tokens(grad_gate, cp_collective)
             grad_up_full = _all_gather_tokens(grad_up, cp_collective)
-            grad_gate_weight = _C.det_gemm_db(rmsnorm_full, grad_gate_full).t().contiguous()
-            grad_up_weight = _C.det_gemm_db(rmsnorm_full, grad_up_full).t().contiguous()
+            grad_gate_weight = _gemm_db(
+                rmsnorm_full, grad_gate_full, disable_split_k=disable_split_k
+            ).t().contiguous()
+            grad_up_weight = _gemm_db(
+                rmsnorm_full, grad_up_full, disable_split_k=disable_split_k
+            ).t().contiguous()
         else:
-            grad_gate_weight = _C.det_gemm_db(rmsnorm_output, grad_gate).t().contiguous()
-            grad_up_weight = _C.det_gemm_db(rmsnorm_output, grad_up).t().contiguous()
+            grad_gate_weight = _gemm_db(
+                rmsnorm_output, grad_gate, disable_split_k=disable_split_k
+            ).t().contiguous()
+            grad_up_weight = _gemm_db(
+                rmsnorm_output, grad_up, disable_split_k=disable_split_k
+            ).t().contiguous()
 
         # Gate/Up input gradients reduce across TP, then add locally.
-        grad_rmsnorm_from_gate = _C.det_gemm_fwd(grad_gate, gate_weight)
+        grad_rmsnorm_from_gate = _gemm_fwd(
+            grad_gate, gate_weight, disable_split_k=disable_split_k
+        )
         if ctx.sequence_parallel:
             grad_rmsnorm_from_gate = _reduce_scatter_tokens(
                 grad_rmsnorm_from_gate,
@@ -261,7 +307,9 @@ class _DeterministicFFNFunction(torch.autograd.Function):
                 tp_collective,
             )
 
-        grad_rmsnorm_from_up = _C.det_gemm_fwd(grad_up, up_weight)
+        grad_rmsnorm_from_up = _gemm_fwd(
+            grad_up, up_weight, disable_split_k=disable_split_k
+        )
         if ctx.sequence_parallel:
             grad_rmsnorm_from_up = _reduce_scatter_tokens(
                 grad_rmsnorm_from_up,
@@ -282,6 +330,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -294,6 +343,7 @@ def qwen3_ffn(
     tp_group: Any = None,
     cp_group: Any = None,
     sequence_parallel: bool = False,
+    disable_split_k: bool = True,
 ) -> Tensor:
     """Apply a bias-free SiLU-gated FFN with deterministic backward kernels.
 
@@ -316,14 +366,19 @@ def qwen3_ffn(
             are sharded on the flattened token dimension across ``tp_group``.
             Token gather/scatter use the deterministic AllGather and
             ReduceScatter.
+        disable_split_k: If True (default), GEMM uses the deterministic
+            ``det_gemm`` kernels with no split-K. If False, GEMM uses
+            ``torch.matmul`` (cuBLASLt / CUTLASS), which may enable split-K.
 
     Returns:
         FFN output with shape ``[..., H]``.
     """
-    _validate_ffn_inputs(rmsnorm_output, gate_weight, up_weight, down_weight)
-    _require_ffn_kernels()
     if not isinstance(sequence_parallel, bool):
         raise TypeError("sequence_parallel must be a bool.")
+    if not isinstance(disable_split_k, bool):
+        raise TypeError("disable_split_k must be a bool.")
+    _validate_ffn_inputs(rmsnorm_output, gate_weight, up_weight, down_weight)
+    _require_ffn_kernels(disable_split_k=disable_split_k)
     return _DeterministicFFNFunction.apply(
         rmsnorm_output,
         gate_weight,
@@ -332,4 +387,5 @@ def qwen3_ffn(
         tp_group,
         cp_group,
         sequence_parallel,
+        disable_split_k,
     )

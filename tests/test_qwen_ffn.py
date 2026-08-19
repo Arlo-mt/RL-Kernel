@@ -849,6 +849,57 @@ def test_qwen_ffn_backward_matches_autograd_reference(monkeypatch):
     assert stub.calls.count("swiglu_backward") == 1
 
 
+def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
+    stub = _TorchKernelStub()
+    monkeypatch.setattr(ffn_module, "_C", stub)
+    monkeypatch.setattr(ffn_module, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(ffn_module, "_validate_ffn_inputs", lambda *args: None)
+
+    hidden = _randn((2, 3, 8), seed=0)
+    gate_weight = _randn((12, 8), seed=1)
+    up_weight = _randn((12, 8), seed=2)
+    down_weight = _randn((8, 12), seed=3)
+    grad_output = _randn(hidden.shape, seed=4)
+
+    ref_inputs = [
+        value.detach().clone().requires_grad_(True)
+        for value in (hidden, gate_weight, up_weight, down_weight)
+    ]
+    expected, _, _, _ = _reference(*ref_inputs)
+    expected.backward(grad_output)
+
+    actual_inputs = [
+        value.detach().clone().requires_grad_(True)
+        for value in (hidden, gate_weight, up_weight, down_weight)
+    ]
+    actual = qwen3_ffn(*actual_inputs, disable_split_k=False)
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected.detach())
+    for actual_input, reference in zip(actual_inputs, ref_inputs, strict=True):
+        torch.testing.assert_close(actual_input.grad, reference.grad)
+
+    assert stub.calls.count("det_gemm_fwd") == 0
+    assert stub.calls.count("det_gemm_db") == 0
+    assert stub.calls.count("swiglu_forward") == 1
+    assert stub.calls.count("swiglu_backward") == 1
+
+
+def test_qwen_ffn_rejects_non_bool_disable_split_k():
+    hidden = torch.empty((2, 8), dtype=torch.bfloat16)
+    gate_weight = torch.empty((12, 8), dtype=torch.bfloat16)
+    up_weight = torch.empty((12, 8), dtype=torch.bfloat16)
+    down_weight = torch.empty((8, 12), dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="disable_split_k must be a bool"):
+        qwen3_ffn(
+            hidden,
+            gate_weight,
+            up_weight,
+            down_weight,
+            disable_split_k=1,  # type: ignore[arg-type]
+        )
+
+
 def test_qwen_ffn_rejects_non_huggingface_weight_layout():
     hidden = torch.empty((2, 8), dtype=torch.bfloat16)
     gate_weight = torch.empty((8, 12), dtype=torch.bfloat16)
@@ -860,7 +911,8 @@ def test_qwen_ffn_rejects_non_huggingface_weight_layout():
 
 
 @requires_cuda_ffn
-def test_qwen_ffn_cuda_forward_backward_matches_fp32_reference():
+@pytest.mark.parametrize("disable_split_k", [True, False])
+def test_qwen_ffn_cuda_forward_backward_matches_fp32_reference(disable_split_k):
     hidden = _randn((2, 3, 64), seed=10, device="cuda", dtype=torch.bfloat16)
     gate_weight = _randn((128, 64), seed=11, device="cuda", dtype=torch.bfloat16)
     up_weight = _randn((128, 64), seed=12, device="cuda", dtype=torch.bfloat16)
@@ -878,7 +930,7 @@ def test_qwen_ffn_cuda_forward_backward_matches_fp32_reference():
         value.detach().clone().requires_grad_(True)
         for value in (hidden, gate_weight, up_weight, down_weight)
     ]
-    actual = qwen3_ffn(*actual_inputs)
+    actual = qwen3_ffn(*actual_inputs, disable_split_k=disable_split_k)
     actual.backward(grad_output)
 
     torch.testing.assert_close(
