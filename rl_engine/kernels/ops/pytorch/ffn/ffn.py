@@ -20,6 +20,8 @@ _REQUIRED_SYMBOLS = (
     "swiglu_forward",
     "swiglu_backward",
 )
+_COLLECTIVE_MIN_CAPACITY_BYTES = 64 * 1024 * 1024
+_COLLECTIVES: dict[tuple[int, int, int, int], Any] = {}
 
 
 def _require_ffn_kernels() -> None:
@@ -99,43 +101,48 @@ def _validate_ffn_inputs(
             )
 
 
-def _all_gather_tokens(tensor: Tensor, dist, group: Any) -> Tensor:
+def _collective_for_group(group: Any, *, min_size_bytes: int):
+    if group is None:
+        return None
+
+    from rl_engine.distributed import DeterministicCollective
+
+    import torch.distributed as dist
+
+    rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
-    output = torch.empty(
-        (world_size * tensor.size(0), *tensor.shape[1:]),
-        device=tensor.device,
-        dtype=tensor.dtype,
+    device_index = torch.cuda.current_device()
+    key = (id(group), rank, world_size, device_index)
+    cached = _COLLECTIVES.get(key)
+    if cached is not None and cached.max_size_bytes >= min_size_bytes:
+        return cached
+    if cached is not None:
+        cached.close()
+
+    collective = DeterministicCollective(
+        group=group,
+        max_size_bytes=max(_COLLECTIVE_MIN_CAPACITY_BYTES, min_size_bytes),
     )
-    # TODO: NCCL AllGather can expose cross-configuration mismatch. Replace it
-    # with the custom deterministic AllGather and compare both paths.
-    dist.all_gather_into_tensor(output, tensor.contiguous(), group=group)
-    return output
+    _COLLECTIVES[key] = collective
+    return collective
 
 
-def _reduce_scatter_tokens(tensor: Tensor, dist, group: Any) -> Tensor:
-    world_size = dist.get_world_size(group=group)
+def _all_gather_tokens(tensor: Tensor, collective: Any) -> Tensor:
+    return collective.all_gather(tensor.contiguous())
+
+
+def _reduce_scatter_tokens(tensor: Tensor, collective: Any) -> Tensor:
+    world_size = collective.world_size
     if tensor.size(0) % world_size != 0:
         raise ValueError(
             "the gathered token count must be divisible by the tensor-parallel "
             f"world size, got {tensor.size(0)} and {world_size}."
         )
+    return collective.reduce_scatter(tensor.contiguous())
 
-    local_tokens = tensor.size(0) // world_size
-    output = torch.empty(
-        (local_tokens, *tensor.shape[1:]),
-        device=tensor.device,
-        dtype=tensor.dtype,
-    )
-    # TODO: NCCL ReduceScatter can change the reduction order and cause
-    # mismatch. Replace it with the custom deterministic ReduceScatter and
-    # compare both paths.
-    dist.reduce_scatter_tensor(
-        output,
-        tensor.contiguous(),
-        op=dist.ReduceOp.SUM,
-        group=group,
-    )
-    return output
+
+def _all_reduce_inplace(tensor: Tensor, collective: Any) -> Tensor:
+    return collective.all_reduce(tensor, out=tensor)
 
 
 class _DeterministicFFNFunction(torch.autograd.Function):
@@ -154,13 +161,25 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         _require_parallel_group(cp_group, "context")
         if sequence_parallel and tp_dist is None:
             raise ValueError("sequence_parallel requires a tensor-parallel group.")
-        if sequence_parallel and str(tp_dist.get_backend(tp_group)) != "nccl":
-            raise RuntimeError("sequence-parallel FFN currently requires an NCCL process group.")
 
         input_shape = rmsnorm_output.shape
         rmsnorm_output_2d = rmsnorm_output.reshape(-1, input_shape[-1]).contiguous()
+        tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
+        gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
+        element_size = rmsnorm_output_2d.element_size()
+        min_size_bytes = max(
+            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
+            gemm_tokens * gate_weight.size(0) * element_size,
+            gate_weight.numel() * element_size,
+            up_weight.numel() * element_size,
+            down_weight.numel() * element_size,
+        )
+        # Create TP before CP so every rank follows the same group order.
+        tp_collective = _collective_for_group(tp_group, min_size_bytes=min_size_bytes)
+        cp_collective = _collective_for_group(cp_group, min_size_bytes=min_size_bytes)
+
         if sequence_parallel:
-            rmsnorm_output_2d = _all_gather_tokens(rmsnorm_output_2d, tp_dist, tp_group)
+            rmsnorm_output_2d = _all_gather_tokens(rmsnorm_output_2d, tp_collective)
 
         # The model stores projection weights as [out, in]; GEMM consumes [K, N].
         gate = _C.det_gemm_fwd(rmsnorm_output_2d, gate_weight.t().contiguous())
@@ -169,11 +188,9 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         output = _C.det_gemm_fwd(activated, down_weight.t().contiguous())
 
         if sequence_parallel:
-            output = _reduce_scatter_tokens(output, tp_dist, tp_group)
-        elif tp_dist is not None:
-            # TODO: CUDA currently uses NCCL. Replace it with the custom
-            # deterministic AllReduce and compare both communication paths.
-            tp_dist.all_reduce(output, op=tp_dist.ReduceOp.SUM, group=tp_group)
+            output = _reduce_scatter_tokens(output, tp_collective)
+        elif tp_collective is not None:
+            output = _all_reduce_inplace(output, tp_collective)
 
         ctx.save_for_backward(
             rmsnorm_output_2d,
@@ -185,8 +202,8 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             down_weight,
         )
         ctx.input_shape = input_shape
-        ctx.tp_group = tp_group
-        ctx.cp_group = cp_group
+        ctx.tp_collective = tp_collective
+        ctx.cp_collective = cp_collective
         ctx.sequence_parallel = sequence_parallel
         return output.reshape(*input_shape[:-1], output.size(-1))
 
@@ -201,73 +218,59 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             up_weight,
             down_weight,
         ) = ctx.saved_tensors
-        tp_dist = _require_parallel_group(ctx.tp_group, "tensor")
-        cp_dist = _require_parallel_group(ctx.cp_group, "context")
+        tp_collective = ctx.tp_collective
+        cp_collective = ctx.cp_collective
         grad_output = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
         if ctx.sequence_parallel:
-            grad_output = _all_gather_tokens(grad_output, tp_dist, ctx.tp_group)
+            grad_output = _all_gather_tokens(grad_output, tp_collective)
 
-        # Down weight gradients use the same coordinates across CP ranks.
-        grad_down_weight = _C.det_gemm_db(activated, grad_output).t().contiguous()
-        if cp_dist is not None:
-            # TODO: CUDA currently uses NCCL. Replace it with the custom
-            # deterministic AllReduce and compare both communication paths.
-            cp_dist.all_reduce(
-                grad_down_weight,
-                op=cp_dist.ReduceOp.SUM,
-                group=ctx.cp_group,
-            )
+        # Down weight gradients must see every CP token so gemm_db's K-tree
+        # matches CP=1. Local dW + AllReduce is a different parenthesization
+        # whenever T is not a complete mid-split tree of 32-wide leaves.
+        if cp_collective is not None:
+            activated_full = _all_gather_tokens(activated, cp_collective)
+            grad_output_full = _all_gather_tokens(grad_output, cp_collective)
+            grad_down_weight = _C.det_gemm_db(activated_full, grad_output_full).t().contiguous()
+        else:
+            grad_down_weight = _C.det_gemm_db(activated, grad_output).t().contiguous()
 
         # Down input-gradient shards concatenate across TP; no TP reduction.
         grad_activated = _C.det_gemm_fwd(grad_output, down_weight)
         grad_gate, grad_up = _C.swiglu_backward(grad_activated, gate, up)
 
-        # Gate/Up weight-gradient shards concatenate across TP and reduce across CP.
-        grad_gate_weight = _C.det_gemm_db(rmsnorm_output, grad_gate).t().contiguous()
-        if cp_dist is not None:
-            cp_dist.all_reduce(
-                grad_gate_weight,
-                op=cp_dist.ReduceOp.SUM,
-                group=ctx.cp_group,
-            )
-
-        grad_up_weight = _C.det_gemm_db(rmsnorm_output, grad_up).t().contiguous()
-        if cp_dist is not None:
-            cp_dist.all_reduce(
-                grad_up_weight,
-                op=cp_dist.ReduceOp.SUM,
-                group=ctx.cp_group,
-            )
+        if cp_collective is not None:
+            rmsnorm_full = _all_gather_tokens(rmsnorm_output, cp_collective)
+            grad_gate_full = _all_gather_tokens(grad_gate, cp_collective)
+            grad_up_full = _all_gather_tokens(grad_up, cp_collective)
+            grad_gate_weight = _C.det_gemm_db(rmsnorm_full, grad_gate_full).t().contiguous()
+            grad_up_weight = _C.det_gemm_db(rmsnorm_full, grad_up_full).t().contiguous()
+        else:
+            grad_gate_weight = _C.det_gemm_db(rmsnorm_output, grad_gate).t().contiguous()
+            grad_up_weight = _C.det_gemm_db(rmsnorm_output, grad_up).t().contiguous()
 
         # Gate/Up input gradients reduce across TP, then add locally.
         grad_rmsnorm_from_gate = _C.det_gemm_fwd(grad_gate, gate_weight)
         if ctx.sequence_parallel:
             grad_rmsnorm_from_gate = _reduce_scatter_tokens(
                 grad_rmsnorm_from_gate,
-                tp_dist,
-                ctx.tp_group,
+                tp_collective,
             )
-        elif tp_dist is not None:
-            # TODO: CUDA currently uses NCCL. Replace it with the custom
-            # deterministic AllReduce and compare both communication paths.
-            tp_dist.all_reduce(
+        elif tp_collective is not None:
+            grad_rmsnorm_from_gate = _all_reduce_inplace(
                 grad_rmsnorm_from_gate,
-                op=tp_dist.ReduceOp.SUM,
-                group=ctx.tp_group,
+                tp_collective,
             )
 
         grad_rmsnorm_from_up = _C.det_gemm_fwd(grad_up, up_weight)
         if ctx.sequence_parallel:
             grad_rmsnorm_from_up = _reduce_scatter_tokens(
                 grad_rmsnorm_from_up,
-                tp_dist,
-                ctx.tp_group,
+                tp_collective,
             )
-        elif tp_dist is not None:
-            tp_dist.all_reduce(
+        elif tp_collective is not None:
+            grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
-                op=tp_dist.ReduceOp.SUM,
-                group=ctx.tp_group,
+                tp_collective,
             )
 
         grad_rmsnorm_output = grad_rmsnorm_from_gate.add_(grad_rmsnorm_from_up)
@@ -303,11 +306,16 @@ def qwen3_ffn(
         down_weight: Down projection weight in ``[out, in]`` layout, shape
             ``[H, I_local]``.
         tp_group: Optional tensor-parallel process group. Gate and Up are
-            column-parallel; Down is row-parallel.
+            column-parallel; Down is row-parallel. Reductions use the
+            deterministic fixed-tree collectives rather than NCCL.
         cp_group: Optional context-parallel process group. Each rank owns
-            different token rows and the same local weight shards.
+            different token rows and the same local weight shards. Weight
+            gradients AllGather tokens along CP and run the full-token
+            ``det_gemm_db`` so they match CP=1 bitwise.
         sequence_parallel: Whether ``rmsnorm_output`` and the returned output
             are sharded on the flattened token dimension across ``tp_group``.
+            Token gather/scatter use the deterministic AllGather and
+            ReduceScatter.
 
     Returns:
         FFN output with shape ``[..., H]``.
