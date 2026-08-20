@@ -143,7 +143,10 @@ def validate_attention_debug_matrix() -> None:
 
     axis_by_id = {axis.axis_id: axis for axis in ATTENTION_DEBUG_AXES}
     for row in diagnostic_rows:
-        axis = axis_by_id[row.root_cause_axis]
+        axis_id = row.root_cause_axis
+        if axis_id is None:
+            raise RuntimeError(f"diagnostic row {row.row_id} must name a root-cause axis")
+        axis = axis_by_id[axis_id]
         if row.probe != axis.representative_subprobe:
             raise RuntimeError(
                 f"matrix row {row.row_id} is not the representative probe for {axis.axis_id}"
