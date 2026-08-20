@@ -291,12 +291,8 @@ class H100AttentionPreprocessor:
                 )
                 if norm_matches and native_rope is None:
                     return AttentionPreprocessResult(
-                        q=_apply_deterministic_rope(
-                            self.rope, q_norm_native, positions, theta
-                        ),
-                        k=_apply_deterministic_rope(
-                            self.rope, k_norm_native, positions, theta
-                        ),
+                        q=_apply_deterministic_rope(self.rope, q_norm_native, positions, theta),
+                        k=_apply_deterministic_rope(self.rope, k_norm_native, positions, theta),
                         backend_ids=MappingProxyType(
                             {
                                 "qk_rmsnorm": self.native_qk_norm_backend_id,

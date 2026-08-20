@@ -8,8 +8,8 @@ import torch
 
 from rl_engine.kernels.attention_preprocess import (
     MANDATED_ATTENTION_PREPROCESS_BACKENDS,
-    H100AttentionPreprocessor,
     TE_ROCM_QK_RMSNORM_BACKEND_ID,
+    H100AttentionPreprocessor,
 )
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp

@@ -29,9 +29,7 @@ def test_attention_debug_taxonomy_is_compact_complete_and_unambiguous():
         "distributed_schedule",
     }
     assert "strict_cp_degree_control" not in {
-        probe
-        for axis in taxonomy["root_cause_axes"].values()
-        for probe in axis["subprobes"]
+        probe for axis in taxonomy["root_cause_axes"].values() for probe in axis["subprobes"]
     }
 
 

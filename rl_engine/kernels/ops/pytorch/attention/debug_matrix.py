@@ -43,9 +43,7 @@ class AttentionDebugMatrixRow:
             "comparability_gate",
             "invariant_control",
         }:
-            raise ValueError(
-                f"unknown Attention debug matrix category {self.category!r}"
-            )
+            raise ValueError(f"unknown Attention debug matrix category {self.category!r}")
         if self.category == "baseline":
             if self.probe is not None or self.root_cause_axis is not None:
                 raise ValueError("baseline rows cannot name a probe or root-cause axis")
@@ -121,9 +119,7 @@ def validate_attention_debug_matrix() -> None:
         raise RuntimeError("Attention debug matrix row IDs must be unique")
     baselines = [row for row in ATTENTION_DEBUG_MATRIX if row.category == "baseline"]
     if len(baselines) != 1 or baselines[0].row_id != "A0":
-        raise RuntimeError(
-            "Attention debug matrix must contain exactly one A0 baseline"
-        )
+        raise RuntimeError("Attention debug matrix must contain exactly one A0 baseline")
 
     axis_ids = {axis.axis_id for axis in ATTENTION_DEBUG_AXES}
     diagnostic_rows = [
@@ -139,9 +135,7 @@ def validate_attention_debug_matrix() -> None:
     if [row.root_cause_axis for row in gates] != ["topology_head_ownership"]:
         raise RuntimeError("only topology/head ownership is a comparability gate")
 
-    controls = [
-        row for row in ATTENTION_DEBUG_MATRIX if row.category == "invariant_control"
-    ]
+    controls = [row for row in ATTENTION_DEBUG_MATRIX if row.category == "invariant_control"]
     if {row.probe for row in controls} != set(ATTENTION_INVARIANT_CONTROLS):
         raise RuntimeError("invariant-control coverage is incomplete")
     if any(row.expected != "exact_zero" for row in controls):
@@ -200,9 +194,7 @@ def attention_debug_matrix_row(row_id: str) -> AttentionDebugMatrixRow:
     try:
         return _ROWS_BY_ID[row_id.strip()]
     except KeyError as exc:
-        raise AttentionContractError(
-            f"unknown Attention debug matrix row {row_id!r}"
-        ) from exc
+        raise AttentionContractError(f"unknown Attention debug matrix row {row_id!r}") from exc
 
 
 __all__ = [

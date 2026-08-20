@@ -8,8 +8,8 @@ import torch
 from rl_engine.kernels.attention_projection import (
     O_PROJ_COLLECTIVE_CONTRACT,
     QKV_COLLECTIVE_CONTRACT,
-    AttentionProjectionOp,
     ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
+    AttentionProjectionOp,
     split_qkv,
 )
 

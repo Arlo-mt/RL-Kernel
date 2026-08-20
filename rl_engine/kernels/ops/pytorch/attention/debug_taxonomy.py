@@ -33,9 +33,7 @@ class AttentionDebugAxisSpec:
         ):
             raise ValueError("Attention debug subprobes must be non-empty strings")
         if len(set(self.subprobes)) != len(self.subprobes):
-            raise ValueError(
-                f"Attention debug axis {self.axis_id!r} has duplicate subprobes"
-            )
+            raise ValueError(f"Attention debug axis {self.axis_id!r} has duplicate subprobes")
         if self.representative_subprobe not in self.subprobes:
             raise ValueError(
                 f"Attention debug representative {self.representative_subprobe!r} "
@@ -118,9 +116,7 @@ _ATTENTION_DEBUG_AXIS_BY_PROBE = MappingProxyType(
 )
 if len(_ATTENTION_DEBUG_AXIS_BY_ID) != len(ATTENTION_DEBUG_AXES):
     raise RuntimeError("Attention debug axis IDs must be unique")
-if len(_ATTENTION_DEBUG_AXIS_BY_PROBE) != sum(
-    len(axis.subprobes) for axis in ATTENTION_DEBUG_AXES
-):
+if len(_ATTENTION_DEBUG_AXIS_BY_PROBE) != sum(len(axis.subprobes) for axis in ATTENTION_DEBUG_AXES):
     raise RuntimeError("Attention debug subprobes must belong to one root-cause axis")
 if set(_ATTENTION_DEBUG_AXIS_BY_PROBE) & set(ATTENTION_INVARIANT_CONTROLS):
     raise RuntimeError("Attention debug subprobes cannot also be invariant controls")

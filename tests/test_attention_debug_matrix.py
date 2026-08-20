@@ -58,16 +58,12 @@ def test_attention_debug_matrix_rows_have_stable_semantics():
     assert control.probe == "tp_partition_control"
     assert control.expected == "exact_zero"
 
-    with pytest.raises(
-        AttentionContractError, match="unknown Attention debug matrix row"
-    ):
+    with pytest.raises(AttentionContractError, match="unknown Attention debug matrix row"):
         attention_debug_matrix_row("A8")
 
 
 def test_matrix_manifest_matches_taxonomy_representatives():
-    from rl_engine.kernels.ops.pytorch.attention.debug_taxonomy import (
-        ATTENTION_DEBUG_AXES,
-    )
+    from rl_engine.kernels.ops.pytorch.attention.debug_taxonomy import ATTENTION_DEBUG_AXES
 
     root_rows = [
         row

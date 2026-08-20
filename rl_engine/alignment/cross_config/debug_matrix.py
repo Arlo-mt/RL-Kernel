@@ -20,7 +20,6 @@ from rl_engine.kernels.ops.pytorch.attention.debug_matrix import (
 )
 from rl_engine.kernels.ops.pytorch.attention.debug_taxonomy import ATTENTION_DEBUG_AXES
 
-
 DEBUG_MATRIX_SCHEMA_VERSION = "rlkernel.debug_matrix.v1"
 
 
@@ -65,70 +64,64 @@ def _attention_axes() -> tuple[ModuleDebugAxis, ...]:
     )
 
 
-MODULE_DEBUG_AXES: MappingProxyType[str, tuple[ModuleDebugAxis, ...]] = (
-    MappingProxyType(
-        {
-            "attention": _attention_axes(),
-            "ffn": (
-                ModuleDebugAxis(
-                    "ffn",
-                    "weight_shard_ownership",
-                    "Weight shard / TP ownership",
-                    "tp_weight_ownership",
-                    "gate",
-                ),
-                ModuleDebugAxis(
-                    "ffn",
-                    "swiglu_rounding",
-                    "SwiGLU intermediate rounding",
-                    "swiglu_one_round",
-                ),
-                ModuleDebugAxis(
-                    "ffn",
-                    "gemm_reduction",
-                    "GEMM K-reduction / Split-K policy",
-                    "k_reduction_split_k",
-                ),
-                ModuleDebugAxis(
-                    "ffn",
-                    "token_collective",
-                    "Token gather / reduce-scatter",
-                    "sequence_parallel",
-                ),
+MODULE_DEBUG_AXES: MappingProxyType[str, tuple[ModuleDebugAxis, ...]] = MappingProxyType(
+    {
+        "attention": _attention_axes(),
+        "ffn": (
+            ModuleDebugAxis(
+                "ffn",
+                "weight_shard_ownership",
+                "Weight shard / TP ownership",
+                "tp_weight_ownership",
+                "gate",
             ),
-            "logp": (
-                ModuleDebugAxis(
-                    "logp",
-                    "vocab_shard_ownership",
-                    "Vocabulary shard / TP ownership",
-                    "vocab_shard_bounds",
-                    "gate",
-                ),
-                ModuleDebugAxis(
-                    "logp",
-                    "selected_token_identity",
-                    "Selected-token and active-mask identity",
-                    "selected_token_active_mask",
-                    "gate",
-                ),
-                ModuleDebugAxis(
-                    "logp",
-                    "vocab_lse_reduction",
-                    "Vocabulary LSE tile / merge policy",
-                    "vocab_tile_merge",
-                ),
+            ModuleDebugAxis(
+                "ffn",
+                "swiglu_rounding",
+                "SwiGLU intermediate rounding",
+                "swiglu_one_round",
             ),
-        }
-    )
+            ModuleDebugAxis(
+                "ffn",
+                "gemm_reduction",
+                "GEMM K-reduction / Split-K policy",
+                "k_reduction_split_k",
+            ),
+            ModuleDebugAxis(
+                "ffn",
+                "token_collective",
+                "Token gather / reduce-scatter",
+                "sequence_parallel",
+            ),
+        ),
+        "logp": (
+            ModuleDebugAxis(
+                "logp",
+                "vocab_shard_ownership",
+                "Vocabulary shard / TP ownership",
+                "vocab_shard_bounds",
+                "gate",
+            ),
+            ModuleDebugAxis(
+                "logp",
+                "selected_token_identity",
+                "Selected-token and active-mask identity",
+                "selected_token_active_mask",
+                "gate",
+            ),
+            ModuleDebugAxis(
+                "logp",
+                "vocab_lse_reduction",
+                "Vocabulary LSE tile / merge policy",
+                "vocab_tile_merge",
+            ),
+        ),
+    }
 )
 
 
 _MODULE_DEBUG_AXIS_BY_ID = MappingProxyType(
-    {
-        (axis.module, axis.axis_id): axis
-        for axes in MODULE_DEBUG_AXES.values()
-        for axis in axes
-    }
+    {(axis.module, axis.axis_id): axis for axes in MODULE_DEBUG_AXES.values() for axis in axes}
 )
 
 
@@ -140,16 +133,12 @@ def _module_rows(module: str) -> dict[str, Any]:
         "ffn": ["FC0"],
         "logp": ["LC0"],
     }[module]
-    rows = [baseline] + [
-        f"{module[0].upper()}{index}" for index in range(1, len(axes) + 1)
-    ]
+    rows = [baseline] + [f"{module[0].upper()}{index}" for index in range(1, len(axes) + 1)]
     return {
         "baseline_row": baseline,
         "rows": rows,
         "invariant_controls": controls,
-        "axes": [
-            axis.to_dict(row_id=rows[index]) for index, axis in enumerate(axes, start=1)
-        ],
+        "axes": [axis.to_dict(row_id=rows[index]) for index, axis in enumerate(axes, start=1)],
     }
 
 
