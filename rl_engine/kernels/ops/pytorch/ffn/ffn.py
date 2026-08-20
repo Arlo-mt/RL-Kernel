@@ -126,9 +126,9 @@ def _collective_for_group(group: Any, *, min_size_bytes: int):
     if group is None:
         return None
 
-    from rl_engine.distributed import DeterministicCollective
-
     import torch.distributed as dist
+
+    from rl_engine.distributed import DeterministicCollective
 
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -211,9 +211,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             rmsnorm_output_2d, up_weight.t().contiguous(), disable_split_k=disable_split_k
         )
         activated = _C.swiglu_forward(gate, up)
-        output = _gemm_fwd(
-            activated, down_weight.t().contiguous(), disable_split_k=disable_split_k
-        )
+        output = _gemm_fwd(activated, down_weight.t().contiguous(), disable_split_k=disable_split_k)
 
         if sequence_parallel:
             output = _reduce_scatter_tokens(output, tp_collective)
@@ -260,42 +258,46 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         if cp_collective is not None:
             activated_full = _all_gather_tokens(activated, cp_collective)
             grad_output_full = _all_gather_tokens(grad_output, cp_collective)
-            grad_down_weight = _gemm_db(
-                activated_full, grad_output_full, disable_split_k=disable_split_k
-            ).t().contiguous()
+            grad_down_weight = (
+                _gemm_db(activated_full, grad_output_full, disable_split_k=disable_split_k)
+                .t()
+                .contiguous()
+            )
         else:
-            grad_down_weight = _gemm_db(
-                activated, grad_output, disable_split_k=disable_split_k
-            ).t().contiguous()
+            grad_down_weight = (
+                _gemm_db(activated, grad_output, disable_split_k=disable_split_k).t().contiguous()
+            )
 
         # Down input-gradient shards concatenate across TP; no TP reduction.
-        grad_activated = _gemm_fwd(
-            grad_output, down_weight, disable_split_k=disable_split_k
-        )
+        grad_activated = _gemm_fwd(grad_output, down_weight, disable_split_k=disable_split_k)
         grad_gate, grad_up = _C.swiglu_backward(grad_activated, gate, up)
 
         if cp_collective is not None:
             rmsnorm_full = _all_gather_tokens(rmsnorm_output, cp_collective)
             grad_gate_full = _all_gather_tokens(grad_gate, cp_collective)
             grad_up_full = _all_gather_tokens(grad_up, cp_collective)
-            grad_gate_weight = _gemm_db(
-                rmsnorm_full, grad_gate_full, disable_split_k=disable_split_k
-            ).t().contiguous()
-            grad_up_weight = _gemm_db(
-                rmsnorm_full, grad_up_full, disable_split_k=disable_split_k
-            ).t().contiguous()
+            grad_gate_weight = (
+                _gemm_db(rmsnorm_full, grad_gate_full, disable_split_k=disable_split_k)
+                .t()
+                .contiguous()
+            )
+            grad_up_weight = (
+                _gemm_db(rmsnorm_full, grad_up_full, disable_split_k=disable_split_k)
+                .t()
+                .contiguous()
+            )
         else:
-            grad_gate_weight = _gemm_db(
-                rmsnorm_output, grad_gate, disable_split_k=disable_split_k
-            ).t().contiguous()
-            grad_up_weight = _gemm_db(
-                rmsnorm_output, grad_up, disable_split_k=disable_split_k
-            ).t().contiguous()
+            grad_gate_weight = (
+                _gemm_db(rmsnorm_output, grad_gate, disable_split_k=disable_split_k)
+                .t()
+                .contiguous()
+            )
+            grad_up_weight = (
+                _gemm_db(rmsnorm_output, grad_up, disable_split_k=disable_split_k).t().contiguous()
+            )
 
         # Gate/Up input gradients reduce across TP, then add locally.
-        grad_rmsnorm_from_gate = _gemm_fwd(
-            grad_gate, gate_weight, disable_split_k=disable_split_k
-        )
+        grad_rmsnorm_from_gate = _gemm_fwd(grad_gate, gate_weight, disable_split_k=disable_split_k)
         if ctx.sequence_parallel:
             grad_rmsnorm_from_gate = _reduce_scatter_tokens(
                 grad_rmsnorm_from_gate,
@@ -307,9 +309,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
                 tp_collective,
             )
 
-        grad_rmsnorm_from_up = _gemm_fwd(
-            grad_up, up_weight, disable_split_k=disable_split_k
-        )
+        grad_rmsnorm_from_up = _gemm_fwd(grad_up, up_weight, disable_split_k=disable_split_k)
         if ctx.sequence_parallel:
             grad_rmsnorm_from_up = _reduce_scatter_tokens(
                 grad_rmsnorm_from_up,

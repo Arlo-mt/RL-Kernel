@@ -41,29 +41,20 @@ _TOKEN_BOUNDARY_COUNTS = (8, 31, 32, 33, 64, 96, 128)
 _WORLD2_CONFIGS = (
     ("tp2_sp", 2, 1, True, _TOPOLOGY_TOKENS),
     ("cp2", 1, 2, False, _TOPOLOGY_TOKENS),
-    *(
-        (f"cp2_T{token_count}", 1, 2, False, token_count)
-        for token_count in _CP_TOKEN_COUNTS
-    ),
+    *((f"cp2_T{token_count}", 1, 2, False, token_count) for token_count in _CP_TOKEN_COUNTS),
 )
 _WORLD4_CONFIGS = (
     ("tp4", 4, 1, False, _TOPOLOGY_TOKENS),
     ("cp4", 1, 4, False, _TOPOLOGY_TOKENS),
     ("tp2_cp2", 2, 2, False, _TOPOLOGY_TOKENS),
     ("tp2_cp2_sp", 2, 2, True, _TOPOLOGY_TOKENS),
-    *(
-        (f"cp4_T{token_count}", 1, 4, False, token_count)
-        for token_count in _CP_TOKEN_COUNTS
-    ),
+    *((f"cp4_T{token_count}", 1, 4, False, token_count) for token_count in _CP_TOKEN_COUNTS),
 )
 _WORLD8_WORLD_GROUP_CONFIGS = (
     ("tp8", 8, 1, False, _TOPOLOGY_TOKENS),
     ("tp8_sp", 8, 1, True, _TOPOLOGY_TOKENS),
     ("cp8", 1, 8, False, _TOPOLOGY_TOKENS),
-    *(
-        (f"cp8_T{token_count}", 1, 8, False, token_count)
-        for token_count in _CP_TOKEN_COUNTS
-    ),
+    *((f"cp8_T{token_count}", 1, 8, False, token_count) for token_count in _CP_TOKEN_COUNTS),
 )
 _WORLD8_TP2_CP4_CONFIGS = (("tp2_cp4", 2, 4, False, _TOPOLOGY_TOKENS),)
 _WORLD8_TP4_CP2_CONFIGS = (
@@ -166,9 +157,7 @@ def _shard_ranges(
 
 def _spawn_nccl_workers(worker, world_size: int, worker_args=(), *, timeout: int = 180) -> None:
     if not _has_sm90_ffn_devices(world_size):
-        pytest.skip(
-            f"requires {world_size} SM90 GPUs, NCCL, and the GEMM/SwiGLU extension"
-        )
+        pytest.skip(f"requires {world_size} SM90 GPUs, NCCL, and the GEMM/SwiGLU extension")
 
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -361,9 +350,7 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
         )
         device = torch.device("cuda", rank)
         token_count, hidden_size, intermediate_size = 16, 64, 256
-        hidden = _randn(
-            (token_count, hidden_size), seed=50, device=device, dtype=torch.bfloat16
-        )
+        hidden = _randn((token_count, hidden_size), seed=50, device=device, dtype=torch.bfloat16)
         gate_weight = _randn(
             (intermediate_size, hidden_size), seed=51, device=device, dtype=torch.bfloat16
         )
@@ -415,15 +402,9 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
             assert train_match, f"TP=1 vs TP={world_size} train forward mismatch"
             assert hidden_match, f"TP=1 vs TP={world_size} hidden grad mismatch"
         else:
-            assert not infer_match, (
-                f"TP=1 vs TP={world_size} infer forward unexpectedly matched"
-            )
-            assert not train_match, (
-                f"TP=1 vs TP={world_size} train forward unexpectedly matched"
-            )
-            assert not hidden_match, (
-                f"TP=1 vs TP={world_size} hidden grad unexpectedly matched"
-            )
+            assert not infer_match, f"TP=1 vs TP={world_size} infer forward unexpectedly matched"
+            assert not train_match, f"TP=1 vs TP={world_size} train forward unexpectedly matched"
+            assert not hidden_match, f"TP=1 vs TP={world_size} hidden grad unexpectedly matched"
 
         assert torch.equal(
             tp1_inputs[1].grad[feat_start:feat_end], tpn_inputs[1].grad
@@ -457,9 +438,7 @@ def _make_topology_inputs(token_count, device):
 def _canonical(hidden, gate, up, down, grad):
     with torch.no_grad():
         infer = qwen3_ffn(hidden, gate, up, down)
-    inputs = [
-        value.detach().clone().requires_grad_(True) for value in (hidden, gate, up, down)
-    ]
+    inputs = [value.detach().clone().requires_grad_(True) for value in (hidden, gate, up, down)]
     train = qwen3_ffn(*inputs)
     train.backward(grad)
     return infer, train, inputs
@@ -582,9 +561,7 @@ def _topology_worker(rank, world_size, init_method, result_queue, configs):
             if token_count not in canonical:
                 tensors = _make_topology_inputs(token_count, device)
                 canonical[token_count] = (*tensors, *_canonical(*tensors))
-            hidden, gate, up, down, grad, infer_ref, train_ref, ref_inputs = canonical[
-                token_count
-            ]
+            hidden, gate, up, down, grad, infer_ref, train_ref, ref_inputs = canonical[token_count]
             _run_topology_config(
                 rank,
                 dist,
@@ -638,7 +615,7 @@ def _cache_worker(rank, world_size, init_method, result_queue):
         small = _ffn_tensors(8, device, seed=100, intermediate=128)
         first = qwen3_ffn(*small, tp_group=dist.group.WORLD)
         assert len(ffn_module._COLLECTIVES) == 1
-        (cache_key, first_collective), = ffn_module._COLLECTIVES.items()
+        ((cache_key, first_collective),) = ffn_module._COLLECTIVES.items()
         first_handle = first_collective._handle
         first_capacity = first_collective.max_size_bytes
         assert first_handle != 0
@@ -728,9 +705,7 @@ def _uneven_sp_worker(rank, world_size, init_method, result_queue):
 
 
 def _qwen3_8b_weights(device):
-    hidden = _randn(
-        (8, QWEN3_8B_HIDDEN_SIZE), seed=90, device=device, dtype=torch.bfloat16
-    )
+    hidden = _randn((8, QWEN3_8B_HIDDEN_SIZE), seed=90, device=device, dtype=torch.bfloat16)
     gate = _randn(
         (QWEN3_8B_INTERMEDIATE_SIZE, QWEN3_8B_HIDDEN_SIZE),
         seed=91,
@@ -749,9 +724,7 @@ def _qwen3_8b_weights(device):
         device=device,
         dtype=torch.bfloat16,
     )
-    grad = _randn(
-        (8, QWEN3_8B_HIDDEN_SIZE), seed=94, device=device, dtype=torch.bfloat16
-    )
+    grad = _randn((8, QWEN3_8B_HIDDEN_SIZE), seed=94, device=device, dtype=torch.bfloat16)
     return hidden, gate, up, down, grad
 
 
@@ -771,8 +744,7 @@ def _qwen3_8b_tp2_worker(rank, world_size, init_method, result_queue):
         with torch.no_grad():
             infer_tp1 = qwen3_ffn(hidden, gate, up, down)
         tp1_inputs = [
-            value.detach().clone().requires_grad_(True)
-            for value in (hidden, gate, up, down)
+            value.detach().clone().requires_grad_(True) for value in (hidden, gate, up, down)
         ]
         train_tp1 = qwen3_ffn(*tp1_inputs)
         train_tp1.backward(grad)
