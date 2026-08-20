@@ -1274,6 +1274,8 @@ def test_scenario_uses_megatron_vocabulary_only():
     assert training["tensor_parallel_size"] == 2
     assert training["context_parallel_size"] == 2
     assert config["baseline"]["rollout"]["batch_invariant"] is True
+    assert config["scenario"]["debug_matrix"]["modules"] == ["attention", "ffn", "logp"]
+    assert config["scenario"]["debug_matrix"]["cartesian_product"] is False
 
 
 def test_scenario_knob_paths_all_exist():
