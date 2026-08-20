@@ -27,6 +27,8 @@ ProjectionCallable = Callable[[Tensor, Tensor], Tensor]
 QKV_PROJECTION = "qkv"
 O_PROJ_PROJECTION = "o_proj"
 PROJECTION_POLICY_ID = "ws2.attention.projection.v1"
+CUDA_DETERMINISTIC_PROJECTION_BACKEND_ID = "rlkernel.cuda.det_gemm"
+ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID = "rlkernel.rocm.triton_det_gemm"
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,7 @@ class AttentionProjectionOp:
         native: ProjectionCallable | None = None,
         native_backend_id: str | None = None,
         deterministic: ProjectionCallable | None = None,
+        deterministic_backend_id: str | None = None,
         policy_id: str = PROJECTION_POLICY_ID,
     ) -> None:
         if projection not in {QKV_PROJECTION, O_PROJ_PROJECTION}:
@@ -151,6 +154,11 @@ class AttentionProjectionOp:
         self.native = native
         self.native_backend_id = native_backend_id or f"native.{projection}"
         self.deterministic = deterministic or DetGemmOp()
+        self.deterministic_backend_id = deterministic_backend_id or (
+            ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID
+            if torch.version.hip is not None
+            else CUDA_DETERMINISTIC_PROJECTION_BACKEND_ID
+        )
         self.policy_id = policy_id
         self.collective = (
             QKV_COLLECTIVE_CONTRACT if projection == QKV_PROJECTION else O_PROJ_COLLECTIVE_CONTRACT
@@ -191,7 +199,7 @@ class AttentionProjectionOp:
             deterministic_out,
             ProjectionPlan(
                 projection=self.projection,
-                backend_id="rlkernel.cuda.det_gemm",
+                backend_id=self.deterministic_backend_id,
                 fallback=True,
                 fallback_reason=reason,
                 probe_id=probe_id,
@@ -242,6 +250,7 @@ def _probe_id(x: Tensor, weight: Tensor) -> str:
 
 __all__ = [
     "AttentionProjectionOp",
+    "CUDA_DETERMINISTIC_PROJECTION_BACKEND_ID",
     "O_PROJ_COLLECTIVE_CONTRACT",
     "O_PROJ_PROJECTION",
     "PROJECTION_POLICY_ID",
@@ -250,5 +259,6 @@ __all__ = [
     "ProjectionResult",
     "QKV_COLLECTIVE_CONTRACT",
     "QKV_PROJECTION",
+    "ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID",
     "split_qkv",
 ]

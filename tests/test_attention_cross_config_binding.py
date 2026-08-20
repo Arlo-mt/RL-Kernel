@@ -957,17 +957,23 @@ def test_strict_runtime_readback_accepts_common_deterministic_preprocess_fallbac
     assert result.passed
 
 
-def test_strict_runtime_readback_accepts_distinct_verified_native_preprocess_backends():
+def test_strict_runtime_readback_rejects_distinct_native_preprocess_backends():
     rollout = replace(
         _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
-        preprocess_backends={"qk_rmsnorm": "native.vllm.rmsnorm", "rope": "native.vllm.rope"},
+        preprocess_backends={
+            "qk_rmsnorm": "transformer_engine.rocm.rmsnorm",
+            "rope": "rlkernel.rocm.deterministic_rope",
+        },
         preprocess_probe_id="rollout-probe",
     )
     training = replace(
         _readback(
             MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
         ),
-        preprocess_backends={"qk_rmsnorm": "native.te.rmsnorm", "rope": "native.te.rope"},
+        preprocess_backends={
+            "qk_rmsnorm": "transformer_engine.cuda.rmsnorm",
+            "rope": "rlkernel.cuda.rope_sm90",
+        },
         preprocess_probe_id="training-probe",
     )
 
@@ -980,7 +986,8 @@ def test_strict_runtime_readback_accepts_distinct_verified_native_preprocess_bac
         training_backend_id="megatron.te",
     )
 
-    assert result.passed
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH)
 
 
 @pytest.mark.parametrize(

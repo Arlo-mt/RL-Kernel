@@ -57,13 +57,16 @@ from rl_engine.kernels.attention_contract import (
     validate_split_kv_plan_set_alignment,
 )
 from rl_engine.kernels.attention_preprocess import (
+    ALLOWED_ATTENTION_PREPROCESS_BACKENDS,
     MANDATED_ATTENTION_PREPROCESS_BACKENDS,
     PREPROCESS_POLICY_ID,
 )
 from rl_engine.kernels.attention_projection import (
+    CUDA_DETERMINISTIC_PROJECTION_BACKEND_ID,
     O_PROJ_COLLECTIVE_CONTRACT,
     PROJECTION_POLICY_ID,
     QKV_COLLECTIVE_CONTRACT,
+    ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
 )
 
 __all__ = [
@@ -976,21 +979,20 @@ def bind_attention_runtime_readbacks(
                 message="QK-Norm/RoPE policy IDs differ between runtimes",
             )
         )
-    if rollout.preprocess_fallback and training.preprocess_fallback:
-        for name in MANDATED_ATTENTION_PREPROCESS_BACKENDS:
-            rollout_backend = rollout.preprocess_backends.get(name)
-            training_backend = training.preprocess_backends.get(name)
-            if rollout_backend != training_backend:
-                missing_scope_evidence.append(
-                    BindingIssue(
-                        code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
-                        tier=BindingTier.SEMANTIC,
-                        field=f"preprocess.{name}",
-                        rollout=rollout_backend,
-                        training=training_backend,
-                        message="fallback sides must use the same deterministic preprocess backend",
-                    )
+    for name in MANDATED_ATTENTION_PREPROCESS_BACKENDS:
+        rollout_backend = rollout.preprocess_backends.get(name)
+        training_backend = training.preprocess_backends.get(name)
+        if rollout_backend != training_backend:
+            missing_scope_evidence.append(
+                BindingIssue(
+                    code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
+                    tier=BindingTier.SEMANTIC,
+                    field=f"preprocess.{name}",
+                    rollout=rollout_backend,
+                    training=training_backend,
+                    message="training and rollout must execute the same preprocess backend",
                 )
+            )
     for projection in ("qkv", "o_proj"):
         rollout_plan = rollout.projection_plans.get(projection, {})
         training_plan = training.projection_plans.get(projection, {})
@@ -1009,22 +1011,18 @@ def bind_attention_runtime_readbacks(
                     ),
                 )
             )
-        if rollout_fallback and training_fallback:
-            for field_name in ("backend_id", "policy_id", "split_k", "reduction_order"):
-                if rollout_plan.get(field_name) != training_plan.get(field_name):
-                    missing_scope_evidence.append(
-                        BindingIssue(
-                            code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
-                            tier=BindingTier.SEMANTIC,
-                            field=f"projection.{projection}.{field_name}",
-                            rollout=rollout_plan.get(field_name),
-                            training=training_plan.get(field_name),
-                            message=(
-                                "deterministic projection fallback evidence differs "
-                                "between sides"
-                            ),
-                        )
+        for field_name in ("backend_id", "policy_id", "split_k", "reduction_order"):
+            if rollout_plan.get(field_name) != training_plan.get(field_name):
+                missing_scope_evidence.append(
+                    BindingIssue(
+                        code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,
+                        tier=BindingTier.SEMANTIC,
+                        field=f"projection.{projection}.{field_name}",
+                        rollout=rollout_plan.get(field_name),
+                        training=training_plan.get(field_name),
+                        message="projection execution evidence differs between sides",
                     )
+                )
     return bind_attention_contracts(
         rollout_contract=rollout.contract,
         training_contract=training.contract,
@@ -1256,7 +1254,7 @@ def _attention_preprocess_issues(
                     ),
                 )
             )
-        elif actual != mandated and not actual.startswith("native."):
+        elif actual not in ALLOWED_ATTENTION_PREPROCESS_BACKENDS[name]:
             issues.append(
                 BindingIssue(
                     code=BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH,
@@ -1266,13 +1264,13 @@ def _attention_preprocess_issues(
                     training=actual if side == "training" else None,
                     message=(
                         f"{side} executed {actual!r}; "
-                        f"the H100 experiment requires {mandated!r} or a verified native backend"
+                        f"the experiment requires {mandated!r} or a verified platform backend"
                     ),
                 )
             )
     if readback.preprocess_fallback and any(
-        readback.preprocess_backends.get(name) != mandated
-        for name, mandated in MANDATED_ATTENTION_PREPROCESS_BACKENDS.items()
+        str(readback.preprocess_backends.get(name, "")).startswith("transformer_engine.")
+        for name in MANDATED_ATTENTION_PREPROCESS_BACKENDS
     ):
         issues.append(
             BindingIssue(
@@ -1280,8 +1278,7 @@ def _attention_preprocess_issues(
                 tier=BindingTier.SEMANTIC,
                 field=f"{side}.preprocess.fallback",
                 message=(
-                    f"{side} reported a fallback but did not use the common deterministic "
-                    "QK-Norm/RoPE backends"
+                    f"{side} reported fallback while still claiming a vendor preprocess backend"
                 ),
             )
         )
@@ -1361,7 +1358,11 @@ def _attention_projection_issues(
                 )
             )
         if plan.get("fallback"):
-            if backend_id != "rlkernel.cuda.det_gemm" or not plan.get("fallback_reason"):
+            deterministic_backends = {
+                CUDA_DETERMINISTIC_PROJECTION_BACKEND_ID,
+                ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
+            }
+            if backend_id not in deterministic_backends or not plan.get("fallback_reason"):
                 issues.append(
                     BindingIssue(
                         code=BindingErrorCode.ATTENTION_PROJECTION_MISMATCH,

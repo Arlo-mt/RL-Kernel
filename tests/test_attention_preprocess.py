@@ -9,6 +9,7 @@ import torch
 from rl_engine.kernels.attention_preprocess import (
     MANDATED_ATTENTION_PREPROCESS_BACKENDS,
     H100AttentionPreprocessor,
+    TE_ROCM_QK_RMSNORM_BACKEND_ID,
 )
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.pytorch.rotary_embedding.rope import NativeRoPEOp
@@ -44,6 +45,79 @@ def test_h100_preprocessor_uses_common_backend_ids_for_fallback():
     }
 
 
+def test_preprocessor_can_reuse_qk_norm_without_fusing_rope():
+    def rmsnorm(x, weight, *, eps):
+        del eps
+        return (x.float() * weight.float()).to(torch.bfloat16)
+
+    def rope(x, positions, *, theta):
+        del positions, theta
+        return x
+
+    op = object.__new__(H100AttentionPreprocessor)
+    op.device = torch.device("cpu")
+    op.device_capability = (0, 0)
+    op.rmsnorm = rmsnorm
+    op.rope = rope
+    op.deterministic_backend_ids = {
+        "qk_rmsnorm": "rlkernel.rocm.triton_rmsnorm",
+        "rope": "rlkernel.rocm.deterministic_rope",
+    }
+    op.native_qk_norm = rmsnorm
+    op.native_rope = None
+    op.native_qk_norm_backend_id = TE_ROCM_QK_RMSNORM_BACKEND_ID
+    op.native_rope_backend_id = "unused"
+    op.policy_id = "test"
+    q = torch.randn(2, 4, 3, 8, dtype=torch.bfloat16)
+    k = torch.randn(2, 2, 3, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, dtype=torch.bfloat16)
+    positions = torch.arange(3, dtype=torch.int64)
+
+    result = op(q, k, weight, weight, positions)
+
+    assert result.fallback is False
+    assert result.backend_ids == {
+        "qk_rmsnorm": TE_ROCM_QK_RMSNORM_BACKEND_ID,
+        "rope": "rlkernel.rocm.deterministic_rope",
+    }
+
+
+def test_preprocessor_falls_back_atomically_when_vendor_qk_norm_drifts():
+    def deterministic(x, weight, *, eps):
+        del weight, eps
+        return x
+
+    def drifting(x, weight, *, eps):
+        del weight, eps
+        return (x.float() + 1).to(torch.bfloat16)
+
+    def rope(x, positions, *, theta):
+        del positions, theta
+        return x
+
+    op = object.__new__(H100AttentionPreprocessor)
+    op.device = torch.device("cpu")
+    op.device_capability = (0, 0)
+    op.rmsnorm = deterministic
+    op.rope = rope
+    op.deterministic_backend_ids = dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS)
+    op.native_qk_norm = drifting
+    op.native_rope = None
+    op.native_qk_norm_backend_id = "transformer_engine.cuda.rmsnorm"
+    op.native_rope_backend_id = "unused"
+    op.policy_id = "test"
+    q = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 1, 3, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, dtype=torch.bfloat16)
+    positions = torch.arange(3, dtype=torch.int64)
+
+    result = op(q, k, weight, weight, positions)
+
+    assert result.fallback is True
+    assert result.backend_ids == MANDATED_ATTENTION_PREPROCESS_BACKENDS
+    assert result.fallback_reason == "native_preprocess_bitwise_probe_failed"
+
+
 def test_h100_preprocessor_fails_before_dispatch_without_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="requires an available CUDA runtime"):
@@ -76,7 +150,9 @@ def _inputs():
 @requires_h100_preprocess
 def test_h100_preprocessor_executes_cuda_qk_norm_and_zigzag_rope():
     q, k, q_weight, k_weight, positions = _inputs()
-    result = H100AttentionPreprocessor()(q, k, q_weight, k_weight, positions)
+    result = H100AttentionPreprocessor(reuse_transformer_engine_qk_norm=False)(
+        q, k, q_weight, k_weight, positions
+    )
 
     norm = NativeRMSNormOp()
     rope = NativeRoPEOp()
@@ -101,7 +177,7 @@ def test_h100_preprocessor_executes_cuda_qk_norm_and_zigzag_rope():
 @requires_h100_preprocess
 def test_h100_preprocessor_is_bitwise_batch_invariant_for_2d_positions():
     q, k, q_weight, k_weight, positions = _inputs()
-    op = H100AttentionPreprocessor()
+    op = H100AttentionPreprocessor(reuse_transformer_engine_qk_norm=False)
     full = op(q, k, q_weight, k_weight, positions)
 
     for batch_index in range(q.shape[0]):
