@@ -22,6 +22,7 @@ from rl_engine.kernels.attention_contract import (
 from rl_engine.kernels.ops.pytorch.attention.ablation import (
     BACKEND_ID,
     REFERENCE_BACKEND_ID,
+    AttentionAblationConfig,
     AttentionAblationOp,
 )
 
@@ -68,6 +69,38 @@ def _qkv():
     )
 
 
+def _cp2_contract() -> AttentionContract:
+    return AttentionContract(
+        role=AttentionRole.TRAIN,
+        mode=AttentionMode.PREFILL,
+        dtype=AttentionDType.BF16,
+        batch_size=1,
+        query_sequence_length=2,
+        head_dim=4,
+        causal=True,
+        causal_offsets=(0,),
+        sharding=ShardingSpec(
+            tp_rank=0,
+            tp_world_size=1,
+            cp_rank=0,
+            cp_world_size=2,
+            global_q_heads=2,
+            global_kv_heads=1,
+            local_q_head_start=0,
+            local_q_heads=2,
+            local_kv_head_start=0,
+            local_kv_heads=1,
+            global_sequence_length=4,
+            local_sequence_length=2,
+            global_block_indices=(0,),
+            global_block_token_starts=(0,),
+            local_block_offsets=(0, 2),
+        ),
+        reduction=ReductionSpec(),
+        split_kv=SplitKVSpec.disabled(),
+    )
+
+
 def test_attention_wrapper_has_unified_result_and_provenance():
     q, k, v = _qkv()
     result = AttentionAblationOp()(q, k, v, contract=_contract())
@@ -106,42 +139,104 @@ def test_attention_wrapper_supports_explicit_injected_backend():
     assert torch.equal(result.out, q)
 
 
+def test_wrapper_owned_deterministic_core_does_not_require_external_provenance():
+    q, k, v = _qkv()
+
+    class WrapperOwnedCore:
+        backend_id = BACKEND_ID
+
+        def __call__(self, q, k, v, *, causal, scale):
+            del k, v, causal, scale
+            return q.clone(), torch.zeros(q.shape[:3], dtype=torch.float32)
+
+    result = AttentionAblationOp()(
+        q,
+        k,
+        v,
+        contract=_contract(),
+        backend=WrapperOwnedCore(),
+    )
+
+    assert result.backend_id == BACKEND_ID
+    assert result.deterministic is True
+
+
 def test_cp_production_configuration_fails_closed_without_ag_rs_backend():
     q, k, v = _qkv()
-    cp_sharding = ShardingSpec(
-        tp_rank=0,
-        tp_world_size=1,
-        cp_rank=0,
-        cp_world_size=2,
-        global_q_heads=2,
-        global_kv_heads=1,
-        local_q_head_start=0,
-        local_q_heads=2,
-        local_kv_head_start=0,
-        local_kv_heads=1,
-        global_sequence_length=4,
-        local_sequence_length=2,
-        global_block_indices=(0,),
-        global_block_token_starts=(0,),
-        local_block_offsets=(0, 2),
-    )
-    contract = AttentionContract(
-        role=AttentionRole.TRAIN,
-        mode=AttentionMode.PREFILL,
-        dtype=AttentionDType.BF16,
-        batch_size=1,
-        query_sequence_length=2,
-        head_dim=4,
-        causal=True,
-        causal_offsets=(0,),
-        sharding=cp_sharding,
-        reduction=ReductionSpec(),
-        split_kv=SplitKVSpec.disabled(),
-    )
     with pytest.raises(AttentionContractError, match="injected AG/RS backend"):
         AttentionAblationOp(communication_backend="self_owned_cuda_ag_rs")(
-            q[:, :, :2], k[:, :, :2], v[:, :, :2], contract=contract
+            q[:, :, :2], k[:, :, :2], v[:, :, :2], contract=_cp2_contract()
         )
+
+
+def test_cp_backend_must_explicitly_declare_cp_world_size():
+    q, k, v = _qkv()
+
+    class KwargsOnlyBackend:
+        backend_id = "test.kwargs_only"
+        core_id = STRICT_ATTENTION_CORE_ID
+        strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
+
+        def __call__(self, q, k, v, **kwargs):
+            del k, v, kwargs
+            return q, torch.zeros(q.shape[:3], dtype=torch.float32)
+
+    with pytest.raises(AttentionContractError, match="explicitly accepts cp_world_size"):
+        AttentionAblationOp(
+            cp_backend=KwargsOnlyBackend(),
+            communication_backend="cuda_ag_rs",
+        )(
+            q[:, :, :2],
+            k[:, :, :2],
+            v[:, :, :2],
+            contract=_cp2_contract(),
+        )
+
+
+@pytest.mark.parametrize("communication_backend", ["cuda_ag_rs", "rccl_ag_rs"])
+def test_cp_wrapper_accepts_exact_platform_vendor_core(communication_backend):
+    q, k, v = _qkv()
+
+    class VendorCPBackend:
+        backend_id = "vendor.strict_attention"
+        core_id = "vendor.strict_core.v1"
+        strict_schedule = "vendor.strict_schedule.v1"
+
+        def __call__(self, q, k, v, *, causal, scale, cp_world_size):
+            del k, v, causal, scale
+            assert cp_world_size == 2
+            return SimpleNamespace(
+                out=q.clone(),
+                lse=torch.zeros(q.shape[:3], dtype=torch.float32),
+                provenance={
+                    "strict_core_id": self.core_id,
+                    "strict_schedule": self.strict_schedule,
+                    "actual_backend": self.backend_id,
+                    "communication_backend": communication_backend,
+                    "production_ready": True,
+                    "native_attention_arithmetic": True,
+                    "fallback": False,
+                    "reference_only": False,
+                },
+            )
+
+    result = AttentionAblationOp(
+        cp_backend=VendorCPBackend(),
+        communication_backend=communication_backend,
+    )(
+        q[:, :, :2],
+        k[:, :, :2],
+        v[:, :, :2],
+        contract=_cp2_contract(),
+        config=AttentionAblationConfig(
+            strict_core_id=VendorCPBackend.core_id,
+            strict_schedule=VendorCPBackend.strict_schedule,
+        ),
+    )
+
+    assert result.provenance["actual_backend"] == VendorCPBackend.backend_id
+    assert result.provenance["communication_backend"] == communication_backend
+    assert result.provenance["native_attention_arithmetic"] is True
 
 
 def test_cp_production_wrapper_preserves_runtime_backend_provenance():
@@ -165,6 +260,7 @@ def test_cp_production_wrapper_preserves_runtime_backend_provenance():
                     "production_ready": True,
                     "native_attention_arithmetic": False,
                     "fallback": False,
+                    "reference_only": False,
                 },
             )
 
@@ -181,6 +277,57 @@ def test_cp_production_wrapper_preserves_runtime_backend_provenance():
     assert result.provenance["actual_backend"] == "rlkernel.cuda.deterministic_attention"
     assert result.provenance["communication_backend"] == "self_owned_cuda_ag_rs"
     assert result.provenance["production_ready"] is True
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "replacement"),
+    [
+        ("production_ready", None),
+        ("fallback", True),
+        ("reference_only", True),
+    ],
+)
+def test_vendor_production_core_fails_closed_without_exact_provenance(missing_field, replacement):
+    q, k, v = _qkv()
+
+    class VendorCore:
+        backend_id = "vendor.strict_attention"
+        core_id = "vendor.strict_core.v1"
+        strict_schedule = "vendor.strict_schedule.v1"
+
+        def __call__(self, q, k, v, *, causal, scale):
+            del k, v, causal, scale
+            provenance = {
+                "strict_core_id": self.core_id,
+                "strict_schedule": self.strict_schedule,
+                "actual_backend": self.backend_id,
+                "production_ready": True,
+                "native_attention_arithmetic": True,
+                "fallback": False,
+                "reference_only": False,
+            }
+            if replacement is None:
+                del provenance[missing_field]
+            else:
+                provenance[missing_field] = replacement
+            return SimpleNamespace(
+                out=q.clone(),
+                lse=torch.zeros(q.shape[:3], dtype=torch.float32),
+                provenance=provenance,
+            )
+
+    with pytest.raises(AttentionContractError, match="runtime provenance"):
+        AttentionAblationOp()(
+            q,
+            k,
+            v,
+            contract=_contract(),
+            backend=VendorCore(),
+            config=AttentionAblationConfig(
+                strict_core_id=VendorCore.core_id,
+                strict_schedule=VendorCore.strict_schedule,
+            ),
+        )
 
 
 def test_deterministic_attention_rejects_runtime_split_kv_auto():

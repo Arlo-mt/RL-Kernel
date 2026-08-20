@@ -140,7 +140,11 @@ class TransformerEngineRMSNormOp:
 
 @dataclass(frozen=True)
 class AttentionPreprocessResult:
-    """Post-QK-Norm, post-RoPE tensors plus executed backend evidence."""
+    """Post-QK-Norm, post-RoPE tensors plus executed backend evidence.
+
+    ``probe_id`` identifies the probe configuration, not tensor contents, and
+    must never be used as an admission-result cache key.
+    """
 
     q: Tensor
     k: Tensor
@@ -278,7 +282,7 @@ class H100AttentionPreprocessor:
         k_norm_det = self.rmsnorm(k, k_weight, eps=eps)
         q_det = _apply_deterministic_rope(self.rope, q_norm_det, positions, theta)
         k_det = _apply_deterministic_rope(self.rope, k_norm_det, positions, theta)
-        probe_id = _probe_id(q, k, q_weight, k_weight, positions, eps, theta)
+        probe_id = _probe_configuration_id(q, k, q_weight, k_weight, positions, eps, theta)
 
         native_qk_norm = self.native_qk_norm
         native_rope = self.native_rope
@@ -409,7 +413,7 @@ def _apply_deterministic_rope(
     )
 
 
-def _probe_id(
+def _probe_configuration_id(
     q: Tensor,
     k: Tensor,
     q_weight: Tensor,

@@ -44,8 +44,6 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 from rl_engine.kernels.attention_contract import (
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContract,
     AttentionContractError,
     AttentionDType,
@@ -159,6 +157,8 @@ class AttentionRuntimeReadback:
     actual_backend: str | None = None
     communication_backend: str | None = None
     production_ready: bool = False
+    attention_fallback: bool = False
+    reference_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.contract, AttentionContract):
@@ -216,6 +216,10 @@ class AttentionRuntimeReadback:
                 raise ValueError(f"{name} must be a non-empty string when provided")
         if not isinstance(self.production_ready, bool):
             raise TypeError("production_ready must be a bool")
+        if not isinstance(self.attention_fallback, bool):
+            raise TypeError("attention_fallback must be a bool")
+        if not isinstance(self.reference_only, bool):
+            raise TypeError("reference_only must be a bool")
         normalized_projection_plans: dict[str, Mapping[str, Any]] = {}
         for name, plan in self.projection_plans.items():
             if not isinstance(name, str) or not isinstance(plan, Mapping):
@@ -268,6 +272,8 @@ class AttentionRuntimeReadback:
                 "actual_backend": self.actual_backend,
                 "communication_backend": self.communication_backend,
                 "production_ready": self.production_ready,
+                "fallback": self.attention_fallback,
+                "reference_only": self.reference_only,
             },
             "split_kv_runtime_plan_set": self.split_kv_plan_set.to_dict(),
         }
@@ -963,7 +969,7 @@ def bind_attention_runtime_readbacks(
                 rollout=rollout.preprocess_fallback,
                 training=training.preprocess_fallback,
                 message=(
-                    "both runtimes must either pass the native H100 bitwise probe or "
+                    "both runtimes must either pass the platform vendor bitwise probe or "
                     "use the same deterministic preprocess fallback"
                 ),
             )
@@ -1050,6 +1056,8 @@ def bind_attention_runtime_readbacks(
             "runtime.actual_backend": rollout.actual_backend,
             "runtime.communication_backend": rollout.communication_backend,
             "runtime.production_ready": rollout.production_ready,
+            "runtime.fallback": rollout.attention_fallback,
+            "runtime.reference_only": rollout.reference_only,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in rollout.projection_plans.items()
@@ -1072,6 +1080,8 @@ def bind_attention_runtime_readbacks(
             "runtime.actual_backend": training.actual_backend,
             "runtime.communication_backend": training.communication_backend,
             "runtime.production_ready": training.production_ready,
+            "runtime.fallback": training.attention_fallback,
+            "runtime.reference_only": training.reference_only,
             **{
                 f"projection.{projection}": dict(plan)
                 for projection, plan in training.projection_plans.items()
@@ -1087,7 +1097,7 @@ def _strict_attention_core_issues(
     if not readback.strict_mode:
         return []
     issues = []
-    if readback.actual_backend != "rlkernel.cuda.deterministic_attention":
+    if not readback.actual_backend:
         issues.append(
             BindingIssue(
                 code=BindingErrorCode.ATTENTION_BACKEND_MISSING,
@@ -1095,10 +1105,14 @@ def _strict_attention_core_issues(
                 field=f"{side}.runtime.actual_backend",
                 rollout=readback.actual_backend if side == "rollout" else None,
                 training=readback.actual_backend if side == "training" else None,
-                message=(f"{side} strict Attention did not execute the CUDA deterministic core"),
+                message=(f"{side} strict Attention did not report its executed production core"),
             )
         )
-    if readback.communication_backend != "self_owned_cuda_ag_rs":
+    supported_communication = {"self_owned_cuda_ag_rs", "cuda_ag_rs", "rccl_ag_rs"}
+    if (
+        readback.contract.sharding.cp_world_size > 1
+        and readback.communication_backend not in supported_communication
+    ):
         issues.append(
             BindingIssue(
                 code=BindingErrorCode.ATTENTION_BACKEND_MISSING,
@@ -1107,7 +1121,7 @@ def _strict_attention_core_issues(
                 rollout=readback.communication_backend if side == "rollout" else None,
                 training=readback.communication_backend if side == "training" else None,
                 message=(
-                    f"{side} strict CP Attention did not execute the self-owned CUDA AG/RS path"
+                    f"{side} strict CP Attention did not execute a supported self-owned AG/RS path"
                 ),
             )
         )
@@ -1122,37 +1136,31 @@ def _strict_attention_core_issues(
                 message=(f"{side} evidence is reference-only and cannot close the production gate"),
             )
         )
-    if readback.strict_core_id != STRICT_ATTENTION_CORE_ID:
+    if not readback.strict_core_id:
         issues.append(
             BindingIssue(
                 code=BindingErrorCode.ATTENTION_CORE_MISSING,
                 tier=BindingTier.SEMANTIC,
                 field=f"{side}.strict.core_id",
-                message=(
-                    f"{side} strict Attention did not execute the shared core "
-                    f"{STRICT_ATTENTION_CORE_ID!r}"
-                ),
+                message=(f"{side} strict Attention did not report its exact shared core identity"),
             )
         )
-    if readback.strict_schedule != STRICT_ATTENTION_SCHEDULE_ID:
+    if not readback.strict_schedule:
         issues.append(
             BindingIssue(
                 code=BindingErrorCode.ATTENTION_CORE_SCHEDULE,
                 tier=BindingTier.SEMANTIC,
                 field=f"{side}.strict.schedule",
-                message=(
-                    f"{side} strict Attention did not execute the canonical schedule "
-                    f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
-                ),
+                message=(f"{side} strict Attention did not report its exact reduction schedule"),
             )
         )
-    if readback.native_attention_arithmetic:
+    if readback.attention_fallback or readback.reference_only:
         issues.append(
             BindingIssue(
-                code=BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC,
+                code=BindingErrorCode.ATTENTION_BACKEND_MISSING,
                 tier=BindingTier.SEMANTIC,
-                field=f"{side}.strict.native_attention_arithmetic",
-                message=f"{side} strict Attention entered native TE/FlashInfer arithmetic",
+                field=f"{side}.runtime.production_path",
+                message=f"{side} strict Attention executed a fallback or reference-only path",
             )
         )
     if (
@@ -1208,6 +1216,20 @@ def _strict_attention_core_pair_issues(
                 rollout=rollout.strict_schedule,
                 training=training.strict_schedule,
                 message="training and rollout executed different strict Attention schedules",
+            )
+        ]
+    if (
+        rollout.strict_mode
+        and rollout.native_attention_arithmetic != training.native_attention_arithmetic
+    ):
+        return [
+            BindingIssue(
+                code=BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC,
+                tier=BindingTier.SEMANTIC,
+                field="strict.native_attention_arithmetic",
+                rollout=rollout.native_attention_arithmetic,
+                training=training.native_attention_arithmetic,
+                message="training and rollout disagree on vendor Attention arithmetic",
             )
         ]
     if rollout.strict_mode and rollout.actual_backend != training.actual_backend:
