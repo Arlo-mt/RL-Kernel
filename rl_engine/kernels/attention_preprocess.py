@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -61,6 +62,7 @@ class TransformerEngineRMSNormUnavailable(RuntimeError):
     """Raised when the exact TE RMSNorm functional contract is unavailable."""
 
 
+@lru_cache(maxsize=1)
 def _load_transformer_engine_rmsnorm():
     try:
         import transformer_engine
@@ -126,7 +128,9 @@ class TransformerEngineRMSNormOp:
 
     def __call__(self, x: Tensor, weight: Tensor, *, eps: float = 1.0e-6) -> Tensor:
         if x.dtype not in (torch.float16, torch.bfloat16) or weight.dtype != x.dtype:
-            raise TypeError("Transformer Engine RMSNorm requires matching FP16/BF16 input and weight")
+            raise TypeError(
+                "Transformer Engine RMSNorm requires matching FP16/BF16 input and weight"
+            )
         if not x.is_cuda or not weight.is_cuda or x.device != weight.device:
             raise ValueError("Transformer Engine RMSNorm requires input and weight on one GPU")
         if weight.shape != (x.shape[-1],):
@@ -187,7 +191,7 @@ class H100AttentionPreprocessor:
         native_qk_norm_backend_id: str = NATIVE_QK_RMSNORM_BACKEND_ID,
         native_rope_backend_id: str = NATIVE_ROPE_BACKEND_ID,
         reuse_transformer_engine_qk_norm: bool = True,
-        require_transformer_engine_qk_norm: bool = False,
+        require_transformer_engine_qk_norm: bool = True,
         policy_id: str = PREPROCESS_POLICY_ID,
     ) -> None:
         if not torch.cuda.is_available():
@@ -230,6 +234,9 @@ class H100AttentionPreprocessor:
                     raise
         self.native_qk_norm = native_qk_norm
         self.native_rope = native_rope
+        self.require_native_qk_norm = bool(
+            require_transformer_engine_qk_norm and reuse_transformer_engine_qk_norm
+        )
         self.native_qk_norm_backend_id = native_qk_norm_backend_id
         self.native_rope_backend_id = native_rope_backend_id
         self.policy_id = policy_id
@@ -324,6 +331,8 @@ class H100AttentionPreprocessor:
                 fallback_reason = f"native_preprocess_unavailable:{type(exc).__name__}"
         else:
             fallback_reason = "native_preprocess_not_supplied"
+        if self.require_native_qk_norm:
+            raise TransformerEngineRMSNormUnavailable(fallback_reason)
         return AttentionPreprocessResult(
             q=q_det,
             k=k_det,
@@ -376,6 +385,9 @@ class RocmAttentionPreprocessor(H100AttentionPreprocessor):
                     raise
         self.native_qk_norm = native_qk_norm
         self.native_rope = None
+        self.require_native_qk_norm = bool(
+            require_transformer_engine_qk_norm and reuse_transformer_engine_qk_norm
+        )
         self.native_qk_norm_backend_id = (
             getattr(native_qk_norm, "backend_id", TE_ROCM_QK_RMSNORM_BACKEND_ID)
             if native_qk_norm is not None

@@ -65,6 +65,7 @@ def test_preprocessor_can_reuse_qk_norm_without_fusing_rope():
     }
     op.native_qk_norm = rmsnorm
     op.native_rope = None
+    op.require_native_qk_norm = True
     op.native_qk_norm_backend_id = TE_ROCM_QK_RMSNORM_BACKEND_ID
     op.native_rope_backend_id = "unused"
     op.policy_id = "test"
@@ -103,6 +104,7 @@ def test_preprocessor_falls_back_atomically_when_vendor_qk_norm_drifts():
     op.deterministic_backend_ids = dict(MANDATED_ATTENTION_PREPROCESS_BACKENDS)
     op.native_qk_norm = drifting
     op.native_rope = None
+    op.require_native_qk_norm = False
     op.native_qk_norm_backend_id = "transformer_engine.cuda.rmsnorm"
     op.native_rope_backend_id = "unused"
     op.policy_id = "test"
