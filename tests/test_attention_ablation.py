@@ -255,7 +255,7 @@ def test_cp_production_wrapper_preserves_runtime_backend_provenance():
                 provenance={
                     "strict_core_id": STRICT_ATTENTION_CORE_ID,
                     "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
-                    "actual_backend": "rlkernel.cuda.deterministic_attention",
+                    "actual_backend": self.backend_id,
                     "communication_backend": "self_owned_cuda_ag_rs",
                     "production_ready": True,
                     "native_attention_arithmetic": False,
@@ -274,7 +274,7 @@ def test_cp_production_wrapper_preserves_runtime_backend_provenance():
         contract=_contract(),
         backend=StrictCPBackend(),
     )
-    assert result.provenance["actual_backend"] == "rlkernel.cuda.deterministic_attention"
+    assert result.provenance["actual_backend"] == StrictCPBackend.backend_id
     assert result.provenance["communication_backend"] == "self_owned_cuda_ag_rs"
     assert result.provenance["production_ready"] is True
 
@@ -330,11 +330,79 @@ def test_vendor_production_core_fails_closed_without_exact_provenance(missing_fi
         )
 
 
-def test_deterministic_attention_rejects_runtime_split_kv_auto():
+@pytest.mark.parametrize(
+    "split_kv",
+    [SplitKVSpec.auto(strict_consistency=False), SplitKVSpec.fixed(2)],
+)
+def test_deterministic_attention_requires_split_kv_disabled(split_kv):
     q, k, v = _qkv()
-    contract = _contract(split_kv=SplitKVSpec.auto(strict_consistency=False))
-    with pytest.raises(AttentionContractError, match="Split-KV=auto"):
+    contract = _contract(split_kv=split_kv)
+    with pytest.raises(AttentionContractError, match="Split-KV to be disabled"):
         AttentionAblationOp()(q, k, v, contract=contract)
+
+
+def test_explicit_cp_callable_cannot_bypass_ag_rs_requirement():
+    q, k, v = _qkv()
+
+    class VendorCPBackend:
+        backend_id = "vendor.strict_attention"
+        core_id = "vendor.strict_core.v1"
+        strict_schedule = "vendor.strict_schedule.v1"
+
+        def __call__(self, q, k, v, *, causal, scale, cp_world_size):
+            del k, v, causal, scale, cp_world_size
+            return q, torch.zeros(q.shape[:3], dtype=torch.float32)
+
+    with pytest.raises(AttentionContractError, match="requires an explicit CUDA AG/RS"):
+        AttentionAblationOp()(
+            q[:, :, :2],
+            k[:, :, :2],
+            v[:, :, :2],
+            contract=_cp2_contract(),
+            backend=VendorCPBackend(),
+            config=AttentionAblationConfig(
+                strict_core_id=VendorCPBackend.core_id,
+                strict_schedule=VendorCPBackend.strict_schedule,
+            ),
+        )
+
+
+def test_vendor_core_actual_backend_must_match_selected_backend():
+    q, k, v = _qkv()
+
+    class VendorCore:
+        backend_id = "vendor.strict_attention"
+        core_id = "vendor.strict_core.v1"
+        strict_schedule = "vendor.strict_schedule.v1"
+
+        def __call__(self, q, k, v, *, causal, scale):
+            del k, v, causal, scale
+            return SimpleNamespace(
+                out=q.clone(),
+                lse=torch.zeros(q.shape[:3], dtype=torch.float32),
+                provenance={
+                    "strict_core_id": self.core_id,
+                    "strict_schedule": self.strict_schedule,
+                    "actual_backend": "vendor.other_attention",
+                    "production_ready": True,
+                    "native_attention_arithmetic": True,
+                    "fallback": False,
+                    "reference_only": False,
+                },
+            )
+
+    with pytest.raises(AttentionContractError, match="actual_backend"):
+        AttentionAblationOp()(
+            q,
+            k,
+            v,
+            contract=_contract(),
+            backend=VendorCore(),
+            config=AttentionAblationConfig(
+                strict_core_id=VendorCore.core_id,
+                strict_schedule=VendorCore.strict_schedule,
+            ),
+        )
 
 
 def test_deterministic_native_backend_requires_explicit_native_callable():

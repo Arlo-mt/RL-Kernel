@@ -238,9 +238,17 @@ class AttentionAblationOp:
         )
         if cfg.validate:
             self._validate_inputs(q, k, v, contract)
-        if cfg.deterministic and contract.split_kv.mode is SplitKVMode.AUTO:
+        if cfg.deterministic and contract.split_kv.mode is not SplitKVMode.DISABLED:
             raise AttentionContractError(
-                "deterministic Attention cannot use runtime-dependent Split-KV=auto"
+                "strict deterministic Attention requires Split-KV to be disabled"
+            )
+        if (
+            cfg.deterministic
+            and contract.sharding.cp_world_size > 1
+            and cfg.communication_backend not in _STRICT_AG_RS_BACKENDS
+        ):
+            raise AttentionContractError(
+                "strict CP Attention requires an explicit CUDA AG/RS or ROCm RCCL AG/RS backend"
             )
         if cfg.deterministic and not cfg.return_lse:
             raise AttentionContractError("strict deterministic Attention must return LSE")
@@ -604,6 +612,7 @@ def _validate_runtime_provenance(
     expected = {
         "strict_core_id": config.strict_core_id,
         "strict_schedule": config.strict_schedule,
+        "actual_backend": selected_id,
         "production_ready": True,
         "fallback": False,
         "reference_only": False,
@@ -611,8 +620,6 @@ def _validate_runtime_provenance(
     if config.communication_backend in _STRICT_AG_RS_BACKENDS:
         expected["communication_backend"] = config.communication_backend
     mismatches = [name for name, value in expected.items() if runtime.get(name) != value]
-    if not isinstance(runtime.get("actual_backend"), str) or not runtime["actual_backend"].strip():
-        mismatches.append("actual_backend")
     if not isinstance(runtime.get("native_attention_arithmetic"), bool):
         mismatches.append("native_attention_arithmetic")
     if mismatches:
