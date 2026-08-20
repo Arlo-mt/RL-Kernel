@@ -63,6 +63,14 @@ torch::Tensor linear_logp_logits_bf16_to_dlogits(torch::Tensor logits,
                                                  int64_t vocab_start_index);
 // RoPE (rotate-half) apply for SM90; cos/sin precomputed fp32, sin_sign = +1 fwd / -1 bwd.
 torch::Tensor rope_apply_sm90(torch::Tensor x, torch::Tensor cos, torch::Tensor sin, double sin_sign);
+torch::Tensor embedding_sm90_forward(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor embedding_sm90_forward_fp32(torch::Tensor token_ids, torch::Tensor weight);
+torch::Tensor lm_head_sm90_forward(torch::Tensor hidden,
+                                   torch::Tensor weight,
+                                   torch::optional<torch::Tensor> bias);
+torch::Tensor lm_head_sm90_forward_fp32(torch::Tensor hidden,
+                                        torch::Tensor weight,
+                                        torch::optional<torch::Tensor> bias);
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -259,6 +267,7 @@ std::vector<torch::Tensor> deterministic_attention_backward(
 
 // Prefix-Shared Attention Declarations & Wrappers
 
+#if !defined(USE_ROCM)
 void prefix_shared_attention_forward(
   const __nv_bfloat16 *Q,  // [bs, G, len_q, DIM]
   const __nv_bfloat16 *K,  // [bs, len_kv, DIM]
@@ -302,6 +311,7 @@ at::Tensor prefix_shared_attention(
   return O;
 }
 #endif
+#endif
 
 // PyBind11 Module Registration
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -334,9 +344,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "In-place local bf16 probs -> TP dlogits for selected log-prob backward");
     m.def("linear_logp_logits_bf16_to_dlogits", &linear_logp_logits_bf16_to_dlogits,
           "Build bf16 dlogits from bf16 logits and fp32 lse");
-
     // RoPE rotate-half apply, SM90 (forward and backward share the kernel via sin_sign)
     m.def("rope_apply_sm90", &rope_apply_sm90, "RoPE rotate-half apply (GPT-NeoX), SM90");
+    m.def("embedding_sm90_forward", &embedding_sm90_forward,
+          "Single-card SM90 batch-invariant embedding forward");
+    m.def("embedding_sm90_forward_fp32", &embedding_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant embedding forward with fp32 output");
+    m.def("lm_head_sm90_forward", &lm_head_sm90_forward,
+          "Single-card SM90 batch-invariant LM-head forward");
+    m.def("lm_head_sm90_forward_fp32", &lm_head_sm90_forward_fp32,
+          "Single-card SM90 batch-invariant LM-head forward with fp32 output");
 #endif
 
 #if defined(__CUDACC__) || defined(KERNEL_ALIGN_WITH_CUDA)
@@ -384,8 +401,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &deterministic_collective_all_gather,
         "Run the TP=8 deterministic rank-ordered all-gather kernel");
 
-    // registry Prefix-Shared Attention
+    // Prefix-shared attention uses NVIDIA PTX and falls back to PyTorch SDPA on ROCm.
+#if !defined(USE_ROCM)
     m.def("prefix_shared_attention", &prefix_shared_attention, "Prefix-Shared Fused Attention for GRPO");
+#endif
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
