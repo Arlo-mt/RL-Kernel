@@ -718,6 +718,16 @@ class KernelRegistry:
 
         raise RuntimeError(f"No functional backend found for {op_type} on {platform}")
 
+    def _platform_for_device(self, device: torch.device | str | None) -> str:
+        if device is None:
+            return self._platform()
+        resolved = torch.device(device)
+        if resolved.type == "cuda":
+            return "rocm" if torch.version.hip is not None else "cuda"
+        if resolved.type in self._priority_map:
+            return resolved.type
+        return "cpu"
+
     def register_logprob_backend(
         self,
         backend: OpBackend,
