@@ -28,8 +28,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.kernels.attention_contract import (  # noqa: E402
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPBlockMetadata,
@@ -40,9 +40,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     CUDAAGRSAttentionCPCommunication,
     P2PNCCLAttentionCPCommunication,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
-    RLKernelDeterministicAttentionCore,
-)
+from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core  # noqa: E402
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -386,7 +384,7 @@ def _run_strict_shared_core_check(
     rope = RoPESM90Op()
     q_ready = _apply_strict_rope(rope, q_ref, positions, config.rope.rope_theta)
     k_ready = _apply_strict_rope(rope, k_ref, positions, config.rope.rope_theta)
-    reference = RLKernelDeterministicAttentionCore().forward_with_lse(
+    reference = StrictFlashAttention4Core().forward_with_lse(
         q_ready,
         k_ready,
         v_ref,
@@ -438,13 +436,17 @@ def _run_strict_shared_core_check(
 
     provenance = distributed.provenance
     identity_valid = (
-        provenance.get("strict_core_id") == STRICT_ATTENTION_CORE_ID
-        and provenance.get("strict_schedule") == STRICT_ATTENTION_SCHEDULE_ID
+        provenance.get("strict_core_id") == STRICT_ATTENTION_PRODUCTION_CORE_ID
+        and provenance.get("strict_schedule") == STRICT_ATTENTION_FA4_SCHEDULE_ID
         and provenance.get("strict_mode") is True
-        and provenance.get("native_attention_arithmetic") is False
+        and provenance.get("native_attention_arithmetic") is True
+        and provenance.get("num_splits") == 1
+        and provenance.get("deterministic_backward") is True
+        and provenance.get("fa_api_source") == "flash_attn.cute.interface"
         and provenance.get("fallback") is False
         and provenance.get("strict_split_kv") == "disabled"
         and provenance.get("strict_comm_autograd") is True
+        and provenance.get("production_ready") is True
     )
     return {
         "executed": True,

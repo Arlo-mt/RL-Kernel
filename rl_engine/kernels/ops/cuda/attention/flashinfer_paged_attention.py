@@ -26,6 +26,8 @@ import torch
 
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
     STRICT_ATTENTION_SCHEDULE_ID,
     AttentionContractError,
     SplitKVExecutionPlan,
@@ -43,10 +45,8 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPPartialState,
     AttentionParallelSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
-    DeterministicAttentionCoreResult,
-    RLKernelDeterministicAttentionCore,
-)
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionCoreResult
+from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
     AttentionRingSchedule,
@@ -704,7 +704,7 @@ class FlashInferQwen3PagedAttentionOp:
     ) -> FlashInferAttentionResult:
         """Use FlashInfer only for paged-KV layout, never Attention arithmetic."""
 
-        core = cfg.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=cfg.split_kv)
+        core = _resolve_strict_core(cfg)
         _validate_strict_core(core)
         rope = _resolve_strict_rope(cfg)
         logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
@@ -818,7 +818,7 @@ class FlashInferQwen3PagedAttentionOp:
         rope = _resolve_strict_rope(cfg)
         q_ready = _apply_strict_rope(rope, global_q, global_q_positions, cfg.rope.rope_theta)
         k_ready = _apply_strict_rope(rope, global_k, global_k_positions, cfg.rope.rope_theta)
-        core = cfg.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=cfg.split_kv)
+        core = _resolve_strict_core(cfg)
         _validate_strict_core(core)
 
         outputs: list[torch.Tensor] = []
@@ -1461,28 +1461,56 @@ class FlashInferQwen3PagedAttentionOp:
 
 def _validate_strict_core(core: Any) -> None:
     if not callable(getattr(core, "forward_with_lse", None)):
-        raise ValueError("strict deterministic core must implement forward_with_lse")
-    if getattr(core, "core_id", None) != STRICT_ATTENTION_CORE_ID:
-        raise ValueError("strict deterministic core ID must be " f"{STRICT_ATTENTION_CORE_ID!r}")
-    if getattr(core, "strict_schedule", None) != STRICT_ATTENTION_SCHEDULE_ID:
+        raise ValueError("strict Attention core must implement forward_with_lse")
+    expected_schedules = {
+        STRICT_ATTENTION_PRODUCTION_CORE_ID: STRICT_ATTENTION_FA4_SCHEDULE_ID,
+        STRICT_ATTENTION_CORE_ID: STRICT_ATTENTION_SCHEDULE_ID,
+    }
+    core_id = getattr(core, "core_id", None)
+    if core_id not in expected_schedules:
         raise ValueError(
-            "strict deterministic core schedule must be " f"{STRICT_ATTENTION_SCHEDULE_ID!r}"
+            "strict Attention core ID must identify the FA4 production core or explicit reference"
         )
+    if getattr(core, "strict_schedule", None) != expected_schedules[core_id]:
+        raise ValueError("strict Attention core schedule does not match its exact core identity")
     required = {
         "merge_order": "global_block_index",
         "accum_dtype": "fp32",
         "downcast_at": "final_write",
         "fallback": False,
-        "native_attention_arithmetic": False,
     }
     mismatches = [
         name for name, expected in required.items() if getattr(core, name, None) != expected
     ]
     if mismatches:
         raise ValueError(
-            "strict deterministic core has incompatible arithmetic identity: "
-            + ", ".join(mismatches)
+            "strict Attention core has incompatible arithmetic identity: " + ", ".join(mismatches)
         )
+    if core_id == STRICT_ATTENTION_PRODUCTION_CORE_ID:
+        production_required = {
+            "backend_id": "flash_attention_4.cute",
+            "native_attention_arithmetic": True,
+            "num_splits": 1,
+            "deterministic_backward": True,
+            "production_ready": True,
+            "reference_only": False,
+        }
+        production_mismatches = [
+            name
+            for name, expected in production_required.items()
+            if getattr(core, name, None) != expected
+        ]
+        if production_mismatches:
+            raise ValueError(
+                "strict FA4 production core has incompatible controls: "
+                + ", ".join(production_mismatches)
+            )
+
+
+def _resolve_strict_core(cfg: FlashInferPagedAttentionConfig) -> Any:
+    if cfg.deterministic_core is not None:
+        return cfg.deterministic_core
+    return StrictFlashAttention4Core(split_kv=cfg.split_kv)
 
 
 def _validate_strict_core_result(
@@ -1491,12 +1519,12 @@ def _validate_strict_core_result(
 ) -> None:
     if not isinstance(result, DeterministicAttentionCoreResult):
         raise FlashInferUnavailable(
-            "strict deterministic core must return DeterministicAttentionCoreResult"
+            "strict Attention core must return DeterministicAttentionCoreResult"
         )
     if result.out.dtype not in (torch.float16, torch.bfloat16):
-        raise FlashInferUnavailable("strict deterministic core output must be FP16/BF16")
+        raise FlashInferUnavailable("strict Attention core output must be FP16/BF16")
     if result.lse.dtype is not torch.float32:
-        raise FlashInferUnavailable("strict deterministic core LSE must be FP32")
+        raise FlashInferUnavailable("strict Attention core LSE must be FP32")
     expected = {
         "strict_core_id": core.core_id,
         "strict_schedule": core.strict_schedule,
@@ -1505,7 +1533,7 @@ def _validate_strict_core_result(
         "accum_dtype": core.accum_dtype,
         "downcast_at": core.downcast_at,
         "fallback": False,
-        "native_attention_arithmetic": False,
+        "native_attention_arithmetic": core.native_attention_arithmetic,
     }
     mismatches = [name for name, value in expected.items() if result.provenance.get(name) != value]
     if mismatches:
@@ -1673,6 +1701,10 @@ def _strict_attention_provenance(
     cp_required: bool,
     rope: Any,
 ) -> dict[str, Any]:
+    communication_id = getattr(cfg.cp_communication, "backend_id", "unknown")
+    communication_backend = (
+        "self_owned_cuda_ag_rs" if communication_id == "cuda_ag_rs" else communication_id
+    )
     return {
         "attention_backend": core_provenance["attention_backend"],
         "requested_backend": "flashinfer_layout_adapter",
@@ -1690,9 +1722,9 @@ def _strict_attention_provenance(
         "strict_schedule": core_provenance["strict_schedule"],
         "accum_dtype": core_provenance["accum_dtype"],
         "downcast_at": core_provenance["downcast_at"],
-        "arithmetic_plan_source": "rlkernel_deterministic_cuda_core",
+        "arithmetic_plan_source": core_provenance.get("fa_api_source", "rlkernel_reference_core"),
         "arithmetic_semantics_verified": True,
-        "native_attention_arithmetic": False,
+        "native_attention_arithmetic": core_provenance["native_attention_arithmetic"],
         "fallback": False,
         "fallback_reason": None,
         "rope_backend": getattr(rope, "backend_id", "rlkernel.cuda.rope_sm90"),
@@ -1704,10 +1736,17 @@ def _strict_attention_provenance(
         "k_cache_rope_state": "post_rope",
         "batch_invariant_claim": "strict_runtime_verified",
         "cp_comm_required": cp_required,
-        "communication_backend": ("self_owned_cuda_ag_rs" if cp_required else "none"),
+        "communication_backend": (communication_backend if cp_required else "none"),
+        "num_splits": core_provenance.get("num_splits"),
+        "deterministic_backward": core_provenance.get("deterministic_backward"),
+        "fa_api_source": core_provenance.get("fa_api_source"),
+        "fa_package_version": core_provenance.get("fa_package_version"),
+        "reference_only": bool(core_provenance.get("reference_only", False)),
         "production_ready": bool(
-            cp_required
-            and core_provenance.get("attention_backend") == "rlkernel.cuda.deterministic_attention"
+            core_provenance.get("production_ready", False)
+            and (
+                not cp_required or getattr(cfg.cp_communication, "backend_id", None) == "cuda_ag_rs"
+            )
         ),
     }
 

@@ -218,11 +218,10 @@ class DeterministicAttentionOp:
 
 
 class RLKernelDeterministicAttentionCore:
-    """Production CUDA Attention core shared by training and rollout.
+    """Materializing CUDA reference core shared by training and rollout.
 
-    Strict execution exposes only the existing WS1 no-Split-K kernel. This is
-    intentional: a different Split-K schedule changes the arithmetic graph and
-    therefore cannot share this core identity.
+    This remains useful for correctness and capability-gap diagnosis. The
+    production default is the shared FA4 CuTe core with ``num_splits=1``.
     """
 
     core_id = STRICT_ATTENTION_CORE_ID
@@ -233,6 +232,8 @@ class RLKernelDeterministicAttentionCore:
     downcast_at = "final_write"
     fallback = False
     native_attention_arithmetic = False
+    production_ready = False
+    reference_only = True
 
     def __init__(
         self,
@@ -300,6 +301,8 @@ class RLKernelDeterministicAttentionCore:
                 "fallback": self.fallback,
                 "fallback_reason": None,
                 "native_attention_arithmetic": self.native_attention_arithmetic,
+                "production_ready": self.production_ready,
+                "reference_only": self.reference_only,
                 "strict_schedule": self.strict_schedule,
             },
         )

@@ -26,16 +26,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.kernels.attention_contract import (  # noqa: E402
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
+    STRICT_ATTENTION_FA4_SCHEDULE_ID,
+    STRICT_ATTENTION_PRODUCTION_CORE_ID,
 )
 from rl_engine.kernels.ops.cuda.attention.cp_comm import (  # noqa: E402
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (  # noqa: E402
-    RLKernelDeterministicAttentionCore,
-)
+from rl_engine.kernels.ops.cuda.attention.flash_attn import StrictFlashAttention4Core  # noqa: E402
 from rl_engine.kernels.ops.cuda.attention.flashinfer_paged_attention import (  # noqa: E402
     FlashInferPagedAttentionConfig,
     FlashInferQwen3PagedAttentionOp,
@@ -398,9 +396,9 @@ def _run_strict_cuda_reference(
     config: FlashInferPagedAttentionConfig,
     paged_plan: Any,
 ) -> AttentionPathResult:
-    """Call the shared CUDA core directly on the logical KV sequence."""
+    """Call the production FA4 core directly on the logical KV sequence."""
 
-    core = config.deterministic_core or RLKernelDeterministicAttentionCore(split_kv=config.split_kv)
+    core = config.deterministic_core or StrictFlashAttention4Core(split_kv=config.split_kv)
     rope = config.strict_rope_op or RoPESM90Op()
     logical_k, logical_v, key_positions = _materialize_strict_logical_kv(
         inputs.k_cache,
@@ -431,12 +429,12 @@ def _run_strict_cuda_reference(
         outputs.append(result.out)
         lses.append(result.lse)
     return AttentionPathResult(
-        name="direct_rlkernel_cuda_deterministic_attention",
+        name="direct_flash_attention4_num_splits1",
         out=torch.cat(outputs, dim=0),
         lse=torch.cat(lses, dim=0),
         provenance={
-            "strict_core_id": STRICT_ATTENTION_CORE_ID,
-            "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            "strict_core_id": core.core_id,
+            "strict_schedule": core.strict_schedule,
             "split_kv_policy": "disabled",
         },
     )
@@ -649,12 +647,22 @@ def _acceptance_errors(report: dict[str, Any], args: argparse.Namespace) -> list
     if args.strict:
         if provenance.get("strict_mode") is not True:
             errors.append("strict runtime did not execute the shared Attention core")
-        if provenance.get("strict_core_id") != STRICT_ATTENTION_CORE_ID:
-            errors.append("strict runtime core identity is invalid")
-        if provenance.get("strict_schedule") != STRICT_ATTENTION_SCHEDULE_ID:
+        if provenance.get("strict_core_id") != STRICT_ATTENTION_PRODUCTION_CORE_ID:
+            errors.append("strict runtime did not execute the FA4 production core")
+        if provenance.get("strict_schedule") != STRICT_ATTENTION_FA4_SCHEDULE_ID:
             errors.append("strict runtime arithmetic schedule is invalid")
-        if provenance.get("native_attention_arithmetic") is not False:
-            errors.append("strict runtime entered native FlashInfer Attention arithmetic")
+        if provenance.get("actual_backend") != "flash_attention_4.cute":
+            errors.append("strict runtime backend is not FlashAttention-4 CuTe")
+        if provenance.get("native_attention_arithmetic") is not True:
+            errors.append("strict runtime did not execute native FA4 Attention arithmetic")
+        if provenance.get("num_splits") != 1:
+            errors.append("strict runtime did not fix FA4 num_splits=1")
+        if provenance.get("deterministic_backward") is not True:
+            errors.append("strict runtime did not request deterministic FA4 backward")
+        if provenance.get("fa_api_source") != "flash_attn.cute.interface":
+            errors.append("strict runtime did not prove the FA4 CuTe API source")
+        if provenance.get("reference_only") is not False:
+            errors.append("strict runtime selected the reference core")
         strict_plans = provenance.get("strict_core_row_plans")
         if not isinstance(strict_plans, list) or not strict_plans:
             errors.append("strict no-Split-K execution plans are missing")
