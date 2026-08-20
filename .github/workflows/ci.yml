@@ -95,6 +95,18 @@ jobs:
         run: |
           python -m pytest tests/test_kv_cache_attention.py -v -k "not large and not gpu"
 
+      - name: Run WS2 Logprob Contract Tests (CPU-safe)
+        run: python -m pytest tests/test_logprob_contract.py -v
+
+      - name: Run WS2 Vocab-Parallel Logprob Tests (CPU-safe)
+        run: python -m pytest tests/test_vocab_parallel_logp.py -v
+
+      - name: Run WS2 Wrapper Interface and FFN Tests (CPU-safe)
+        run: |
+          python -m pytest -q \
+            tests/test_alignment_wrapper_interfaces.py \
+            tests/test_qwen_ffn.py
+
   docs:
     runs-on: ubuntu-latest
     steps:

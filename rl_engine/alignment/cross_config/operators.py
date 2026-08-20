@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping, Optional, cast
 
 import torch
 
+from rl_engine.kernels.logprob_contract import LogprobContract
 from rl_engine.kernels.semantic_registry import (
     OperatorInstanceProvenance,
     OperatorRequirements,
@@ -201,8 +202,13 @@ def selected_logprobs_with_operator(
     active_mask: Optional[torch.Tensor] = None,
     temperature: float = 1.0,
     output_dtype: torch.dtype = torch.float32,
+    contract: Optional[LogprobContract] = None,
+    tp_group: Any = None,
+    num_vocab_tiles: Optional[int] = None,
+    deterministic: bool = True,
+    validate: bool = True,
 ) -> torch.Tensor:
-    """Apply the repository selected-logprob interface with common mask semantics."""
+    """Apply legacy or contract-aware selected-logprob operators uniformly."""
 
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise ValueError("temperature must be finite and greater than zero")
@@ -219,13 +225,49 @@ def selected_logprobs_with_operator(
         mask = active_mask.to(device=logits.device, dtype=torch.bool)
         safe_token_ids = safe_token_ids.masked_fill(~mask, 0)
 
-    scaled_logits = logits.float() / float(temperature)
-    if hasattr(operator, "apply_fp32") and callable(operator.apply_fp32):
-        selected = operator.apply_fp32(scaled_logits, safe_token_ids)
-    elif callable(operator):
-        selected = operator(scaled_logits, safe_token_ids)
+    if contract is not None:
+        if not isinstance(contract, LogprobContract):
+            raise TypeError("contract must be a LogprobContract")
+        contract_mask = torch.tensor(contract.mask.active_mask, dtype=torch.bool)
+        if contract_mask.numel() != token_ids.numel():
+            raise ValueError("contract active_mask size must match token_ids")
+        if mask is not None and not torch.equal(contract_mask, mask.detach().cpu().reshape(-1)):
+            raise ValueError("active_mask must match contract.mask.active_mask")
+        kwargs: dict[str, Any] = {
+            "contract": contract,
+            "tp_group": tp_group,
+            "deterministic": deterministic,
+            "validate": validate,
+        }
+        if num_vocab_tiles is not None:
+            kwargs["num_vocab_tiles"] = num_vocab_tiles
+        if not callable(operator):
+            raise TypeError("contract-aware selected-logprob operator must be callable")
+        result = operator(
+            (logits / float(temperature)).reshape(-1, logits.shape[-1]),
+            safe_token_ids.reshape(-1),
+            **kwargs,
+        )
+        if isinstance(result, tuple):
+            if len(result) != 2:
+                raise TypeError("contract-aware selected-logprob operator must return (logp, lse)")
+            selected, lse = result
+            if not isinstance(selected, torch.Tensor) or not isinstance(lse, torch.Tensor):
+                raise TypeError("contract-aware selected-logprob operator must return (logp, lse)")
+            if lse.shape != safe_token_ids.reshape(-1).shape:
+                raise ValueError("vocab LSE output shape must match token_ids")
+        else:
+            selected = result
+        if isinstance(selected, torch.Tensor):
+            selected = selected.reshape(token_ids.shape)
     else:
-        raise TypeError("selected-logprob operator must be callable or expose apply_fp32")
+        scaled_logits = logits.float() / float(temperature)
+        if hasattr(operator, "apply_fp32") and callable(operator.apply_fp32):
+            selected = operator.apply_fp32(scaled_logits, safe_token_ids)
+        elif callable(operator):
+            selected = operator(scaled_logits, safe_token_ids)
+        else:
+            raise TypeError("selected-logprob operator must be callable or expose apply_fp32")
     if not isinstance(selected, torch.Tensor):
         raise TypeError("selected-logprob operator must return a torch.Tensor")
     if selected.shape != token_ids.shape:
