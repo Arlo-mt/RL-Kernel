@@ -133,7 +133,7 @@ Target: Building the most efficient RLHF toolchain for the open-source community
 # Support
 Don’t hesitate to ask!
 
-Contact the developers and community on the [Slack](https://rl-align.slack.com/join/shared_invite/zt-46bxj7uyt-gEK3xzwSJr_lppJsZolR~g#/shared-invite/email) if you need any help.
+Contact the developers and community in [Slack](https://rl-align.slack.com/join/shared_invite/zt-46bxj7uyt-gEK3xzwSJr_lppJsZolR~g#/shared-invite/email) if you need any help.
 
 [Open an issue](https://github.com/RL-Align/RL-Kernel/issues) if you find a bug in **RL-Kernel**.
 
