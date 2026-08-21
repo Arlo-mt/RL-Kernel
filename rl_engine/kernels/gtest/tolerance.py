@@ -14,6 +14,7 @@ Gates must obtain thresholds only through the resolvers defined here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass

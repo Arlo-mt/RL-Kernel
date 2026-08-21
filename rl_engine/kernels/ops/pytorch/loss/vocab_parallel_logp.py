@@ -485,6 +485,7 @@ class VocabParallelLogprobOp:
             tp_group=tp_group,
             num_vocab_tiles=num_vocab_tiles,
             validate=validate,
+            deterministic=deterministic,
             with_entropy=False,
             with_entropy_grad=False,
         )
@@ -500,6 +501,7 @@ class VocabParallelLogprobOp:
         num_vocab_tiles: int = DEFAULT_NUM_VOCAB_TILES,
         validate: bool = True,
         with_entropy_grad: bool = True,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return selected logprob, vocabulary LSE, and full-vocabulary entropy.
 
@@ -514,6 +516,7 @@ class VocabParallelLogprobOp:
             tp_group=tp_group,
             num_vocab_tiles=num_vocab_tiles,
             validate=validate,
+            deterministic=deterministic,
             with_entropy=True,
             with_entropy_grad=with_entropy_grad,
         )
@@ -527,6 +530,7 @@ class VocabParallelLogprobOp:
         tp_group: Any,
         num_vocab_tiles: int,
         validate: bool,
+        deterministic: bool,
         with_entropy: bool,
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
