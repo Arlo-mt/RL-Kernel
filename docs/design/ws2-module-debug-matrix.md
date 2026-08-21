@@ -41,3 +41,13 @@ logical ownership are intentionally not exposed as mismatch axes.
 Use the compact row first. The operator-specific secondary probes remain
 available for a focused follow-up only after the representative row reproduces
 the mismatch.
+
+## Report artifacts
+
+The matrix reporter is owned by RL-Kernel because it consumes the sealed
+cross-configuration attempt contract. It reads `actual.json`,
+`comparison.json`, and `token_diffs.pt` only after `COMPLETE` validation, so
+the report displays actual selected operators and the materialized topology,
+not merely requested flags. See
+[Cross-Configuration Drift Report](../usage/cross-config-drift-report.md) for
+the `.rlk-drift` bundle, desktop viewer, static image, and trace entry points.

@@ -300,6 +300,12 @@ setup(
         "cuda": ["flashinfer"],
         "rocm": ["aiter"],
         "vllm": ["vllm>=0.6.0"],
+        "drift-viewer": ["Pillow>=10", "PySide6>=6.6"],
+    },
+    entry_points={
+        "console_scripts": [
+            "rlk-drift-view=rl_engine.alignment.cross_config.drift_viewer:main",
+        ],
     },
     python_requires=">=3.10",
     include_package_data=True,
