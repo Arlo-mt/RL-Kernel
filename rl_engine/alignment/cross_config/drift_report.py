@@ -1,3 +1,4 @@
+# flake8: noqa: E501
 """Build self-contained profiler-style reports from cross-config artifacts.
 
 The reporter is deliberately downstream of execution.  It validates a sealed
@@ -19,7 +20,6 @@ from typing import Any
 import torch
 
 from rl_engine.alignment.cross_config.artifacts import ArtifactStore
-
 
 REPORT_SCHEMA_VERSION = 2
 _STATUS_LABELS = {"pass": "PASS", "warning": "WARN", "failure": "FAIL", "info": "INFO"}
@@ -182,46 +182,30 @@ def build_drift_report(
     cube = _plain_mapping(result_cube)
     metrics = _plain_mapping(cube.get("metrics"))
     axes = _plain_mapping(cube.get("axes"))
-    validation = _plain_mapping(
-        cube.get("metadata_validation") or manifest.get("validation")
-    )
+    validation = _plain_mapping(cube.get("metadata_validation") or manifest.get("validation"))
     provenance = _plain_mapping(
-        runtime_provenance
-        or cube.get("runtime_provenance")
-        or manifest.get("runtime_provenance")
+        runtime_provenance or cube.get("runtime_provenance") or manifest.get("runtime_provenance")
     )
     samples = [
-        _plain_mapping(item)
-        for item in manifest.get("samples", [])
-        if isinstance(item, Mapping)
+        _plain_mapping(item) for item in manifest.get("samples", []) if isinstance(item, Mapping)
     ]
     warnings = [
-        _plain_mapping(item)
-        for item in validation.get("warnings", [])
-        if isinstance(item, Mapping)
+        _plain_mapping(item) for item in validation.get("warnings", []) if isinstance(item, Mapping)
     ]
     failures = [
-        _plain_mapping(item)
-        for item in validation.get("failures", [])
-        if isinstance(item, Mapping)
+        _plain_mapping(item) for item in validation.get("failures", []) if isinstance(item, Mapping)
     ]
 
     max_abs_dlogp = _number(metrics.get("max_abs_dlogp"))
     warning_count = _number(metrics.get("warning_count"), default=0.0) or 0.0
     metadata_warning_count = (
-        _number(metrics.get("metadata_warning_count"), default=float(len(warnings)))
-        or 0.0
+        _number(metrics.get("metadata_warning_count"), default=float(len(warnings))) or 0.0
     )
     metadata_failure_count = (
-        _number(metrics.get("metadata_failure_count"), default=float(len(failures)))
-        or 0.0
+        _number(metrics.get("metadata_failure_count"), default=float(len(failures))) or 0.0
     )
-    runtime_fallback = bool(
-        metrics.get("runtime_fallback") or provenance.get("fallback")
-    )
-    strict_failure = bool(
-        metrics.get("runtime_strict_failure") or provenance.get("strict_failure")
-    )
+    runtime_fallback = bool(metrics.get("runtime_fallback") or provenance.get("fallback"))
+    strict_failure = bool(metrics.get("runtime_strict_failure") or provenance.get("strict_failure"))
     comparison_passed = metrics.get("passed") is True
 
     if strict_failure or metadata_failure_count > 0:
@@ -236,16 +220,12 @@ def build_drift_report(
         status = "pass"
 
     span = max(1.0, float(len(samples)))
-    has_timestamps = any(
-        _number(sample.get("start_ts")) is not None for sample in samples
-    )
+    has_timestamps = any(_number(sample.get("start_ts")) is not None for sample in samples)
     timeline_mode = "timestamp" if has_timestamps else "ordinal_diagnostic"
     events: list[dict[str, Any]] = []
 
     train_status = (
-        "failure"
-        if status == "failure"
-        else "warning" if status == "warning" else "pass"
+        "failure" if status == "failure" else "warning" if status == "warning" else "pass"
     )
     events.append(
         {
@@ -296,9 +276,7 @@ def build_drift_report(
         provenance.get("requested_backend"),
         "unknown backend",
     )
-    operator_status = (
-        "failure" if strict_failure else "warning" if runtime_fallback else "pass"
-    )
+    operator_status = "failure" if strict_failure else "warning" if runtime_fallback else "pass"
     events.append(
         {
             "id": "operator-backend",
@@ -315,8 +293,7 @@ def build_drift_report(
     worst_token = _plain_mapping(cube.get("worst_token"))
     if worst_token:
         marker_position = (
-            _number(worst_token.get("sample_position"), default=max(0.0, span - 0.5))
-            or 0.0
+            _number(worst_token.get("sample_position"), default=max(0.0, span - 0.5)) or 0.0
         )
         events.append(
             {
@@ -445,9 +422,7 @@ def build_drift_trace(report: Mapping[str, Any]) -> dict[str, Any]:
         tid = lane_ids.get(event_lane, lane_ids["Drift markers"])
         start = _number(event.get("start"), default=0.0) or 0.0
         end = _number(event.get("end"), default=start) or start
-        details = (
-            event.get("details") if isinstance(event.get("details"), Mapping) else {}
-        )
+        details = event.get("details") if isinstance(event.get("details"), Mapping) else {}
         args = {
             "event_id": str(event.get("id", "")),
             "status": str(event.get("status", status)),
@@ -455,9 +430,7 @@ def build_drift_trace(report: Mapping[str, Any]) -> dict[str, Any]:
             "timeline_note": normalized.get("timeline_note", ""),
             "details": details,
         }
-        color = event_colors.get(
-            str(event.get("status", "info")), "thread_state_running"
-        )
+        color = event_colors.get(str(event.get("status", "info")), "thread_state_running")
         if event.get("kind") == "marker":
             trace_events.append(
                 {
@@ -487,11 +460,7 @@ def build_drift_trace(report: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
-    metrics = (
-        normalized.get("metrics")
-        if isinstance(normalized.get("metrics"), Mapping)
-        else {}
-    )
+    metrics = _plain_mapping(normalized.get("metrics"))
     max_abs_dlogp = _number(metrics.get("max_abs_dlogp"))
     if max_abs_dlogp is not None:
         trace_events.append(
@@ -510,9 +479,7 @@ def build_drift_trace(report: Mapping[str, Any]) -> dict[str, Any]:
         "traceEvents": trace_events,
         "displayTimeUnit": "ms",
         "metadata": {
-            "report_title": normalized.get(
-                "title", "RL-Kernel cross-config drift report"
-            ),
+            "report_title": normalized.get("title", "RL-Kernel cross-config drift report"),
             "status": status,
             "timeline_mode": timeline_mode,
             "timeline_note": normalized.get("timeline_note", ""),
@@ -553,9 +520,7 @@ def write_drift_bundle(
     manifest = {
         "format": "rl_kernel.cross_config_drift",
         "bundle_version": 1,
-        "report_schema_version": normalized.get(
-            "schema_version", REPORT_SCHEMA_VERSION
-        ),
+        "report_schema_version": normalized.get("schema_version", REPORT_SCHEMA_VERSION),
         "files": [
             "manifest.json",
             "report.json",
@@ -567,12 +532,8 @@ def write_drift_bundle(
         "status": normalized.get("status", "info"),
     }
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            "manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2)
-        )
-        archive.writestr(
-            "report.json", json.dumps(normalized, ensure_ascii=True, indent=2)
-        )
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
+        archive.writestr("report.json", json.dumps(normalized, ensure_ascii=True, indent=2))
         archive.writestr("trace.json", json.dumps(trace, ensure_ascii=True, indent=2))
         if include_preview:
             preview = render_drift_report_image(normalized)
@@ -593,11 +554,7 @@ def load_drift_bundle(path: str | Path) -> dict[str, Any]:
             )
         report = json.loads(archive.read("report.json"))
         trace = json.loads(archive.read("trace.json"))
-        manifest = (
-            json.loads(archive.read("manifest.json"))
-            if "manifest.json" in names
-            else {}
-        )
+        manifest = json.loads(archive.read("manifest.json")) if "manifest.json" in names else {}
     return {"manifest": manifest, "report": report, "trace": trace}
 
 
@@ -624,9 +581,7 @@ def render_drift_report(report: Mapping[str, Any]) -> str:
     event_map = {str(event.get("id")): event for event in events}
 
     def x(value: float) -> float:
-        return (
-            left + max(0.0, min(timeline_span, value)) / timeline_span * timeline_width
-        )
+        return left + max(0.0, min(timeline_span, value)) / timeline_span * timeline_width
 
     svg_parts = [
         f'<svg class="timeline" viewBox="0 0 {width} {svg_height}" role="img" aria-label="Consistency drift timeline">',
@@ -652,11 +607,7 @@ def render_drift_report(report: Mapping[str, Any]) -> str:
         )
 
     for event in events:
-        lane_index = (
-            lanes.index(str(event.get("lane")))
-            if str(event.get("lane")) in lanes
-            else 0
-        )
+        lane_index = lanes.index(str(event.get("lane"))) if str(event.get("lane")) in lanes else 0
         ypos = top + lane_index * row_height
         status = str(event.get("status", "info"))
         color = _STATUS_COLORS.get(status, _STATUS_COLORS["info"])
@@ -694,11 +645,7 @@ def render_drift_report(report: Mapping[str, Any]) -> str:
     svg_parts.append("</svg>")
     svg = "".join(svg_parts)
 
-    metrics = (
-        normalized.get("metrics")
-        if isinstance(normalized.get("metrics"), Mapping)
-        else {}
-    )
+    metrics = _plain_mapping(normalized.get("metrics"))
     metric_cards = [
         ("Max |dlogp|", _format_number(metrics.get("max_abs_dlogp"))),
         ("Active tokens", _format_number(metrics.get("active_token_count"))),
@@ -717,14 +664,12 @@ def render_drift_report(report: Mapping[str, Any]) -> str:
         empty="No runtime provenance was recorded.",
     )
     validation_html = _render_validation(normalized.get("validation"))
-    event_json = json.dumps(
-        event_map, ensure_ascii=True, separators=(",", ":")
-    ).replace("<", "\\u003c")
+    event_json = json.dumps(event_map, ensure_ascii=True, separators=(",", ":")).replace(
+        "<", "\\u003c"
+    )
     status = str(normalized.get("status", "info"))
     status_color = _STATUS_COLORS.get(status, _STATUS_COLORS["info"])
-    title = html.escape(
-        str(normalized.get("title", "RL-Kernel cross-config drift report"))
-    )
+    title = html.escape(str(normalized.get("title", "RL-Kernel cross-config drift report")))
     timeline_note = html.escape(str(normalized.get("timeline_note", "")))
 
     return f"""<!doctype html>
@@ -791,14 +736,10 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     ruler/grid, thin event bars, and tabular details below the timeline.
     """
 
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     normalized = _plain_mapping(report)
-    metrics = (
-        normalized.get("metrics")
-        if isinstance(normalized.get("metrics"), Mapping)
-        else {}
-    )
+    metrics = _plain_mapping(normalized.get("metrics"))
     events = [_plain_mapping(event) for event in normalized.get("events", [])]
     status = str(normalized.get("status", "info"))
     status_color = _REPORT_IMAGE_COLORS.get(status, _REPORT_IMAGE_COLORS["info"])
@@ -856,8 +797,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     write(
         width - 30,
         12,
-        "static report  |  schema v"
-        + str(normalized.get("schema_version", REPORT_SCHEMA_VERSION)),
+        "static report  |  schema v" + str(normalized.get("schema_version", REPORT_SCHEMA_VERSION)),
         tiny,
         "#b7c0c8",
         anchor="ra",
@@ -872,16 +812,12 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     write(34, 101, "run / audit replay", tiny, muted)
     write(180, 101, normalized.get("timeline_note", ""), tiny, muted)
     badge_text = _STATUS_LABELS.get(status, status.upper())
-    draw.rectangle(
-        (width - 188, 61, width - 34, 101), fill=panel_bg, outline=status_color, width=2
-    )
+    draw.rectangle((width - 188, 61, width - 34, 101), fill=panel_bg, outline=status_color, width=2)
     write(width - 111, 81, badge_text, label_font, status_color, anchor="mm")
 
     # Compact metric strip. These are values, not dashboard cards.
     strip_y = 127
-    draw.rectangle(
-        (34, strip_y, width - 34, strip_y + 64), fill=panel_bg, outline=line, width=1
-    )
+    draw.rectangle((34, strip_y, width - 34, strip_y + 64), fill=panel_bg, outline=line, width=1)
     strip_items = [
         ("MAX |DLOGP|", _format_number(metrics.get("max_abs_dlogp")), status_color),
         (
@@ -916,9 +852,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     write(52, timeline_y + 14, "CAPTURED EXECUTION", section_font, text_color)
     mode = str(normalized.get("timeline_mode", "diagnostic"))
     mode_color = (
-        _REPORT_IMAGE_COLORS["yellow"]
-        if mode != "timestamp"
-        else _REPORT_IMAGE_COLORS["blue"]
+        _REPORT_IMAGE_COLORS["yellow"] if mode != "timestamp" else _REPORT_IMAGE_COLORS["blue"]
     )
     write(width - 52, timeline_y + 18, mode, tiny, mode_color, anchor="ra")
 
@@ -938,9 +872,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     chart_top = timeline_y + 91
     row_height = 62
     chart_bottom = chart_top + row_height * len(lanes)
-    max_end = max(
-        (_number(event.get("end"), default=1.0) or 1.0 for event in events), default=1.0
-    )
+    max_end = max((_number(event.get("end"), default=1.0) or 1.0 for event in events), default=1.0)
     span = max(1.0, max_end)
 
     def x_for(value: float) -> int:
@@ -998,9 +930,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
         if event.get("kind") == "marker":
             mid = x_for(start)
             draw.line((mid, y0 + 6, mid, y0 + row_height - 6), fill=color, width=3)
-            draw.polygon(
-                [(mid - 7, y0 + 7), (mid + 7, y0 + 7), (mid, y0 + 17)], fill=color
-            )
+            draw.polygon([(mid - 7, y0 + 7), (mid + 7, y0 + 7), (mid, y0 + 17)], fill=color)
             marker_label = fit(event.get("label", "marker"), 34)
             label_x = mid + 14 if mid <= right - 250 else max(left + 10, mid - 240)
             write(label_x, y0 + 22, marker_label, tiny, color)
@@ -1026,11 +956,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
 
     # Keep the comparison track meaningful even when the dump only contains a
     # scalar worst-token summary instead of per-token samples.
-    worst = (
-        normalized.get("worst_token")
-        if isinstance(normalized.get("worst_token"), Mapping)
-        else {}
-    )
+    worst = _plain_mapping(normalized.get("worst_token"))
     comparison_y = chart_top + 5 * row_height + 31
     draw.line(
         (left + 18, comparison_y, right - 18, comparison_y),
@@ -1091,12 +1017,8 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     bar_x = 54
     bar_y = summary_y + 91
     bar_width = half_width - 110
-    rect(
-        (bar_x, bar_y, bar_x + bar_width, bar_y + 24), _REPORT_IMAGE_COLORS["track"], 4
-    )
-    fill_width = (
-        int(min(1.0, max_value / max(max_value, 1.0)) * bar_width) if max_value else 0
-    )
+    rect((bar_x, bar_y, bar_x + bar_width, bar_y + 24), _REPORT_IMAGE_COLORS["track"], 4)
+    fill_width = int(min(1.0, max_value / max(max_value, 1.0)) * bar_width) if max_value else 0
     if fill_width:
         rect((bar_x, bar_y, bar_x + max(8, fill_width), bar_y + 24), status_color, 4)
     write(bar_x, bar_y + 30, "0", tiny, muted)
@@ -1108,11 +1030,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
         muted,
         anchor="ra",
     )
-    worst = (
-        normalized.get("worst_token")
-        if isinstance(normalized.get("worst_token"), Mapping)
-        else {}
-    )
+    worst = _plain_mapping(normalized.get("worst_token"))
     worst_text = (
         f"worst token: sample={worst.get('sample_position', '-')}  token={worst.get('token_position', '-')}  "
         f"|dlogp|={_format_number(worst.get('abs_dlogp'))}"
@@ -1120,20 +1038,14 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     write(54, summary_y + 157, fit(worst_text, 92), mono, text_color)
     right_x = 34 + half_width + half_gap + 20
     write(right_x, summary_y + 18, "SELECTED EVENT", section_font)
-    warning_items = (
-        normalized.get("validation")
-        if isinstance(normalized.get("validation"), Mapping)
-        else {}
-    )
+    warning_items = _plain_mapping(normalized.get("validation"))
     warnings = warning_items.get("warnings") or []
     failures = warning_items.get("failures") or []
     issue_text = "No anomaly recorded."
     if failures or warnings:
         first = (failures or warnings)[0]
         first = first if isinstance(first, Mapping) else {"message": first}
-        issue_text = (
-            f"{str(first.get('code', 'validation'))}: {str(first.get('message', ''))}"
-        )
+        issue_text = f"{str(first.get('code', 'validation'))}: {str(first.get('message', ''))}"
     elif worst:
         issue_text = (
             f"worst token: sample={worst.get('sample_position', '-')}  "
@@ -1171,9 +1083,7 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
     axes_rows = key_value_rows(normalized.get("axes"))
     provenance_rows = key_value_rows(normalized.get("runtime_provenance"))
 
-    def table(
-        rows: list[tuple[str, str]], x0: int, y0: int, w: int, max_rows: int = 8
-    ) -> None:
+    def table(rows: list[tuple[str, str]], x0: int, y0: int, w: int, max_rows: int = 8) -> None:
         row_y = y0
         for index, (key, value) in enumerate(rows[:max_rows]):
             if index % 2 == 0:
@@ -1186,12 +1096,8 @@ def render_drift_report_image(report: Mapping[str, Any], *, width: int = 2400) -
             write(x0 + 14, row_y + 8, "not recorded", small, muted)
 
     table(axes_rows, 54, table_y + 66, half_width - 40)
-    table(
-        provenance_rows, 34 + half_width + half_gap + 20, table_y + 66, half_width - 40
-    )
-    validation_label = (
-        "VALIDATION: PASS" if status == "pass" else f"VALIDATION: {badge_text}"
-    )
+    table(provenance_rows, 34 + half_width + half_gap + 20, table_y + 66, half_width - 40)
+    validation_label = "VALIDATION: PASS" if status == "pass" else f"VALIDATION: {badge_text}"
     if failures or warnings:
         validation_label = f"VALIDATION: {badge_text} | {fit(issue_text, 86)}"
     write(70, height - 58, validation_label, tiny, status_color)
@@ -1232,9 +1138,7 @@ def _worst_token(
     active_mask: torch.Tensor,
 ) -> dict[str, Any] | None:
     if absolute_diff.shape != active_mask.shape:
-        raise ValueError(
-            "token_diffs absolute_diff and active_mask must have matching shapes"
-        )
+        raise ValueError("token_diffs absolute_diff and active_mask must have matching shapes")
     if not bool(active_mask.any()):
         return None
     values = absolute_diff.masked_fill(~active_mask, -1.0)
@@ -1257,18 +1161,12 @@ def _samples_from_identity(
     token_ids = logical_identity.get("token_ids")
     samples: list[dict[str, Any]] = []
     for index in range(active_mask.shape[0] if active_mask.ndim else 0):
-        row = (
-            token_ids[index]
-            if isinstance(token_ids, list) and index < len(token_ids)
-            else None
-        )
+        row = token_ids[index] if isinstance(token_ids, list) and index < len(token_ids) else None
         samples.append(
             {
                 "sample_position": index,
                 "sample_index": index,
-                "token_count": (
-                    len(row) if isinstance(row, list) else int(active_mask.shape[-1])
-                ),
+                "token_count": (len(row) if isinstance(row, list) else int(active_mask.shape[-1])),
                 "active_token_count": int(active_mask[index].sum().item()),
             }
         )
@@ -1292,9 +1190,7 @@ def _render_validation(validation: Any) -> str:
     warnings = validation.get("warnings") or []
     failures = validation.get("failures") or []
     if not warnings and not failures:
-        return (
-            '<div class="pass">PASS: no metadata validation warnings or failures.</div>'
-        )
+        return '<div class="pass">PASS: no metadata validation warnings or failures.</div>'
     rows = []
     for kind, items in (("failure", failures), ("warning", warnings)):
         for item in items:

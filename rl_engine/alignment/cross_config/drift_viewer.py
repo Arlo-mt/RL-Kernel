@@ -10,7 +10,6 @@ from typing import Any
 
 from rl_engine.alignment.cross_config.drift_report import load_drift_bundle
 
-
 _LANES = [
     ("Audit", None),
     ("Training audit", "Training audit"),
@@ -63,34 +62,24 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
     status = str(report.get("status", "info"))
     status_color = _COLORS.get(status, _COLORS["info"])
 
-    class EventItem(QtWidgets.QGraphicsRectItem):
+    class EventItem(QtWidgets.QGraphicsRectItem):  # type: ignore[name-defined]
         def __init__(self, rect: Any, event: dict[str, Any], color: str) -> None:
             super().__init__(rect)
             self.event = event
             self.setBrush(QtGui.QColor(color))
             self.setPen(QtGui.QPen(QtGui.QColor(color)))
-            self.setFlag(
-                QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True
-            )
+            self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
             self.setToolTip(str(event.get("label", event.get("id", "event"))))
 
-    class TimelineView(QtWidgets.QGraphicsView):
+    class TimelineView(QtWidgets.QGraphicsView):  # type: ignore[name-defined]
         def __init__(self, scene: Any) -> None:
             super().__init__(scene)
             self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
             self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
-            self.setTransformationAnchor(
-                QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse
-            )
-            self.setResizeAnchor(
-                QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter
-            )
-            self.setHorizontalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn
-            )
-            self.setVerticalScrollBarPolicy(
-                QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
+            self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter)
+            self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+            self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.setStyleSheet("QGraphicsView { border: 0; background: #ffffff; }")
 
         def wheelEvent(self, event: Any) -> None:
@@ -98,7 +87,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
             self.scale(factor, 1.0)
             event.accept()
 
-    class Window(QtWidgets.QMainWindow):
+    class Window(QtWidgets.QMainWindow):  # type: ignore[name-defined]
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle(f"RL-Kernel Cross-Config Drift - {title}")
@@ -125,9 +114,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
             )
             self._details = QtWidgets.QPlainTextEdit()
             self._details.setReadOnly(True)
-            self._details.setPlaceholderText(
-                "Select an event to inspect its audit details."
-            )
+            self._details.setPlaceholderText("Select an event to inspect its audit details.")
             self._details.setStyleSheet(
                 "QPlainTextEdit { background: #ffffff; border-top: 1px solid #c9ced3; "
                 "font-family: Consolas; font-size: 10pt; padding: 8px; }"
@@ -148,9 +135,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
                     groups[label] = item
                     continue
                 parent = groups.get(
-                    "Audit"
-                    if event_lane in {"Training audit", "Rollout samples"}
-                    else "Execution"
+                    "Audit" if event_lane in {"Training audit", "Rollout samples"} else "Execution"
                 )
                 if event_lane == "Drift markers":
                     parent = groups.get("Validation")
@@ -163,10 +148,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
             self._tree.expandAll()
 
         def _x_for(self, value: float) -> float:
-            return (
-                120.0
-                + max(0.0, min(self._span, value)) / self._span * self._scene_width
-            )
+            return 120.0 + max(0.0, min(self._span, value)) / self._span * self._scene_width
 
         def _build_scene(self) -> None:
             font = QtGui.QFont("Segoe UI", 9)
@@ -186,11 +168,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
                 label.setDefaultTextColor(muted)
                 label.setPos(x + 3, -24)
 
-            lane_index = {
-                name: index
-                for index, (_, name) in enumerate(_LANES)
-                if name is not None
-            }
+            lane_index = {name: index for index, (_, name) in enumerate(_LANES) if name is not None}
             for index, (label, event_lane) in enumerate(_LANES):
                 y = index * self._row_height
                 self._scene.addLine(
@@ -246,9 +224,7 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
                 "QToolBar { background: #ffffff; border-bottom: 1px solid #c9ced3; }"
             )
             status_label = QtWidgets.QLabel(f"  {title}    STATUS: {status.upper()}  ")
-            status_label.setStyleSheet(
-                f"color: {status_color}; font-weight: 600; padding: 5px;"
-            )
+            status_label.setStyleSheet(f"color: {status_color}; font-weight: 600; padding: 5px;")
             toolbar.addWidget(status_label)
             fit_button = QtWidgets.QAction("Fit", self)
             fit_button.triggered.connect(
@@ -284,16 +260,12 @@ def _run_qt(bundle_path: Path) -> int:  # pragma: no cover - GUI path
 
         def _show_selected(self) -> None:
             selected = self._scene.selectedItems()
-            self._details.setPlainText(
-                _format_event(selected[0].event) if selected else ""
-            )
+            self._details.setPlainText(_format_event(selected[0].event) if selected else "")
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     window = Window()
     window.show()
-    window._view.fitInView(
-        window._scene.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio
-    )
+    window._view.fitInView(window._scene.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
     return app.exec()
 
 

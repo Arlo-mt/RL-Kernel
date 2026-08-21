@@ -1014,9 +1014,13 @@ def resolve_logprob_threshold(dtype: Any) -> float:
         raise ValueError(f"invalid WS1 logprob threshold for dtype {dtype_name!r}")
     return threshold
 
+
 def tolerance_contract_fingerprint() -> str:
-    canonical = json.dumps(load_contract(), ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    canonical = json.dumps(
+        load_contract(), ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
 
 # Private compatibility alias for callers outside this package that have not
 # migrated to the public normalizer yet.

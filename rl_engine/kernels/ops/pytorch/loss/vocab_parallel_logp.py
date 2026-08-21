@@ -372,7 +372,9 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             finite_row = torch.isfinite(lse)
             lse_safe = torch.where(finite_row, lse, torch.zeros_like(lse))
             probabilities = (z_masked - lse_safe.unsqueeze(1)).exp()
-            probabilities = torch.where(finite_row.unsqueeze(1), probabilities, torch.zeros_like(probabilities))
+            probabilities = torch.where(
+                finite_row.unsqueeze(1), probabilities, torch.zeros_like(probabilities)
+            )
             finite_logits = torch.isfinite(z_masked)
             log_gap = torch.where(
                 finite_logits,
@@ -424,7 +426,9 @@ class _VocabParallelLogprobFunction(torch.autograd.Function):
             grad = grad + grad_lse.unsqueeze(1) * p
         if ctx.with_entropy_grad and grad_entropy is not None:
             entropy_input = lse_safe.unsqueeze(1) - z_masked - entropy.unsqueeze(1)
-            entropy_input = torch.where(torch.isfinite(z_masked), entropy_input, torch.zeros_like(entropy_input))
+            entropy_input = torch.where(
+                torch.isfinite(z_masked), entropy_input, torch.zeros_like(entropy_input)
+            )
             grad = grad + grad_entropy.unsqueeze(1) * p * entropy_input
         if bool(padding_cols.any()):
             grad = grad.masked_fill(padding_cols.unsqueeze(0), 0.0)

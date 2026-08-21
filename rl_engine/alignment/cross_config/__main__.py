@@ -52,9 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report",
         help="render a sealed attempt as an offline drift report",
     )
-    report.add_argument(
-        "attempt_dir", type=Path, help="Completed cross-config attempt directory"
-    )
+    report.add_argument("attempt_dir", type=Path, help="Completed cross-config attempt directory")
     report.add_argument(
         "--output",
         "-o",
@@ -173,9 +171,7 @@ def _report(args: argparse.Namespace) -> dict[str, Any]:
     report = build_cross_config_attempt_report(args.attempt_dir, title=args.title)
     suffix = args.output.suffix.lower()
     if suffix == ".rlk-drift":
-        output = write_drift_bundle(
-            report, args.output, include_preview=not args.no_preview
-        )
+        output = write_drift_bundle(report, args.output, include_preview=not args.no_preview)
         artifact_type = "bundle"
     elif suffix in {".png", ".jpg", ".jpeg"}:
         output = write_drift_report_image(report, args.output)

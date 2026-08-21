@@ -58,14 +58,17 @@ class FrameworkOperatorIntegration:
         if not callable(native):
             raise TypeError("native operator must be callable")
         implementation = self.plan.implementation_for(normalized, self.target)
+        selected: Callable[..., Any]
         if implementation is Implementation.PRODUCTION:
             selected = native
         else:
-            selected = self._rl_kernel_operators.get(normalized)
-            if selected is None:
+            rl_kernel_operator = self._rl_kernel_operators.get(normalized)
+            if rl_kernel_operator is None:
                 raise RuntimeError(
-                    f"{self.framework} {normalized} selected RL-Kernel but no operator was installed"
+                    f"{self.framework} {normalized} selected RL-Kernel "
+                    "but no operator was installed"
                 )
+            selected = rl_kernel_operator
         result = selected(*args, **kwargs)
         backend_id = getattr(selected, "backend_id", None)
         if not isinstance(backend_id, str) or not backend_id.strip():

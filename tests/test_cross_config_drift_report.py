@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import rl_engine.alignment.cross_config.__main__ as cli_main
+from rl_engine.alignment.cross_config.artifacts import ArtifactStore
 from rl_engine.alignment.cross_config.drift_report import (
     build_cross_config_attempt_report,
     build_drift_report,
@@ -19,7 +20,6 @@ from rl_engine.alignment.cross_config.drift_report import (
     write_drift_report_image,
     write_drift_trace,
 )
-from rl_engine.alignment.cross_config.artifacts import ArtifactStore
 
 
 def _artifacts(*, with_timestamp: bool = False):
@@ -187,9 +187,7 @@ def test_report_prefers_actual_backend_and_timestamp_mode():
     }
 
     report = build_drift_report(replay_manifest=manifest, result_cube=cube)
-    operator = next(
-        event for event in report["events"] if event["id"] == "operator-backend"
-    )
+    operator = next(event for event in report["events"] if event["id"] == "operator-backend")
 
     assert report["timeline_mode"] == "timestamp"
     assert operator["label"] == "native.linear_logp"
@@ -199,9 +197,7 @@ def test_report_prefers_actual_backend_and_timestamp_mode():
 @pytest.mark.unit
 def test_rendered_report_is_self_contained_and_escapes_details(tmp_path: Path):
     manifest, cube = _artifacts()
-    manifest["validation"]["warnings"] = [
-        {"code": "bad<&", "message": "value </script>"}
-    ]
+    manifest["validation"]["warnings"] = [{"code": "bad<&", "message": "value </script>"}]
     cube["metadata_validation"] = manifest["validation"]
 
     report = build_drift_report(
@@ -315,10 +311,7 @@ def test_attempt_report_reads_only_sealed_cross_config_artifacts(tmp_path: Path)
     assert report["axes"]["rollout_tp"] == 2
     assert report["axes"]["rollout_cp"] == 2
     assert report["metrics"]["active_token_count"] == 2
-    assert (
-        report["runtime_provenance"]["operator_source"]
-        == "exact_resolution_and_instance"
-    )
+    assert report["runtime_provenance"]["operator_source"] == "exact_resolution_and_instance"
 
 
 @pytest.mark.unit
@@ -335,10 +328,7 @@ def test_cli_writes_offline_bundle_from_sealed_attempt(tmp_path: Path, capsys):
     attempt = _completed_attempt(tmp_path)
     output = tmp_path / "report.rlk-drift"
 
-    assert (
-        cli_main.main(["report", str(attempt), "--output", str(output), "--no-preview"])
-        == 0
-    )
+    assert cli_main.main(["report", str(attempt), "--output", str(output), "--no-preview"]) == 0
 
     assert output.is_file()
     assert "drift report: pass" in capsys.readouterr().err
