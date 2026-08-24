@@ -18,6 +18,8 @@ from typing import Any, Iterable, TypeVar
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
+# Stable identity shared by the training and rollout deterministic Attention
+# core.  Backend adapters may differ, but strict mode must report this ID.
 STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
 STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 
