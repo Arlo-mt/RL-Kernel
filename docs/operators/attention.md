@@ -144,6 +144,33 @@ python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2
   --output artifacts/ws2-cp-attention-drift.json
 ```
 
+### WS2 CP-aware dispatch
+
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_attention_op(contract)`. It validates explicit TP/CP ownership, fixed
+`(out, lse)` merge semantics, causal or packed-sequence offsets, and decode KV-cache identity
+before selecting a backend. Legacy `get_op("attention")` behavior remains unchanged.
+
+Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
+CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
+a silent fallback. See the
+[WS2 CP-aware Attention contract in PR #236](https://github.com/RL-Align/RL-Kernel/blob/feat/issue-235-attention-cp-contract/docs/design/ws2-cp-attention-contract.md).
+
+Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
+`disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
+boundaries, FP32 `(out, lse)` merge order, final downcast point, backend, and fallback reason.
+Runtime-selected `auto` plans are diagnostic only unless both training and rollout export and
+validate the same actual plan.
+
+The rank-aware drift benchmark can emit a CPU smoke artifact or a torchrun-friendly GPU report:
+
+```bash
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2 \
+  --cp-world-sizes 2 --kv-chunk-sizes none,1 --include-backward \
+  --output artifacts/ws2-cp-attention-drift.json
+```
+
 ## Accuracy
 
 Reference semantics (`forward_fp32`, fp32 accumulation, TF32/autocast disabled):

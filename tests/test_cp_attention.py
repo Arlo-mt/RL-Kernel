@@ -14,8 +14,12 @@ import math
 import pytest
 import torch
 
+from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionPartialState,
+    DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
     compare_cp_attention_backward,
     merge_attention_partial_states,
@@ -81,6 +85,28 @@ def _full_lse(q, k, *, causal, scale=None, key_padding_mask=None):
     if key_padding_mask is not None:
         scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
     return torch.logsumexp(scores, dim=-1)
+
+
+def test_strict_attention_core_freezes_plan_and_final_write():
+    q, k, v = _qkv(1, 3, 4, seed=17, dtype=torch.bfloat16)
+    core = DeterministicAttentionCore()
+    result = core.forward_with_lse(q, k, v, output_dtype=torch.bfloat16)
+
+    assert result.out.dtype is torch.bfloat16
+    assert result.lse.dtype is torch.float32
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
+    assert result.provenance["merge_order"] == "global_block_index"
+    assert result.provenance["accum_dtype"] == "fp32"
+    assert result.provenance["downcast_at"] == "final_write"
+    assert result.provenance["fallback"] is False
+    assert result.provenance["native_attention_arithmetic"] is False
+
+
+@pytest.mark.parametrize("split_kv", [SplitKVSpec.fixed(2), SplitKVSpec.auto()])
+def test_strict_attention_core_rejects_split_kv(split_kv):
+    with pytest.raises(ValueError, match="requires Split-KV to be disabled"):
+        DeterministicAttentionCore(split_kv=split_kv)
 
 
 def test_cp1_matches_native_attention_and_exports_lse():
@@ -626,6 +652,27 @@ def test_invalid_scale_fails_before_attention_math(scale):
         op.forward_fp32_with_lse(q, k, v, scale=scale)
 
 
+def test_forward_reference_provenance_does_not_claim_production_communication():
+    provenance = DeterministicCPAttentionReferenceOp.execution_provenance(
+        8,
+        cp_world_size=2,
+        kv_chunk_size=2,
+    )
+
+    assert provenance["execution_scope"] == "logical_single_process_cp_reference"
+    assert provenance["query_scope"] == "logical_global_query_reference"
+    assert provenance["kv_scope"] == "logical_owner_local_cp_shards"
+    assert provenance["production_cp_protocol"] == "ag_query_local_kv_rs_out_lse"
+    assert provenance["communication_executed"] == "none"
+    assert provenance["merge_order"] == "global_block_index"
+    plans = provenance["actual_split_kv_plans"]
+    assert [plan["owner_cp_rank"] for plan in plans] == [0, 1]
+    assert [plan["actual_split_boundaries"] for plan in plans] == [
+        [[0, 2], [2, 4]],
+        [[4, 6], [6, 8]],
+    ]
+
+
 def test_qkv_dtype_and_floating_contract_fails_closed():
     op = DeterministicCPAttentionReferenceOp()
     q, k, v = _qkv(1, 4, 4, seed=25, heads=4, kv_heads=2, dim=8)
@@ -690,9 +737,11 @@ def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
 
 
-def test_strict_reference_is_bitwise_across_batch_cp_and_backward():
-    q, k, v = _qkv(2, 4, 8, seed=41, heads=4, kv_heads=2, dim=8)
-    dout = torch.randn_like(q)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
+    """The strict candidate must not change arithmetic with batch/CP shape."""
+
+    q, k, v = _qkv(2, 5, 9, seed=41, dtype=dtype, heads=4, kv_heads=2, dim=8)
     op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
     cp1_out, cp1_lse = op.forward_with_lse(
@@ -708,11 +757,27 @@ def test_strict_reference_is_bitwise_across_batch_cp_and_backward():
     )
     assert torch.equal(cp1_out, cp2_out)
     assert torch.equal(cp1_lse, cp2_lse)
-    assert torch.equal(cp1_out[:1], single_out)
-    assert torch.equal(cp1_lse[:1], single_lse)
 
-    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=3)
+    single_out, single_lse = op.forward_with_lse(
+        q[:1],
+        k[:1],
+        v[:1],
+        cp_world_size=1,
+        kv_chunk_size=1,
+    )
+    assert torch.equal(single_out, cp1_out[:1])
+    assert torch.equal(single_lse, cp1_lse[:1])
+
+
+def test_strict_core_backward_is_bitwise_invariant_to_cp_schedule():
+    q, k, v = _qkv(1, 4, 8, seed=42, dtype=torch.float32, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn_like(q)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=None)
     cp2 = op.backward_reference(q, k, v, dout, cp_world_size=2, kv_chunk_size=3)
+    assert torch.equal(cp1.out, cp2.out)
+    assert torch.equal(cp1.lse, cp2.lse)
     assert torch.equal(cp1.gradients.dq, cp2.gradients.dq)
     assert torch.equal(cp1.gradients.dk, cp2.gradients.dk)
     assert torch.equal(cp1.gradients.dv, cp2.gradients.dv)
