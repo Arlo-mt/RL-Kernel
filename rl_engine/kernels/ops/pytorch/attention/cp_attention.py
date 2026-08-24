@@ -17,14 +17,14 @@ from typing import Optional, Sequence
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVExecutionPlan,
     SplitKVMode,
     SplitKVRuntimeCoordinate,
     SplitKVRuntimePlanEntry,
     SplitKVRuntimePlanSet,
     SplitKVSpec,
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
@@ -82,9 +82,7 @@ class DeterministicAttentionCore:
         if not isinstance(self.split_kv, SplitKVSpec):
             raise TypeError("split_kv must be a SplitKVSpec")
         if self.split_kv.mode is not SplitKVMode.DISABLED:
-            raise ValueError(
-                "strict deterministic Attention core requires Split-KV to be disabled"
-            )
+            raise ValueError("strict deterministic Attention core requires Split-KV to be disabled")
         self._reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
     def forward_with_lse(

@@ -16,11 +16,11 @@ import torch
 
 from rl_engine.kernels.attention_contract import SplitKVSpec
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     AttentionPartialState,
     DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
-    STRICT_ATTENTION_CORE_ID,
-    STRICT_ATTENTION_SCHEDULE_ID,
     compare_cp_attention_backward,
     merge_attention_partial_states,
     split_kv_execution_plan_provenance,
