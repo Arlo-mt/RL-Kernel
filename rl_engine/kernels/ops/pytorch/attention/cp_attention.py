@@ -328,109 +328,6 @@ class DeterministicCPAttentionReferenceOp:
             kv_chunk_size=kv_chunk_size,
             backend="deterministic_cp_reference",
         )
-        return {
-            "execution_scope": "logical_single_process_cp_reference",
-            "runtime_verified": False,
-            "input_boundary": "projected_post_qk_norm_post_rope_qkv",
-            "query_scope": "logical_global_query_reference",
-            "kv_scope": "logical_owner_local_cp_shards",
-            "production_cp_protocol": "ag_query_local_kv_rs_out_lse",
-            "communication_executed": "none",
-            "partial_state": "fp32_out_attention_lse",
-            "merge_order": "global_block_index",
-            "accum_dtype": "fp32",
-            "downcast_at": "final_write",
-            "requested_split_kv_policy": "disabled" if kv_chunk_size is None else "fixed",
-            "requested_split_kv_size": kv_chunk_size,
-            "actual_split_kv_plans": plans,
-        }
-
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
-        cp_world_size: int = 1,
-        kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        return self.forward(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
-        )
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
-        cp_world_size: int = 1,
-        kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute CP attention with fp32 accumulation and final input-dtype write."""
-
-        out, _ = self.forward_with_lse(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
-            output_dtype=q.dtype,
-        )
-        return out
-
-    def forward_fp32(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
-        cp_world_size: int = 1,
-        kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute CP attention with fp32 accumulation and fp32 output."""
-
-        out, _ = self.forward_fp32_with_lse(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
-        )
         return out
 
     def forward_with_lse(
@@ -457,6 +354,18 @@ class DeterministicCPAttentionReferenceOp:
 
         resolved_output_dtype = q.dtype if output_dtype is None else output_dtype
         _validate_output_dtype(resolved_output_dtype)
+        out, lse = self._forward_impl(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+        )
         if self.strict_bitwise:
             out, lse = self._forward_strict_bitwise(
                 q,
@@ -1236,6 +1145,7 @@ def build_reference_split_kv_runtime_plan_set(
         raise ValueError("kv_chunk_size must be >= 1 when provided")
 
     entries: list[SplitKVRuntimePlanEntry] = []
+    boundaries: tuple[tuple[int, int], ...]
     for batch_index, total in enumerate(totals):
         owner_ranges = _split_bounds(total, cp_world_size)
         for tp_rank in range(tp_world_size):
