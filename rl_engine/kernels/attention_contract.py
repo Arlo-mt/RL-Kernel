@@ -18,6 +18,10 @@ from typing import Any, Iterable, TypeVar
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
+STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
+
+
 class AttentionContractError(ValueError):
     """Raised when attention metadata does not describe a valid invocation."""
 
@@ -830,6 +834,79 @@ def validate_split_kv_plan_set_alignment(
             ) from exc
 
 
+def build_split_kv_runtime_plan_set(
+    total_kv_tokens: Iterable[int],
+    *,
+    tp_world_size: int,
+    cp_world_size: int,
+    split_kv: SplitKVSpec,
+    backend: str = "contract_reference",
+) -> SplitKVRuntimePlanSet:
+    """Build a complete owner-local plan set for contract tests and adapters."""
+
+    totals = _integer_tuple(total_kv_tokens, "total_kv_tokens")
+    if not totals or any(total < cp_world_size for total in totals):
+        raise AttentionContractError(
+            "contract plan sets require at least one KV token per CP owner"
+        )
+    tp_world_size = _positive_int(tp_world_size, "tp_world_size")
+    cp_world_size = _positive_int(cp_world_size, "cp_world_size")
+    if not isinstance(split_kv, SplitKVSpec):
+        raise AttentionContractError("split_kv must be a SplitKVSpec")
+
+    entries: list[SplitKVRuntimePlanEntry] = []
+    for batch_index, total in enumerate(totals):
+        base = total // cp_world_size
+        remainder = total % cp_world_size
+        owner_ranges: list[tuple[int, int]] = []
+        start = 0
+        for owner_cp_rank in range(cp_world_size):
+            end = start + base + (1 if owner_cp_rank < remainder else 0)
+            owner_ranges.append((start, end))
+            start = end
+        for tp_rank in range(tp_world_size):
+            for cp_rank in range(cp_world_size):
+                for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    local_total = owner_end - owner_start
+                    local = split_kv.resolve(local_total, backend=backend)
+                    execution = SplitKVExecutionPlan(
+                        requested_mode=local.requested_mode,
+                        requested_split_size=local.requested_split_size,
+                        actual_mode=local.actual_mode,
+                        actual_split_size=local.actual_split_size,
+                        boundaries=tuple(
+                            (owner_start + start, owner_start + end)
+                            for start, end in local.boundaries
+                        ),
+                        merge_order=local.merge_order,
+                        acc_dtype=local.acc_dtype,
+                        downcast_at=local.downcast_at,
+                        backend=local.backend,
+                        source=local.source,
+                        fallback=local.fallback,
+                        fallback_reason=local.fallback_reason,
+                    )
+                    entries.append(
+                        SplitKVRuntimePlanEntry(
+                            coordinate=SplitKVRuntimeCoordinate(
+                                batch_index=batch_index,
+                                tp_rank=tp_rank,
+                                cp_rank=cp_rank,
+                                owner_cp_rank=owner_cp_rank,
+                            ),
+                            expected_kv_range=(owner_start, owner_end),
+                            execution=execution,
+                        )
+                    )
+    return SplitKVRuntimePlanSet(
+        batch_size=len(totals),
+        tp_world_size=tp_world_size,
+        cp_world_size=cp_world_size,
+        total_kv_tokens=totals,
+        entries=tuple(entries),
+    )
+
+
 def _format_split_kv_coordinates(
     coordinates: Iterable[SplitKVRuntimeCoordinate],
 ) -> list[dict[str, int]]:
@@ -1441,12 +1518,15 @@ __all__ = [
     "RoPESpec",
     "RoPEState",
     "ShardingSpec",
+    "build_split_kv_runtime_plan_set",
     "SplitKVExecutionPlan",
     "SplitKVMode",
     "SplitKVRuntimeCoordinate",
     "SplitKVRuntimePlanEntry",
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
+    "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
 ]

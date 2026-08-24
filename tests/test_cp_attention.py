@@ -688,3 +688,25 @@ def test_gapped_partial_ranges_raise():
 
 def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
+
+
+def test_strict_reference_is_bitwise_across_batch_cp_and_backward():
+    q, k, v = _qkv(2, 4, 8, seed=41, heads=4, kv_heads=2, dim=8)
+    dout = torch.randn_like(q)
+    op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    cp1_out, cp1_lse = op.forward_with_lse(q, k, v, cp_world_size=1, kv_chunk_size=3)
+    cp2_out, cp2_lse = op.forward_with_lse(q, k, v, cp_world_size=2, kv_chunk_size=3)
+    single_out, single_lse = op.forward_with_lse(
+        q[:1], k[:1], v[:1], cp_world_size=1, kv_chunk_size=3
+    )
+    assert torch.equal(cp1_out, cp2_out)
+    assert torch.equal(cp1_lse, cp2_lse)
+    assert torch.equal(cp1_out[:1], single_out)
+    assert torch.equal(cp1_lse[:1], single_lse)
+
+    cp1 = op.backward_reference(q, k, v, dout, cp_world_size=1, kv_chunk_size=3)
+    cp2 = op.backward_reference(q, k, v, dout, cp_world_size=2, kv_chunk_size=3)
+    assert torch.equal(cp1.gradients.dq, cp2.gradients.dq)
+    assert torch.equal(cp1.gradients.dk, cp2.gradients.dk)
+    assert torch.equal(cp1.gradients.dv, cp2.gradients.dv)
