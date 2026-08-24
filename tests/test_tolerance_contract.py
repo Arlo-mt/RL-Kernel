@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
+import json
 import math
 
 import pytest
 import torch
 
+from rl_engine.kernels.gtest import tolerance as tolerance_module
 from rl_engine.kernels.gtest.tolerance import (
     CHAIN_AGGREGATE_METRICS,
     JUDGMENTS,
@@ -26,8 +30,10 @@ from rl_engine.kernels.gtest.tolerance import (
     resolve_chain_aggregate_thresholds,
     resolve_comparison_roles,
     resolve_dtype_policy,
+    resolve_logprob_threshold,
     resolve_tolerance,
     resolve_tolerance_support,
+    tolerance_contract_fingerprint,
     validate_backend_provenance,
     validate_contract_schema,
 )

@@ -17,11 +17,14 @@ from typing import Optional, Sequence
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVExecutionPlan,
     SplitKVMode,
     SplitKVRuntimeCoordinate,
     SplitKVRuntimePlanEntry,
     SplitKVRuntimePlanSet,
+    SplitKVSpec,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
@@ -54,6 +57,79 @@ class AttentionPartialState:
             raise ValueError("block_start must be non-negative")
         if self.block_end < self.block_start:
             raise ValueError("block_end must be >= block_start")
+
+
+@dataclass(frozen=True)
+class DeterministicAttentionCoreResult:
+    """Strict-core output and the exact arithmetic plan used for it."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    provenance: dict[str, object]
+
+
+class DeterministicAttentionCore:
+    """Common FP32 Attention arithmetic used by both train and rollout."""
+
+    core_id = STRICT_ATTENTION_CORE_ID
+    backend_id = "rlkernel.attention.cp_reference"
+    merge_order = "global_block_index"
+    accum_dtype = "fp32"
+    downcast_at = "final_write"
+
+    def __init__(self, *, split_kv: SplitKVSpec | None = None) -> None:
+        self.split_kv = SplitKVSpec.disabled() if split_kv is None else split_kv
+        if not isinstance(self.split_kv, SplitKVSpec):
+            raise TypeError("split_kv must be a SplitKVSpec")
+        if self.split_kv.mode is not SplitKVMode.DISABLED:
+            raise ValueError("strict deterministic Attention core requires Split-KV to be disabled")
+        self._reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: float | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        query_position_offsets: torch.Tensor | None = None,
+        key_position_offsets: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        out, lse = self._reference.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=1,
+            kv_chunk_size=None,
+        )
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict Attention output_dtype must be FP16 or BF16")
+        plan = self.split_kv.resolve(k.size(2), backend=self.backend_id)
+        return DeterministicAttentionCoreResult(
+            out=out.to(dtype=resolved_dtype),
+            lse=lse,
+            provenance={
+                "strict_core_id": self.core_id,
+                "attention_backend": self.backend_id,
+                "split_kv": plan.to_dict(),
+                "merge_order": self.merge_order,
+                "accum_dtype": self.accum_dtype,
+                "downcast_at": self.downcast_at,
+                "fallback": False,
+                "fallback_reason": None,
+                "native_attention_arithmetic": False,
+                "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -209,6 +285,14 @@ class DeterministicCPAttentionReferenceOp:
     op_class = "attention"
 
     def __init__(self, *, strict_bitwise: bool = False) -> None:
+        """Create the reference op.
+
+        ``strict_bitwise`` uses a canonical schedule that is independent of
+        batch size and CP ownership.  The regular path remains vectorized for
+        drift/performance experiments; the strict path is intentionally slower
+        because it is the shared arithmetic reference for train and rollout.
+        """
+
         if not isinstance(strict_bitwise, bool):
             raise TypeError("strict_bitwise must be a bool")
         self.strict_bitwise = strict_bitwise
@@ -229,91 +313,20 @@ class DeterministicCPAttentionReferenceOp:
             backend="deterministic_cp_reference",
         )
 
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+    @staticmethod
+    def execution_provenance(
+        total_kv_tokens: int,
         *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
         cp_world_size: int = 1,
         kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        return self.forward(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
+    ) -> dict[str, object]:
+        """Describe the reference boundary without claiming production communication."""
+
+        plans = split_kv_execution_plan_provenance(
+            total_kv_tokens,
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
-        )
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
-        cp_world_size: int = 1,
-        kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute CP attention with fp32 accumulation and final input-dtype write."""
-
-        out, _ = self.forward_with_lse(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
-            output_dtype=q.dtype,
-        )
-        return out
-
-    def forward_fp32(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        causal: bool = True,
-        scale: Optional[float] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        query_position_offsets: Optional[torch.Tensor] = None,
-        key_position_offsets: Optional[torch.Tensor] = None,
-        cp_world_size: int = 1,
-        kv_chunk_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Compute CP attention with fp32 accumulation and fp32 output."""
-
-        out, _ = self.forward_fp32_with_lse(
-            q,
-            k,
-            v,
-            causal=causal,
-            scale=scale,
-            key_padding_mask=key_padding_mask,
-            query_position_offsets=query_position_offsets,
-            key_position_offsets=key_position_offsets,
-            cp_world_size=cp_world_size,
-            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_reference",
         )
         return out
 
@@ -424,7 +437,16 @@ class DeterministicCPAttentionReferenceOp:
         key_position_offsets: Optional[torch.Tensor],
         kv_chunk_size: Optional[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Execute one batch/CP-independent arithmetic schedule."""
+        """Run one canonical arithmetic schedule for every caller.
+
+        The regular implementation changes GEMM shapes when batch/CP changes;
+        that is numerically valid but cannot be bitwise invariant.  Strict mode
+        fixes every matmul to ``[1, H, 1, D]`` by processing one batch row and
+        one query position at a time.  KV blocks are global and independent of
+        ``cp_world_size``; communication only determines ownership outside this
+        reference.  Both training and rollout therefore execute the same
+        score, softmax, value and LSE-merge operations in the same order.
+        """
 
         _validate_qkv(q, k, v)
         _validate_scale(scale)
@@ -435,6 +457,7 @@ class DeterministicCPAttentionReferenceOp:
                 raise ValueError("key_padding_mask must have shape [B, Skv]")
             if key_padding_mask.dtype != torch.bool:
                 raise ValueError("key_padding_mask must be bool")
+
         query_offsets = _normalize_position_offsets(
             query_position_offsets,
             batch,
@@ -449,7 +472,8 @@ class DeterministicCPAttentionReferenceOp:
             default=0,
             name="key_position_offsets",
         )
-        kv_bounds = _kv_block_bounds(skv, 1, kv_chunk_size)
+        # The canonical schedule is global.  CP ownership and arrival order
+        # must not change which partial states are generated or merged.
         out_rows: list[torch.Tensor] = []
         lse_rows: list[torch.Tensor] = []
         for batch_index in range(batch):
@@ -467,31 +491,22 @@ class DeterministicCPAttentionReferenceOp:
             lse_query_rows: list[torch.Tensor] = []
             for query_index in range(sq):
                 q_row = q_batch[:, :, query_index : query_index + 1, :].contiguous()
-                states = [
-                    self.local_partial_state(
-                        q_row,
-                        k_batch[:, :, key_start:key_end, :].contiguous(),
-                        v_batch[:, :, key_start:key_end, :].contiguous(),
-                        q_start=query_index,
-                        k_start=key_start,
-                        total_kv_len=skv,
-                        total_query_len=sq,
-                        causal=causal,
-                        scale=scale,
-                        key_padding_mask=(
-                            None
-                            if pad_batch is None
-                            else pad_batch[:, key_start:key_end].contiguous()
-                        ),
-                        query_position_offsets=query_offset,
-                        key_position_offsets=key_offset,
-                    )
-                    for key_start, key_end in kv_bounds
-                    if key_start != key_end
-                ]
-                merged = merge_attention_partial_states(states)
-                query_rows.append(merged.out)
-                lse_query_rows.append(merged.lse)
+                state = self.local_partial_state(
+                    q_row,
+                    k_batch,
+                    v_batch,
+                    q_start=query_index,
+                    k_start=0,
+                    total_kv_len=skv,
+                    total_query_len=sq,
+                    causal=causal,
+                    scale=scale,
+                    key_padding_mask=pad_batch,
+                    query_position_offsets=query_offset,
+                    key_position_offsets=key_offset,
+                )
+                query_rows.append(state.out)
+                lse_query_rows.append(state.lse)
             out_rows.append(torch.cat(query_rows, dim=2))
             lse_rows.append(torch.cat(lse_query_rows, dim=2))
         return torch.cat(out_rows, dim=0), torch.cat(lse_rows, dim=0)
@@ -1187,8 +1202,12 @@ __all__ = [
     "AttentionPartialState",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
+    "DeterministicAttentionCore",
+    "DeterministicAttentionCoreResult",
     "DeterministicCPAttentionReferenceOp",
     "GradientDriftStats",
+    "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "compare_cp_attention_backward",
     "merge_attention_partial_states",
     "split_kv_execution_plan_provenance",

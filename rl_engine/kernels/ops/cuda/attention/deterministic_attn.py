@@ -17,6 +17,10 @@ import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
+from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
+)
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.utils.logger import logger
 
@@ -81,6 +85,10 @@ class DeterministicAttentionOp:
     Materializes full FP32 scores/P. Public surface matches NativeAttentionOp
     so #108 harness can call forward(**inputs) with key_padding_mask.
     """
+
+    core_id = STRICT_ATTENTION_CORE_ID
+    strict_schedule = STRICT_ATTENTION_SCHEDULE_ID
+    backend_id = "rlkernel.cuda.deterministic_attention"
 
     def __init__(self) -> None:
         if not _EXT_AVAILABLE or not hasattr(_C, "deterministic_attention_forward"):
