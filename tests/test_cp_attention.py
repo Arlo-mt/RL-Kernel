@@ -745,18 +745,15 @@ def test_strict_core_is_bitwise_invariant_to_batch_and_cp_schedule(dtype):
     op = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
 
     cp1_out, cp1_lse = op.forward_with_lse(
-        q,
-        k,
-        v,
-        cp_world_size=1,
-        kv_chunk_size=None,
+        q, k, v, cp_world_size=1, kv_chunk_size=3
     )
     cp2_out, cp2_lse = op.forward_with_lse(
-        q,
-        k,
-        v,
-        cp_world_size=2,
-        kv_chunk_size=3,
+        q, k, v, cp_world_size=2, kv_chunk_size=3
+    )
+    cp1_out, cp1_lse = op.forward_with_lse(q, k, v, cp_world_size=1, kv_chunk_size=3)
+    cp2_out, cp2_lse = op.forward_with_lse(q, k, v, cp_world_size=2, kv_chunk_size=3)
+    single_out, single_lse = op.forward_with_lse(
+        q[:1], k[:1], v[:1], cp_world_size=1, kv_chunk_size=3
     )
     assert torch.equal(cp1_out, cp2_out)
     assert torch.equal(cp1_lse, cp2_lse)

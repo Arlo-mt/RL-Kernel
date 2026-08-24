@@ -13,6 +13,12 @@ friends) are validated against.
 This op covers **only** the softmax attention. Qwen3's QK-Norm and RoPE are applied *before*
 the call (see the chain), so the `q`, `k` passed in are already normalized and rotated.
 
+For the WS2 Attention experiment, the measured boundary also includes QKV and `o_proj`
+projections plus their TP/SP communication contracts. Those projections use native TE or
+vLLM callables only after an H100 bitwise probe; otherwise both sides use the deterministic
+`DetGemmOp` path with BF16 I/O, FP32 accumulation, ascending-K reduction, and Split-K disabled.
+The model input RMSNorm and residual add remain outside this boundary.
+
 ```text
 q --\
 k ----softmax(QKᵀ/√d + mask)·V--> out
@@ -94,6 +100,34 @@ before selecting a backend. Legacy `get_op("attention")` behavior remains unchan
 Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
 CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
 a silent fallback. See [WS2 CP-aware Attention contract](../design/ws2-cp-attention-contract.md).
+
+### WS2 deterministic CP reference
+
+### WS2 CP-aware dispatch
+
+WS2 distributed callers use a separate contract-aware entry point,
+`kernel_registry.get_attention_op(contract)`. It validates explicit TP/CP ownership, fixed
+`(out, lse)` merge semantics, causal or packed-sequence offsets, and decode KV-cache identity
+before selecting a backend. Legacy `get_op("attention")` behavior remains unchanged.
+
+Existing WS1 implementations do not yet export attention-domain LSE or implement deterministic
+CP merge, so they are declared incompatible with strict WS2 requests instead of being selected as
+a silent fallback. See [WS2 CP-aware Attention contract](../design/ws2-cp-attention-contract.md).
+
+Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
+`disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
+boundaries, FP32 `(out, lse)` merge order, final downcast point, backend, and fallback reason.
+Runtime-selected `auto` plans are diagnostic only unless both training and rollout export and
+validate the same actual plan.
+
+The rank-aware drift benchmark can emit a CPU smoke artifact or a torchrun-friendly GPU report:
+
+```bash
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --json
+python benchmarks/benchmark_ws2_cp_attention_drift.py --smoke --tp-world-sizes 2 \
+  --cp-world-sizes 2 --kv-chunk-sizes none,1 --include-backward \
+  --output artifacts/ws2-cp-attention-drift.json
+```
 
 Split-KV is part of that contract rather than a recorded backend extra. Strict runs allow
 `disabled` or a fixed logical KV chunk size, and must export the actual per-CP-owner block
