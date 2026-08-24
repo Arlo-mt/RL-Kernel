@@ -13,6 +13,7 @@ from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 
 QWEN3_8B_HIDDEN_SIZE = 4096
 QWEN3_8B_INTERMEDIATE_SIZE = 12288
+BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
 
 _DET_GEMM_SYMBOLS = (
     "det_gemm_fwd",
@@ -205,10 +206,14 @@ class _DeterministicFFNFunction(torch.autograd.Function):
 
         # The model stores projection weights as [out, in]; GEMM consumes [K, N].
         gate = _gemm_fwd(
-            rmsnorm_output_2d, gate_weight.t().contiguous(), disable_split_k=disable_split_k
+            rmsnorm_output_2d,
+            gate_weight.t().contiguous(),
+            disable_split_k=disable_split_k,
         )
         up = _gemm_fwd(
-            rmsnorm_output_2d, up_weight.t().contiguous(), disable_split_k=disable_split_k
+            rmsnorm_output_2d,
+            up_weight.t().contiguous(),
+            disable_split_k=disable_split_k,
         )
         activated = _C.swiglu_forward(gate, up)
         output = _gemm_fwd(activated, down_weight.t().contiguous(), disable_split_k=disable_split_k)
@@ -343,7 +348,8 @@ def qwen3_ffn(
     tp_group: Any = None,
     cp_group: Any = None,
     sequence_parallel: bool = False,
-    disable_split_k: bool = True,
+    deterministic: bool | None = None,
+    disable_split_k: bool | None = None,
 ) -> Tensor:
     """Apply a bias-free SiLU-gated FFN with deterministic backward kernels.
 
@@ -366,19 +372,20 @@ def qwen3_ffn(
             are sharded on the flattened token dimension across ``tp_group``.
             Token gather/scatter use the deterministic AllGather and
             ReduceScatter.
-        disable_split_k: If True (default), GEMM uses the deterministic
-            ``det_gemm`` kernels with no split-K. If False, GEMM uses
-            ``torch.matmul`` (cuBLASLt / CUTLASS), which may enable split-K.
+        deterministic: Select the RL-Kernel fixed-reduction GEMM when True
+            (default), or the production ``torch.matmul`` GEMM when False.
+        disable_split_k: Compatibility alias for ``deterministic``. New code
+            should use ``deterministic`` because Split-K is only one possible
+            implementation detail of the production GEMM.
 
     Returns:
         FFN output with shape ``[..., H]``.
     """
     if not isinstance(sequence_parallel, bool):
         raise TypeError("sequence_parallel must be a bool.")
-    if not isinstance(disable_split_k, bool):
-        raise TypeError("disable_split_k must be a bool.")
+    deterministic = _resolve_deterministic_mode(deterministic, disable_split_k)
     _validate_ffn_inputs(rmsnorm_output, gate_weight, up_weight, down_weight)
-    _require_ffn_kernels(disable_split_k=disable_split_k)
+    _require_ffn_kernels(disable_split_k=deterministic)
     return _DeterministicFFNFunction.apply(
         rmsnorm_output,
         gate_weight,
@@ -387,5 +394,84 @@ def qwen3_ffn(
         tp_group,
         cp_group,
         sequence_parallel,
-        disable_split_k,
+        deterministic,
     )
+
+
+def _resolve_deterministic_mode(
+    deterministic: bool | None,
+    disable_split_k: bool | None,
+) -> bool:
+    if deterministic is not None and not isinstance(deterministic, bool):
+        raise TypeError("deterministic must be a bool or None.")
+    if disable_split_k is not None and not isinstance(disable_split_k, bool):
+        raise TypeError("disable_split_k must be a bool or None.")
+    if (
+        deterministic is not None
+        and disable_split_k is not None
+        and deterministic != disable_split_k
+    ):
+        raise ValueError("deterministic and disable_split_k select conflicting FFN backends.")
+    if deterministic is not None:
+        return deterministic
+    if disable_split_k is not None:
+        return disable_split_k
+    return True
+
+
+class Qwen3FFNOp:
+    """Instantiable Qwen3 FFN wrapper for semantic operator dispatch."""
+
+    op_class = "ffn"
+    is_batch_invariant = True
+    backend_id = BACKEND_ID
+
+    def __call__(
+        self,
+        rmsnorm_output: Tensor,
+        gate_weight: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+        *,
+        tp_group: Any = None,
+        cp_group: Any = None,
+        sequence_parallel: bool = False,
+        deterministic: bool | None = None,
+        disable_split_k: bool | None = None,
+    ) -> Tensor:
+        return self.apply(
+            rmsnorm_output,
+            gate_weight,
+            up_weight,
+            down_weight,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            deterministic=deterministic,
+            disable_split_k=disable_split_k,
+        )
+
+    def apply(
+        self,
+        rmsnorm_output: Tensor,
+        gate_weight: Tensor,
+        up_weight: Tensor,
+        down_weight: Tensor,
+        *,
+        tp_group: Any = None,
+        cp_group: Any = None,
+        sequence_parallel: bool = False,
+        deterministic: bool | None = None,
+        disable_split_k: bool | None = None,
+    ) -> Tensor:
+        return qwen3_ffn(
+            rmsnorm_output,
+            gate_weight,
+            up_weight,
+            down_weight,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            sequence_parallel=sequence_parallel,
+            deterministic=deterministic,
+            disable_split_k=disable_split_k,
+        )

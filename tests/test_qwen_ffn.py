@@ -242,13 +242,22 @@ def _distributed_ffn_backward_nccl_worker(
             (token_count, hidden_size), seed=40, device=device, dtype=torch.bfloat16
         )
         gate_weight = _randn(
-            (intermediate_size, hidden_size), seed=41, device=device, dtype=torch.bfloat16
+            (intermediate_size, hidden_size),
+            seed=41,
+            device=device,
+            dtype=torch.bfloat16,
         )
         up_weight = _randn(
-            (intermediate_size, hidden_size), seed=42, device=device, dtype=torch.bfloat16
+            (intermediate_size, hidden_size),
+            seed=42,
+            device=device,
+            dtype=torch.bfloat16,
         )
         down_weight = _randn(
-            (hidden_size, intermediate_size), seed=43, device=device, dtype=torch.bfloat16
+            (hidden_size, intermediate_size),
+            seed=43,
+            device=device,
+            dtype=torch.bfloat16,
         )
         grad_output = _randn(
             (token_count, hidden_size), seed=44, device=device, dtype=torch.bfloat16
@@ -352,13 +361,22 @@ def _tp1_vs_tpn_train_infer_worker(rank, world_size, init_method, result_queue, 
         token_count, hidden_size, intermediate_size = 16, 64, 256
         hidden = _randn((token_count, hidden_size), seed=50, device=device, dtype=torch.bfloat16)
         gate_weight = _randn(
-            (intermediate_size, hidden_size), seed=51, device=device, dtype=torch.bfloat16
+            (intermediate_size, hidden_size),
+            seed=51,
+            device=device,
+            dtype=torch.bfloat16,
         )
         up_weight = _randn(
-            (intermediate_size, hidden_size), seed=52, device=device, dtype=torch.bfloat16
+            (intermediate_size, hidden_size),
+            seed=52,
+            device=device,
+            dtype=torch.bfloat16,
         )
         down_weight = _randn(
-            (hidden_size, intermediate_size), seed=53, device=device, dtype=torch.bfloat16
+            (hidden_size, intermediate_size),
+            seed=53,
+            device=device,
+            dtype=torch.bfloat16,
         )
         grad_output = _randn(
             (token_count, hidden_size), seed=54, device=device, dtype=torch.bfloat16
@@ -688,7 +706,11 @@ def _uneven_sp_worker(rank, world_size, init_method, result_queue):
                 sequence_parallel=True,
             )
             result_queue.put(
-                {"ok": False, "rank": rank, "failures": "uneven SP tokens should have raised"}
+                {
+                    "ok": False,
+                    "rank": rank,
+                    "failures": "uneven SP tokens should have raised",
+                }
             )
         except ValueError as exc:
             message = str(exc)
@@ -855,6 +877,35 @@ def test_qwen_ffn_disable_split_k_false_uses_torch_matmul(monkeypatch):
     assert stub.calls.count("det_gemm_db") == 0
     assert stub.calls.count("swiglu_forward") == 1
     assert stub.calls.count("swiglu_backward") == 1
+
+
+def test_qwen_ffn_deterministic_false_uses_production_gemm(monkeypatch):
+    modes = []
+    monkeypatch.setattr(ffn_module, "_validate_ffn_inputs", lambda *args: None)
+    monkeypatch.setattr(ffn_module, "_require_ffn_kernels", lambda **kwargs: modes.append(kwargs))
+    monkeypatch.setattr(
+        ffn_module._DeterministicFFNFunction,
+        "apply",
+        lambda *args: args[-1],
+    )
+
+    tensors = [torch.empty(1)] * 4
+    assert qwen3_ffn(*tensors, deterministic=False) is False
+    assert modes == [{"disable_split_k": False}]
+
+
+def test_qwen_ffn_rejects_conflicting_backend_switches():
+    tensors = [torch.empty(1)] * 4
+
+    with pytest.raises(ValueError, match="conflicting FFN backends"):
+        qwen3_ffn(*tensors, deterministic=True, disable_split_k=False)
+
+
+def test_qwen_ffn_rejects_non_bool_deterministic():
+    tensors = [torch.empty(1)] * 4
+
+    with pytest.raises(TypeError, match="deterministic must be a bool or None"):
+        qwen3_ffn(*tensors, deterministic=1)  # type: ignore[arg-type]
 
 
 def test_qwen_ffn_rejects_non_bool_disable_split_k():
