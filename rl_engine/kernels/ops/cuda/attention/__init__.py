@@ -1,8 +1,14 @@
 from .deterministic_attn import DeterministicAttentionOp
-from .flash_attn import FlashAttentionOp
+from .flash_attn import FlashAttentionOp, StrictFlashAttention4Core, StrictFlashAttentionUnavailable
 from .prefix_shared_attn import PrefixSharedAttentionOp
 
-__all__ = ["DeterministicAttentionOp", "FlashAttentionOp", "PrefixSharedAttentionOp"]
+__all__ = [
+    "DeterministicAttentionOp",
+    "FlashAttentionOp",
+    "PrefixSharedAttentionOp",
+    "StrictFlashAttention4Core",
+    "StrictFlashAttentionUnavailable",
+]
 
 # CP communication and FlashInfer are optional layers owned by later WS2 PRs.
 # Keep the base Attention package importable while those PRs are developed or
@@ -14,6 +20,7 @@ try:
         AttentionCPCommunicationPlan,
         AttentionCPCommunicationUnavailable,
         AttentionCPMergedState,
+        AttentionCPOutputShard,
         AttentionCPPartialState,
         AttentionParallelSpec,
         CPCommunicationBackend,
@@ -32,6 +39,7 @@ else:
         "AttentionCPCommunicationPlan",
         "AttentionCPCommunicationUnavailable",
         "AttentionCPMergedState",
+        "AttentionCPOutputShard",
         "AttentionCPPartialState",
         "AttentionParallelSpec",
         "CPCommunicationBackend",

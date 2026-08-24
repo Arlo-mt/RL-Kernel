@@ -19,8 +19,13 @@ from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVSpec,
 )
+from rl_engine.kernels.ops.cuda.attention import deterministic_attn as deterministic_attn_module
+from rl_engine.kernels.ops.cuda.attention.deterministic_attn import (
+    RLKernelDeterministicAttentionCore,
+)
 from rl_engine.kernels.ops.pytorch.attention.cp_attention import (
     AttentionPartialState,
+    AttentionRingSchedule,
     AttentionSavedForwardState,
     DeterministicAttentionCore,
     DeterministicCPAttentionReferenceOp,
@@ -37,6 +42,17 @@ _N_KV = 8
 _HEAD_DIM = 128
 _ATOL = 3.0e-6
 _GRAD_ATOL = 1.0e-5
+
+
+def test_ring_schedule_separates_compute_and_merge_order():
+    schedule = AttentionRingSchedule.build(12, cp_world_size=2, kv_chunk_size=2)
+
+    assert schedule.schedule_id == "rlkernel.attention.strict_ring_state.v1"
+    assert schedule.compute_communication == "decoupled"
+    assert schedule.overlap == "disabled"
+    assert schedule.merge_order == tuple(range(6))
+    assert schedule.compute_order == (0, 5, 1, 4, 2, 3)
+    assert [block.owner_cp_rank for block in schedule.blocks] == [0, 0, 0, 1, 1, 1]
 
 
 @contextlib.contextmanager
@@ -921,6 +937,35 @@ def test_gapped_partial_ranges_raise():
 
 def test_registry_dispatches_cp_attention_reference():
     assert isinstance(kernel_registry.get_op("cp_attention"), DeterministicCPAttentionReferenceOp)
+
+
+def test_shared_strict_core_reports_canonical_cuda_schedule(monkeypatch):
+    class FakeCUDAAttentionOp:
+        @staticmethod
+        def forward_with_lse(q, k, v, **_kwargs):
+            del k, v
+            return (
+                torch.zeros_like(q),
+                torch.zeros(q.shape[:3], dtype=torch.float32, device=q.device),
+            )
+
+    monkeypatch.setattr(
+        deterministic_attn_module,
+        "DeterministicAttentionOp",
+        FakeCUDAAttentionOp,
+    )
+    q, k, v = _qkv(1, 3, 4, seed=41, heads=4, kv_heads=2, dim=8)
+    q_positions = torch.arange(1, 4).view(1, -1)
+    k_positions = torch.arange(4).view(1, -1)
+    result = RLKernelDeterministicAttentionCore().forward_with_lse(
+        q,
+        k,
+        v,
+        query_position_ids=q_positions,
+        key_position_ids=k_positions,
+    )
+    assert result.provenance["strict_core_id"] == STRICT_ATTENTION_CORE_ID
+    assert result.provenance["strict_schedule"] == STRICT_ATTENTION_SCHEDULE_ID
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])

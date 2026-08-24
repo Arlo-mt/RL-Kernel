@@ -18,9 +18,14 @@ from typing import Any, Iterable, TypeVar
 _EnumT = TypeVar("_EnumT", bound=Enum)
 
 
-# Stable identity shared by the training and rollout deterministic Attention
-# core.  Backend adapters may differ, but strict mode must report this ID.
-STRICT_ATTENTION_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+# Stable identities for Attention arithmetic shared by training and rollout.
+# The FA4 core is the strict production path. The materializing RL-Kernel core
+# remains available as an explicit reference and capability-gap fallback.
+STRICT_ATTENTION_PRODUCTION_CORE_ID = "rlkernel.attention.flash_attention4.num_splits1.v1"
+STRICT_ATTENTION_REFERENCE_CORE_ID = "rlkernel.attention.deterministic_core.v1"
+# Compatibility alias for callers that explicitly select the original core.
+STRICT_ATTENTION_CORE_ID = STRICT_ATTENTION_REFERENCE_CORE_ID
+STRICT_ATTENTION_FA4_SCHEDULE_ID = "single_batch_flash_attention4_num_splits1"
 STRICT_ATTENTION_SCHEDULE_ID = "single_batch_single_query_global_kv_blocks"
 
 
@@ -1672,6 +1677,9 @@ __all__ = [
     "SplitKVRuntimePlanSet",
     "SplitKVSpec",
     "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_FA4_SCHEDULE_ID",
+    "STRICT_ATTENTION_PRODUCTION_CORE_ID",
+    "STRICT_ATTENTION_REFERENCE_CORE_ID",
     "STRICT_ATTENTION_SCHEDULE_ID",
     "validate_split_kv_alignment",
     "validate_split_kv_plan_set_alignment",
