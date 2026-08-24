@@ -25,8 +25,8 @@ from rl_engine.testing.attention_comparison import (
     compare_single_gpu_attention,
     compare_single_gpu_rope_attention,
     decode_kv_cache_fingerprint,
-    decode_rope_identity_fingerprint,
     decode_prefix_cache_fingerprint,
+    decode_rope_identity_fingerprint,
     run_decode_kv_replay,
     run_paged_kv_attention,
 )
@@ -308,12 +308,8 @@ def test_strict_decode_replay_is_bitwise_across_logical_and_paged_materializatio
     assert drift.candidate_name == "strict_shared_core_paged_kv_layout"
     assert drift.out.max_abs == 0.0
     assert drift.lse.max_abs == 0.0
-    assert drift.provenance["strict_core_id"] == (
-        "rlkernel.attention.deterministic_core.v1"
-    )
-    assert drift.provenance["strict_schedule"] == (
-        "single_batch_single_query_global_kv_blocks"
-    )
+    assert drift.provenance["strict_core_id"] == ("rlkernel.attention.deterministic_core.v1")
+    assert drift.provenance["strict_schedule"] == ("single_batch_single_query_global_kv_blocks")
     assert drift.provenance["split_kv_policy"] == "disabled"
 
 

@@ -22,8 +22,6 @@ from rl_engine.kernels.attention_contract import (
     AttentionRole,
     KVCacheSpec,
     ProjectionCollective,
-    AttentionRole,
-    KVCacheSpec,
     ReductionSpec,
     RoPEFusionBoundary,
     RoPESpec,
