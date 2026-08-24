@@ -41,6 +41,7 @@ def _args(**overrides):
         "matmul",
         "det_gemm",
         "attention",
+        "cp_attention",
         "logp",
         "linear_logp",
         "batch_invariant_logp",
