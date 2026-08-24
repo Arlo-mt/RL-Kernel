@@ -96,10 +96,9 @@ jobs:
         run: |
           python -m pytest tests/test_kv_cache_attention.py -v -k "not large and not gpu"
 
-<<<<<<< HEAD
       - name: Run WS2 Attention Contract Tests (CPU-safe)
         run: python -m pytest tests/test_attention_contract.py -v
-=======
+
       - name: Run WS2 Logprob Contract Tests (CPU-safe)
         run: python -m pytest tests/test_logprob_contract.py -v
 
@@ -111,7 +110,6 @@ jobs:
           python -m pytest -q \
             tests/test_alignment_wrapper_interfaces.py \
             tests/test_qwen_ffn.py
->>>>>>> origin/test
 
   docs:
     runs-on: ubuntu-latest
