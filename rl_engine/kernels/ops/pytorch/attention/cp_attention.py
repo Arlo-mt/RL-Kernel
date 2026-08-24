@@ -534,6 +534,7 @@ class DeterministicCPAttentionReferenceOp:
         kv_chunk_size: Optional[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Execute one canonical schedule for training and rollout."""
+        """Execute one batch/CP-independent arithmetic schedule."""
 
         _validate_qkv(q, k, v)
         _validate_scale(scale)
@@ -1255,6 +1256,7 @@ def build_reference_split_kv_runtime_plan_set(
         for tp_rank in range(tp_world_size):
             for cp_rank in range(cp_world_size):
                 for owner_cp_rank, (owner_start, owner_end) in enumerate(owner_ranges):
+                    boundaries: tuple[tuple[int, int], ...]
                     if kv_chunk_size is None:
                         mode = SplitKVMode.DISABLED
                         boundaries = ((owner_start, owner_end),)
