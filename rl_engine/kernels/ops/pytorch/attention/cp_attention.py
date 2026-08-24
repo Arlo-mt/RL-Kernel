@@ -17,11 +17,14 @@ from typing import Optional, Sequence
 import torch
 
 from rl_engine.kernels.attention_contract import (
+    STRICT_ATTENTION_CORE_ID,
+    STRICT_ATTENTION_SCHEDULE_ID,
     SplitKVExecutionPlan,
     SplitKVMode,
     SplitKVRuntimeCoordinate,
     SplitKVRuntimePlanEntry,
     SplitKVRuntimePlanSet,
+    SplitKVSpec,
 )
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 
@@ -152,6 +155,79 @@ class AttentionRingSchedule:
             "merge_order_indices": list(self.merge_order),
             "communication_overlap": self.overlap,
         }
+
+
+@dataclass(frozen=True)
+class DeterministicAttentionCoreResult:
+    """Strict-core output and the exact arithmetic plan used for it."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    provenance: dict[str, object]
+
+
+class DeterministicAttentionCore:
+    """Common FP32 Attention arithmetic used by both train and rollout."""
+
+    core_id = STRICT_ATTENTION_CORE_ID
+    backend_id = "rlkernel.attention.cp_reference"
+    merge_order = "global_block_index"
+    accum_dtype = "fp32"
+    downcast_at = "final_write"
+
+    def __init__(self, *, split_kv: SplitKVSpec | None = None) -> None:
+        self.split_kv = SplitKVSpec.disabled() if split_kv is None else split_kv
+        if not isinstance(self.split_kv, SplitKVSpec):
+            raise TypeError("split_kv must be a SplitKVSpec")
+        if self.split_kv.mode is not SplitKVMode.DISABLED:
+            raise ValueError("strict deterministic Attention core requires Split-KV to be disabled")
+        self._reference = DeterministicCPAttentionReferenceOp(strict_bitwise=True)
+
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        causal: bool = True,
+        scale: float | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        query_position_offsets: torch.Tensor | None = None,
+        key_position_offsets: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
+    ) -> DeterministicAttentionCoreResult:
+        out, lse = self._reference.forward_fp32_with_lse(
+            q,
+            k,
+            v,
+            causal=causal,
+            scale=scale,
+            key_padding_mask=key_padding_mask,
+            query_position_offsets=query_position_offsets,
+            key_position_offsets=key_position_offsets,
+            cp_world_size=1,
+            kv_chunk_size=None,
+        )
+        resolved_dtype = q.dtype if output_dtype is None else output_dtype
+        if resolved_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("strict Attention output_dtype must be FP16 or BF16")
+        plan = self.split_kv.resolve(k.size(2), backend=self.backend_id)
+        return DeterministicAttentionCoreResult(
+            out=out.to(dtype=resolved_dtype),
+            lse=lse,
+            provenance={
+                "strict_core_id": self.core_id,
+                "attention_backend": self.backend_id,
+                "split_kv": plan.to_dict(),
+                "merge_order": self.merge_order,
+                "accum_dtype": self.accum_dtype,
+                "downcast_at": self.downcast_at,
+                "fallback": False,
+                "fallback_reason": None,
+                "native_attention_arithmetic": False,
+                "strict_schedule": STRICT_ATTENTION_SCHEDULE_ID,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -309,10 +385,10 @@ class DeterministicCPAttentionReferenceOp:
     def __init__(self, *, strict_bitwise: bool = False) -> None:
         """Create the reference op.
 
-        Strict mode pins every matmul to one batch row and one query position,
-        so changing the caller's batch or CP partition cannot select a
-        different reduction tree.  The regular vectorized path is retained
-        for performance/drift experiments.
+        ``strict_bitwise`` uses a canonical schedule that is independent of
+        batch size and CP ownership.  The regular path remains vectorized for
+        drift/performance experiments; the strict path is intentionally slower
+        because it is the shared arithmetic reference for train and rollout.
         """
 
         if not isinstance(strict_bitwise, bool):
@@ -349,6 +425,38 @@ class DeterministicCPAttentionReferenceOp:
             cp_world_size=cp_world_size,
             kv_chunk_size=kv_chunk_size,
         )
+
+    @staticmethod
+    def execution_provenance(
+        total_kv_tokens: int,
+        *,
+        cp_world_size: int = 1,
+        kv_chunk_size: Optional[int] = None,
+    ) -> dict[str, object]:
+        """Describe the reference boundary without claiming production communication."""
+
+        plans = split_kv_execution_plan_provenance(
+            total_kv_tokens,
+            cp_world_size=cp_world_size,
+            kv_chunk_size=kv_chunk_size,
+            backend="deterministic_cp_reference",
+        )
+        return {
+            "execution_scope": "logical_single_process_cp_reference",
+            "runtime_verified": False,
+            "input_boundary": "projected_post_qk_norm_post_rope_qkv",
+            "query_scope": "logical_global_query_reference",
+            "kv_scope": "logical_owner_local_cp_shards",
+            "production_cp_protocol": "ag_query_local_kv_rs_out_lse",
+            "communication_executed": "none",
+            "partial_state": "fp32_out_attention_lse",
+            "merge_order": "global_block_index",
+            "accum_dtype": "fp32",
+            "downcast_at": "final_write",
+            "requested_split_kv_policy": "disabled" if kv_chunk_size is None else "fixed",
+            "requested_split_kv_size": kv_chunk_size,
+            "actual_split_kv_plans": plans,
+        }
 
     def __call__(
         self,
@@ -533,8 +641,16 @@ class DeterministicCPAttentionReferenceOp:
         key_position_offsets: Optional[torch.Tensor],
         kv_chunk_size: Optional[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Execute one canonical schedule for training and rollout."""
-        """Execute one batch/CP-independent arithmetic schedule."""
+        """Run one canonical arithmetic schedule for every caller.
+
+        The regular implementation changes GEMM shapes when batch/CP changes;
+        that is numerically valid but cannot be bitwise invariant.  Strict mode
+        fixes every matmul to ``[1, H, 1, D]`` by processing one batch row and
+        one query position at a time.  KV blocks are global and independent of
+        ``cp_world_size``; communication only determines ownership outside this
+        reference.  Both training and rollout therefore execute the same
+        score, softmax, value and LSE-merge operations in the same order.
+        """
 
         _validate_qkv(q, k, v)
         _validate_scale(scale)
@@ -545,6 +661,7 @@ class DeterministicCPAttentionReferenceOp:
                 raise ValueError("key_padding_mask must have shape [B, Skv]")
             if key_padding_mask.dtype != torch.bool:
                 raise ValueError("key_padding_mask must be bool")
+
         query_offsets = _normalize_position_offsets(
             query_position_offsets,
             batch,
@@ -559,9 +676,8 @@ class DeterministicCPAttentionReferenceOp:
             default=0,
             name="key_position_offsets",
         )
-        # CP ownership is a transport concern.  The arithmetic reference uses
-        # the same global KV blocks for every CP world size.
-        kv_bounds = _kv_block_bounds(skv, 1, kv_chunk_size)
+        # The canonical schedule is global.  CP ownership and arrival order
+        # must not change which partial states are generated or merged.
         out_rows: list[torch.Tensor] = []
         lse_rows: list[torch.Tensor] = []
         for batch_index in range(batch):
@@ -579,31 +695,22 @@ class DeterministicCPAttentionReferenceOp:
             lse_query_rows: list[torch.Tensor] = []
             for query_index in range(sq):
                 q_row = q_batch[:, :, query_index : query_index + 1, :].contiguous()
-                states = [
-                    self.local_partial_state(
-                        q_row,
-                        k_batch[:, :, key_start:key_end, :].contiguous(),
-                        v_batch[:, :, key_start:key_end, :].contiguous(),
-                        q_start=query_index,
-                        k_start=key_start,
-                        total_kv_len=skv,
-                        total_query_len=sq,
-                        causal=causal,
-                        scale=scale,
-                        key_padding_mask=(
-                            None
-                            if pad_batch is None
-                            else pad_batch[:, key_start:key_end].contiguous()
-                        ),
-                        query_position_offsets=query_offset,
-                        key_position_offsets=key_offset,
-                    )
-                    for key_start, key_end in kv_bounds
-                    if key_start != key_end
-                ]
-                merged = merge_attention_partial_states(states)
-                query_rows.append(merged.out)
-                lse_query_rows.append(merged.lse)
+                state = self.local_partial_state(
+                    q_row,
+                    k_batch,
+                    v_batch,
+                    q_start=query_index,
+                    k_start=0,
+                    total_kv_len=skv,
+                    total_query_len=sq,
+                    causal=causal,
+                    scale=scale,
+                    key_padding_mask=pad_batch,
+                    query_position_offsets=query_offset,
+                    key_position_offsets=key_offset,
+                )
+                query_rows.append(state.out)
+                lse_query_rows.append(state.lse)
             out_rows.append(torch.cat(query_rows, dim=2))
             lse_rows.append(torch.cat(lse_query_rows, dim=2))
         return torch.cat(out_rows, dim=0), torch.cat(lse_rows, dim=0)
@@ -1250,7 +1357,6 @@ def build_reference_split_kv_runtime_plan_set(
         raise ValueError("kv_chunk_size must be >= 1 when provided")
 
     entries: list[SplitKVRuntimePlanEntry] = []
-    boundaries: tuple[tuple[int, int], ...]
     for batch_index, total in enumerate(totals):
         owner_ranges = _split_bounds(total, cp_world_size)
         for tp_rank in range(tp_world_size):
@@ -1309,8 +1415,12 @@ __all__ = [
     "AttentionRingSchedule",
     "build_reference_split_kv_runtime_plan_set",
     "CPAttentionReferenceOp",
+    "DeterministicAttentionCore",
+    "DeterministicAttentionCoreResult",
     "DeterministicCPAttentionReferenceOp",
     "GradientDriftStats",
+    "STRICT_ATTENTION_CORE_ID",
+    "STRICT_ATTENTION_SCHEDULE_ID",
     "compare_cp_attention_backward",
     "merge_attention_partial_states",
     "split_kv_execution_plan_provenance",
