@@ -8,6 +8,7 @@ import torch
 from rl_engine.kernels.attention_projection import (
     O_PROJ_COLLECTIVE_CONTRACT,
     QKV_COLLECTIVE_CONTRACT,
+    ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
     AttentionProjectionOp,
     split_qkv,
 )
@@ -55,6 +56,18 @@ def test_projection_accepts_native_only_after_bitwise_probe():
     assert result.plan.backend_id == "megatron.te.qkv"
     assert result.plan.fallback is False
     assert result.plan.fallback_reason is None
+
+
+def test_projection_records_rocm_deterministic_backend():
+    x, weight = _inputs()
+    result = AttentionProjectionOp(
+        "qkv",
+        deterministic=_deterministic,
+        deterministic_backend_id=ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
+    )(x, weight)
+
+    assert result.plan.backend_id == ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID
+    assert result.plan.fallback is True
 
 
 def test_projection_rejects_native_drift_and_records_reason():

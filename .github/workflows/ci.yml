@@ -81,12 +81,37 @@ jobs:
         run: |
           python -m pytest tests/test_attention.py -v -k "not large and not gpu"
 
+      - name: Run WS2 Attention Cross-Configuration Tests (CPU-safe)
+        run: |
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
+            tests/test_attention_ablation.py \
+            tests/test_attention_contract.py \
+            tests/test_attention_cross_config_binding.py \
+            tests/test_attention_preprocess.py \
+            tests/test_attention_projection.py \
+            tests/test_cp_attention.py \
+            tests/test_cp_attention_transformer_engine.py
+
       - name: Run KV-Cache Attention Ground-Truth Tests (CPU-safe)
         run: |
           python -m pytest tests/test_kv_cache_attention.py -v -k "not large and not gpu"
 
+<<<<<<< HEAD
       - name: Run WS2 Attention Contract Tests (CPU-safe)
         run: python -m pytest tests/test_attention_contract.py -v
+=======
+      - name: Run WS2 Logprob Contract Tests (CPU-safe)
+        run: python -m pytest tests/test_logprob_contract.py -v
+
+      - name: Run WS2 Vocab-Parallel Logprob Tests (CPU-safe)
+        run: python -m pytest tests/test_vocab_parallel_logp.py -v
+
+      - name: Run WS2 Wrapper Interface and FFN Tests (CPU-safe)
+        run: |
+          python -m pytest -q \
+            tests/test_alignment_wrapper_interfaces.py \
+            tests/test_qwen_ffn.py
+>>>>>>> origin/test
 
   docs:
     runs-on: ubuntu-latest

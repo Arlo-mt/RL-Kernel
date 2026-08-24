@@ -24,7 +24,16 @@
       "prefill only; strict PR4 acceptance covers CP=2 prefill/chunked prefill.",
       "A decode request that becomes CP=1 is a blocking fallback and is tested",
       "separately by the PR6 logical KV replay harness."
-    ]
+    ],
+    "debug_matrix": {
+      "schema_version": "rlkernel.debug_matrix.v1",
+      "method": "fixed_replay_one_at_a_time",
+      "module_manifest": "rl_engine.alignment.cross_config.debug_matrix",
+      "modules": ["attention", "ffn", "logp"],
+      "comparison_edges": ["train_vs_rollout_prefill", "rollout_prefill_vs_decode"],
+      "replay_identity": "fixed rollout tokens, masks, positions, cache metadata, and pre-update state",
+      "cartesian_product": false
+    }
   },
   "baseline": {
     "batch": {

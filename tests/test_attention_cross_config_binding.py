@@ -820,12 +820,8 @@ def test_strict_runtime_readback_entrypoint_binds_executed_evidence():
     ("changes", "expected_code"),
     [
         (
-            {"native_attention_arithmetic": True},
-            BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC,
-        ),
-        (
             {"strict_core_id": "different.core"},
-            BindingErrorCode.ATTENTION_CORE_MISSING,
+            BindingErrorCode.ATTENTION_CORE_MISMATCH,
         ),
         (
             {"strict_schedule": "different_schedule"},
@@ -859,6 +855,81 @@ def test_strict_runtime_readback_rejects_non_shared_attention_arithmetic(changes
 
     assert not result.passed
     assert result.issues_by_code(expected_code)
+
+
+@pytest.mark.parametrize(
+    ("actual_backend", "core_id", "schedule", "communication_backend"),
+    [
+        (
+            "flash_attention_4.cute",
+            "rlkernel.attention.flash_attention4.num_splits1.v1",
+            "single_batch_flash_attention4_num_splits1",
+            "cuda_ag_rs",
+        ),
+        (
+            "aiter.rocm.ck_dense_mha",
+            "rlkernel.attention.aiter_ck.num_splits1.v1",
+            "single_batch_aiter_ck_num_splits1",
+            "rccl_ag_rs",
+        ),
+    ],
+)
+def test_strict_runtime_readback_accepts_same_qualified_vendor_core(
+    actual_backend, core_id, schedule, communication_backend
+):
+    rollout = replace(
+        _strict_readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
+        strict_core_id=core_id,
+        strict_schedule=schedule,
+        native_attention_arithmetic=True,
+        actual_backend=actual_backend,
+        communication_backend=communication_backend,
+    )
+    training = replace(
+        _strict_readback(
+            MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
+        ),
+        strict_core_id=core_id,
+        strict_schedule=schedule,
+        native_attention_arithmetic=True,
+        actual_backend=actual_backend,
+        communication_backend=communication_backend,
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id=actual_backend,
+        training_backend_id=actual_backend,
+    )
+
+    assert result.passed
+
+
+def test_strict_runtime_readback_rejects_vendor_arithmetic_mismatch():
+    rollout = _strict_readback(
+        VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"
+    )
+    training = replace(
+        _strict_readback(
+            MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
+        ),
+        native_attention_arithmetic=True,
+    )
+
+    result = bind_attention_runtime_readbacks(
+        rollout=rollout,
+        training=training,
+        rollout_identity=_identity(),
+        training_identity=_identity(),
+        rollout_backend_id=rollout.actual_backend,
+        training_backend_id=training.actual_backend,
+    )
+
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.ATTENTION_NATIVE_ARITHMETIC)
 
 
 def test_strict_runtime_readback_accepts_shared_no_split_k_core():
@@ -895,10 +966,11 @@ def test_strict_runtime_readback_accepts_shared_no_split_k_core():
     ("field", "value", "error_code"),
     [
         (
-            "actual_backend",
-            "rlkernel.attention.cp_reference",
+            "reference_only",
+            True,
             BindingErrorCode.ATTENTION_BACKEND_MISSING,
         ),
+        ("attention_fallback", True, BindingErrorCode.ATTENTION_BACKEND_MISSING),
         (
             "communication_backend",
             "p2p_nccl_reference",
@@ -957,17 +1029,23 @@ def test_strict_runtime_readback_accepts_common_deterministic_preprocess_fallbac
     assert result.passed
 
 
-def test_strict_runtime_readback_accepts_distinct_verified_native_preprocess_backends():
+def test_strict_runtime_readback_rejects_distinct_native_preprocess_backends():
     rollout = replace(
         _readback(VllmRolloutMaterializer(), ROLLOUT_KNOBS, source="vllm.runtime_readback"),
-        preprocess_backends={"qk_rmsnorm": "native.vllm.rmsnorm", "rope": "native.vllm.rope"},
+        preprocess_backends={
+            "qk_rmsnorm": "transformer_engine.rocm.rmsnorm",
+            "rope": "rlkernel.rocm.deterministic_rope",
+        },
         preprocess_probe_id="rollout-probe",
     )
     training = replace(
         _readback(
             MegatronAttentionMaterializer(), TRAINING_KNOBS, source="megatron.runtime_readback"
         ),
-        preprocess_backends={"qk_rmsnorm": "native.te.rmsnorm", "rope": "native.te.rope"},
+        preprocess_backends={
+            "qk_rmsnorm": "transformer_engine.cuda.rmsnorm",
+            "rope": "rlkernel.cuda.rope_sm90",
+        },
         preprocess_probe_id="training-probe",
     )
 
@@ -980,7 +1058,8 @@ def test_strict_runtime_readback_accepts_distinct_verified_native_preprocess_bac
         training_backend_id="megatron.te",
     )
 
-    assert result.passed
+    assert not result.passed
+    assert result.issues_by_code(BindingErrorCode.ATTENTION_PREPROCESS_MISMATCH)
 
 
 @pytest.mark.parametrize(
@@ -1274,6 +1353,8 @@ def test_scenario_uses_megatron_vocabulary_only():
     assert training["tensor_parallel_size"] == 2
     assert training["context_parallel_size"] == 2
     assert config["baseline"]["rollout"]["batch_invariant"] is True
+    assert config["scenario"]["debug_matrix"]["modules"] == ["attention", "ffn", "logp"]
+    assert config["scenario"]["debug_matrix"]["cartesian_product"] is False
 
 
 def test_scenario_knob_paths_all_exist():

@@ -701,6 +701,8 @@ def test_strict_reference_is_bitwise_across_batch_cp_and_backward():
     cp2_out, cp2_lse = op.forward_with_lse(
         q, k, v, cp_world_size=2, kv_chunk_size=3
     )
+    cp1_out, cp1_lse = op.forward_with_lse(q, k, v, cp_world_size=1, kv_chunk_size=3)
+    cp2_out, cp2_lse = op.forward_with_lse(q, k, v, cp_world_size=2, kv_chunk_size=3)
     single_out, single_lse = op.forward_with_lse(
         q[:1], k[:1], v[:1], cp_world_size=1, kv_chunk_size=3
     )

@@ -47,6 +47,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create new attempts even when matching COMPLETE artifacts exist",
     )
+
+    report = commands.add_parser(
+        "report",
+        help="render a sealed attempt as an offline drift report",
+    )
+    report.add_argument("attempt_dir", type=Path, help="Completed cross-config attempt directory")
+    report.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        required=True,
+        help="Output .rlk-drift bundle, .png/.jpg image, or .json trace",
+    )
+    report.add_argument("--title", default=None, help="Optional report title")
+    report.add_argument(
+        "--no-preview", action="store_true", help="Omit PNG from a .rlk-drift bundle"
+    )
     return parser
 
 
@@ -63,11 +80,14 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        config = load_config(args.config)
-        if args.command == "plan":
-            summary = record_plan(config, args.output_root)
+        if args.command == "report":
+            summary = _report(args)
         else:
-            summary = _run(config, args)
+            config = load_config(args.config)
+            if args.command == "plan":
+                summary = record_plan(config, args.output_root)
+            else:
+                summary = _run(config, args)
     except Exception as exc:
         summary = {
             "schema_version": "cross_config.cli_summary.v1",
@@ -83,6 +103,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "plan":
         print(
             f"planned {summary['planned_case_count']} cases; no runtime was created",
+            file=sys.stderr,
+        )
+        return 0
+    if args.command == "report":
+        print(
+            f"drift report: {summary['status']} ({summary['output']})",
             file=sys.stderr,
         )
         return 0
@@ -132,6 +158,37 @@ def _run(config: ExperimentConfig, args: argparse.Namespace) -> dict[str, Any]:
         timeout_seconds=args.timeout_seconds,
         resume=not args.no_resume,
     )
+
+
+def _report(args: argparse.Namespace) -> dict[str, Any]:
+    from rl_engine.alignment.cross_config.drift_report import (
+        build_cross_config_attempt_report,
+        write_drift_bundle,
+        write_drift_report_image,
+        write_drift_trace,
+    )
+
+    report = build_cross_config_attempt_report(args.attempt_dir, title=args.title)
+    suffix = args.output.suffix.lower()
+    if suffix == ".rlk-drift":
+        output = write_drift_bundle(report, args.output, include_preview=not args.no_preview)
+        artifact_type = "bundle"
+    elif suffix in {".png", ".jpg", ".jpeg"}:
+        output = write_drift_report_image(report, args.output)
+        artifact_type = "image"
+    elif suffix == ".json":
+        output = write_drift_trace(report, args.output)
+        artifact_type = "trace"
+    else:
+        raise ValueError("report output must use .rlk-drift, .png/.jpg, or .json")
+    return {
+        "schema_version": "cross_config.drift_report_summary.v1",
+        "status": report["status"],
+        "artifact_type": artifact_type,
+        "output": str(output),
+        "case_id": report["axes"].get("case_id"),
+        "attempt_id": report["axes"].get("attempt_id"),
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover

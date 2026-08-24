@@ -5,8 +5,8 @@
 
 The matrix needs one stable callable shape even though training and rollout may
 materialize different Attention backends. This adapter owns the common
-contract checks and provenance only; numerical work remains in the existing
-deterministic Attention implementations.
+contract checks and provenance only; numerical work remains in the qualified
+CUDA/ROCm production cores or the explicit RL-Kernel reference core.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 import torch
 from torch import Tensor
@@ -33,6 +33,7 @@ from rl_engine.kernels.attention_contract import (
 
 BACKEND_ID = "rlkernel.attention.deterministic.v1"
 REFERENCE_BACKEND_ID = "rlkernel.attention.reference.v1"
+_STRICT_AG_RS_BACKENDS = frozenset({"self_owned_cuda_ag_rs", "cuda_ag_rs", "rccl_ag_rs"})
 
 _TORCH_DTYPES = {
     AttentionDType.BF16: torch.bfloat16,
@@ -59,7 +60,10 @@ class AttentionAblationConfig:
             raise AttentionContractError("Attention backend must be a non-empty string")
         if not isinstance(self.deterministic, bool):
             raise AttentionContractError("deterministic must be a bool")
-        if not isinstance(self.communication_backend, str) or not self.communication_backend.strip():
+        if (
+            not isinstance(self.communication_backend, str)
+            or not self.communication_backend.strip()
+        ):
             raise AttentionContractError("communication_backend must be a non-empty string")
         for name in ("return_lse", "return_gradients", "validate"):
             if not isinstance(getattr(self, name), bool):
@@ -117,9 +121,7 @@ class AttentionAblationResult:
             "out_shape": list(self.out.shape),
             "out_dtype": str(self.out.dtype).replace("torch.", ""),
             "lse_shape": None if self.lse is None else list(self.lse.shape),
-            "lse_dtype": None
-            if self.lse is None
-            else str(self.lse.dtype).replace("torch.", ""),
+            "lse_dtype": None if self.lse is None else str(self.lse.dtype).replace("torch.", ""),
             "gradients": {
                 "dq": self.dq is not None,
                 "dk": self.dk is not None,
@@ -156,7 +158,7 @@ class AttentionAblationOp:
         self.core = core
         self.reference = reference
         self.native = native
-        # CP production execution is injected by the runtime adapter.  Keeping
+        # CP production execution is injected by the runtime adapter. Keeping
         # it separate from the single-device core prevents an accidental
         # fallback to the PyTorch reference when AG/RS is required.
         self.cp_backend = cp_backend
@@ -216,7 +218,9 @@ class AttentionAblationOp:
             raise AttentionContractError("contract must be an AttentionContract")
         backend_request = (
             backend
-            if callable(backend) or hasattr(backend, "forward_with_lse") or hasattr(backend, "apply")
+            if callable(backend)
+            or hasattr(backend, "forward_with_lse")
+            or hasattr(backend, "apply")
             else None
         )
         cfg = _resolve_config(
@@ -234,16 +238,17 @@ class AttentionAblationOp:
         )
         if cfg.validate:
             self._validate_inputs(q, k, v, contract)
-        if cfg.deterministic and contract.split_kv.mode is SplitKVMode.AUTO:
+        if cfg.deterministic and contract.split_kv.mode is not SplitKVMode.DISABLED:
             raise AttentionContractError(
-                "deterministic Attention cannot use runtime-dependent Split-KV=auto"
+                "strict deterministic Attention requires Split-KV to be disabled"
             )
-        if cfg.deterministic and (
-            cfg.strict_core_id != STRICT_ATTENTION_CORE_ID
-            or cfg.strict_schedule != STRICT_ATTENTION_SCHEDULE_ID
+        if (
+            cfg.deterministic
+            and contract.sharding.cp_world_size > 1
+            and cfg.communication_backend not in _STRICT_AG_RS_BACKENDS
         ):
             raise AttentionContractError(
-                "strict deterministic Attention requires the canonical core and schedule"
+                "strict CP Attention requires an explicit CUDA AG/RS or ROCm RCCL AG/RS backend"
             )
         if cfg.deterministic and not cfg.return_lse:
             raise AttentionContractError("strict deterministic Attention must return LSE")
@@ -266,10 +271,7 @@ class AttentionAblationOp:
         selected_core_id = getattr(selected, "core_id", None)
         selected_schedule = getattr(selected, "strict_schedule", None)
         if cfg.deterministic and selected_id not in {BACKEND_ID, REFERENCE_BACKEND_ID}:
-            if (
-                selected_core_id != cfg.strict_core_id
-                or selected_schedule != cfg.strict_schedule
-            ):
+            if selected_core_id != cfg.strict_core_id or selected_schedule != cfg.strict_schedule:
                 raise AttentionContractError(
                     "deterministic Attention requires the shared strict core and schedule"
                 )
@@ -280,9 +282,7 @@ class AttentionAblationOp:
         call_kwargs.setdefault("cp_world_size", contract.sharding.cp_world_size)
         if contract.split_kv.mode is SplitKVMode.FIXED:
             call_kwargs.setdefault("kv_chunk_size", contract.split_kv.fixed_split_size)
-        out, lse, backend_provenance = self._invoke(
-            selected, q, k, v, call_kwargs, contract
-        )
+        out, lse, backend_provenance = self._invoke(selected, q, k, v, call_kwargs, contract)
         if cfg.validate:
             self._validate_outputs(out, lse, q, contract)
         _validate_runtime_provenance(
@@ -301,19 +301,13 @@ class AttentionAblationOp:
             "semantic_operator": "attention",
             "backend_id": selected_id,
             "deterministic": cfg.deterministic,
-            "strict_core_id": (
-                cfg.strict_core_id
-                if cfg.deterministic
-                else None
-            ),
+            "strict_core_id": (cfg.strict_core_id if cfg.deterministic else None),
             "strict_schedule": cfg.strict_schedule if cfg.deterministic else None,
             "core_id": cfg.strict_core_id if cfg.deterministic else selected_id,
             "backend_deterministic": cfg.deterministic,
             "native_attention_arithmetic": False if cfg.deterministic else selected_id == "native",
             "communication_backend": cfg.communication_backend,
-            "communication_executed": bool(
-                getattr(selected, "communication_executed", False)
-            ),
+            "communication_executed": bool(getattr(selected, "communication_executed", False)),
             "split_kv": contract.split_kv.to_dict(),
             "actual_split_kv": _actual_split_provenance(
                 contract,
@@ -353,7 +347,11 @@ class AttentionAblationOp:
         *,
         communication_backend: str,
     ) -> tuple[Any, str]:
-        if callable(requested) or hasattr(requested, "forward_with_lse") or hasattr(requested, "apply"):
+        if (
+            callable(requested)
+            or hasattr(requested, "forward_with_lse")
+            or hasattr(requested, "apply")
+        ):
             return requested, _callable_backend_id(requested)
         normalized = str(requested).strip().lower()
         if normalized in {"native", "te", "flashinfer"}:
@@ -367,7 +365,7 @@ class AttentionAblationOp:
         if normalized not in {"auto", "deterministic", "rlkernel"}:
             raise AttentionContractError(f"unsupported Attention backend {requested!r}")
         if contract.sharding.cp_world_size > 1:
-            if communication_backend == "self_owned_cuda_ag_rs":
+            if communication_backend in _STRICT_AG_RS_BACKENDS:
                 if self.cp_backend is None:
                     raise AttentionContractError(
                         "CP production Attention requires an injected AG/RS backend"
@@ -398,7 +396,11 @@ class AttentionAblationOp:
         if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
             raise AttentionContractError("q, k, and v must use [B, H, S, D] layout")
         expected_dtype = _TORCH_DTYPES[contract.dtype]
-        if q.dtype is not expected_dtype or k.dtype is not expected_dtype or v.dtype is not expected_dtype:
+        if (
+            q.dtype is not expected_dtype
+            or k.dtype is not expected_dtype
+            or v.dtype is not expected_dtype
+        ):
             raise AttentionContractError(
                 f"q, k, and v must match contract dtype {contract.dtype.value}"
             )
@@ -416,7 +418,12 @@ class AttentionAblationOp:
         sharding = contract.sharding
         if q_heads != sharding.local_q_heads or k.shape[1] != sharding.local_kv_heads:
             raise AttentionContractError("q/k head counts do not match TP sharding in contract")
-        if k.shape[0] != batch or v.shape[:3] != k.shape[:3] or k.shape[-1] != dim or v.shape[-1] != dim:
+        if (
+            k.shape[0] != batch
+            or v.shape[:3] != k.shape[:3]
+            or k.shape[-1] != dim
+            or v.shape[-1] != dim
+        ):
             raise AttentionContractError("q, k, and v shapes are inconsistent")
         if dim != contract.head_dim:
             raise AttentionContractError("tensor head_dim does not match AttentionContract")
@@ -459,12 +466,14 @@ class AttentionAblationOp:
                 "Attention backend must expose forward_with_lse, apply, or __call__"
             )
         accepted = _accepted_kwargs(method, kwargs)
-        if contract.sharding.cp_world_size > 1 and "cp_world_size" not in accepted:
+        if contract.sharding.cp_world_size > 1 and not _declares_keyword(method, "cp_world_size"):
             raise AttentionContractError(
                 "CP>1 requires an Attention backend that explicitly accepts cp_world_size"
             )
         result = method(q, k, v, **accepted)
         backend_provenance: dict[str, Any] = {}
+        out: Any
+        lse: Any
         if isinstance(result, AttentionAblationResult):
             out, lse = result.out, result.lse
         elif isinstance(result, tuple) and len(result) == 2:
@@ -502,16 +511,21 @@ class AttentionAblationOp:
             gradients = getattr(result, "gradients", None)
             if gradients is not None:
                 return gradients.dq, gradients.dk, gradients.dv
+        if dout is None:
+            raise AttentionContractError("dout is required to compute Attention gradients")
         if not out.requires_grad:
             raise AttentionContractError(
                 "Attention backend did not retain an autograd graph for gradients"
             )
-        return torch.autograd.grad(
-            out,
-            (q, k, v),
-            grad_outputs=dout.to(dtype=out.dtype),
-            allow_unused=False,
-            retain_graph=True,
+        return cast(
+            tuple[Tensor, Tensor, Tensor],
+            torch.autograd.grad(
+                out,
+                (q, k, v),
+                grad_outputs=dout.to(dtype=out.dtype),
+                allow_unused=False,
+                retain_graph=True,
+            ),
         )
 
 
@@ -554,8 +568,23 @@ def _accepted_kwargs(method: Callable[..., Any], kwargs: Mapping[str, Any]) -> d
     return {name: value for name, value in kwargs.items() if name in signature.parameters}
 
 
+def _declares_keyword(method: Callable[..., Any], name: str) -> bool:
+    """Return whether ``method`` explicitly declares a keyword-capable parameter."""
+
+    try:
+        parameter = inspect.signature(method).parameters.get(name)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+
+
 def _callable_backend_id(value: Any) -> str:
-    explicit = getattr(value, "backend_id", None) or getattr(value, "__attention_backend_id__", None)
+    explicit = getattr(value, "backend_id", None) or getattr(
+        value, "__attention_backend_id__", None
+    )
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     return f"injected.{type(value).__module__}.{type(value).__qualname__}"
@@ -576,33 +605,26 @@ def _validate_runtime_provenance(
             "deterministic Attention cannot execute native Attention arithmetic"
         )
 
-    actual_core = runtime.get("strict_core_id", getattr(selected, "core_id", None))
-    actual_schedule = runtime.get("strict_schedule", getattr(selected, "strict_schedule", None))
-    if selected_id != REFERENCE_BACKEND_ID and (
-        actual_core != config.strict_core_id or actual_schedule != config.strict_schedule
-    ):
-        raise AttentionContractError(
-            "deterministic Attention backend did not prove the shared strict core and schedule"
-        )
-
-    if config.communication_backend != "self_owned_cuda_ag_rs":
+    external_production_backend = selected_id not in {BACKEND_ID, REFERENCE_BACKEND_ID}
+    if not external_production_backend:
         return
 
     expected = {
         "strict_core_id": config.strict_core_id,
         "strict_schedule": config.strict_schedule,
-        "actual_backend": "rlkernel.cuda.deterministic_attention",
-        "communication_backend": "self_owned_cuda_ag_rs",
+        "actual_backend": selected_id,
         "production_ready": True,
-        "native_attention_arithmetic": False,
         "fallback": False,
+        "reference_only": False,
     }
-    mismatches = [
-        name for name, value in expected.items() if runtime.get(name) != value
-    ]
+    if config.communication_backend in _STRICT_AG_RS_BACKENDS:
+        expected["communication_backend"] = config.communication_backend
+    mismatches = [name for name, value in expected.items() if runtime.get(name) != value]
+    if not isinstance(runtime.get("native_attention_arithmetic"), bool):
+        mismatches.append("native_attention_arithmetic")
     if mismatches:
         raise AttentionContractError(
-            "CP production Attention runtime provenance is incomplete or mismatched: "
+            "production Attention runtime provenance is incomplete or mismatched: "
             + ", ".join(mismatches)
         )
 
