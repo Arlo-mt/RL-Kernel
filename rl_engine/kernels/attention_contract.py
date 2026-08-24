@@ -157,6 +157,8 @@ class ShardingSpec:
         tp_rank = _non_negative_int(self.tp_rank, "tp_rank")
         cp_rank = _non_negative_int(self.cp_rank, "cp_rank")
         sp_rank = _non_negative_int(self.sp_rank, "sp_rank")
+        tp_rank = _non_negative_int(self.tp_rank, "tp_rank")
+        cp_rank = _non_negative_int(self.cp_rank, "cp_rank")
         if tp_rank >= tp_world_size:
             raise AttentionContractError(
                 f"tp_rank={tp_rank} must be smaller than tp_world_size={tp_world_size}"
