@@ -270,9 +270,7 @@ def compare_decode_kv_replay(
     _validate_decode_inputs(inputs)
     if strict_bitwise:
         reference = _run_decode_strict_shared_core(inputs, materialization="logical_prefill")
-        candidates = [
-            _run_decode_strict_shared_core(inputs, materialization="paged_kv_layout")
-        ]
+        candidates = [_run_decode_strict_shared_core(inputs, materialization="paged_kv_layout")]
     else:
         reference = _run_decode_full_prefill_reference(inputs)
         candidates = [_run_decode_kv_replay(inputs, merge_backend="rl_kernel")]

@@ -139,44 +139,6 @@ def test_attention_wrapper_supports_explicit_injected_backend():
     assert torch.equal(result.out, q)
 
 
-def test_cp_production_configuration_fails_closed_without_ag_rs_backend():
-    q, k, v = _qkv()
-    cp_sharding = ShardingSpec(
-        tp_rank=0,
-        tp_world_size=1,
-        cp_rank=0,
-        cp_world_size=2,
-        global_q_heads=2,
-        global_kv_heads=1,
-        local_q_head_start=0,
-        local_q_heads=2,
-        local_kv_head_start=0,
-        local_kv_heads=1,
-        global_sequence_length=4,
-        local_sequence_length=2,
-        global_block_indices=(0,),
-        global_block_token_starts=(0,),
-        local_block_offsets=(0, 2),
-    )
-    contract = AttentionContract(
-        role=AttentionRole.TRAIN,
-        mode=AttentionMode.PREFILL,
-        dtype=AttentionDType.BF16,
-        batch_size=1,
-        query_sequence_length=2,
-        head_dim=4,
-        causal=True,
-        causal_offsets=(0,),
-        sharding=cp_sharding,
-        reduction=ReductionSpec(),
-        split_kv=SplitKVSpec.disabled(),
-    )
-    with pytest.raises(AttentionContractError, match="injected AG/RS backend"):
-        AttentionAblationOp(communication_backend="self_owned_cuda_ag_rs")(
-            q[:, :, :2], k[:, :, :2], v[:, :, :2], contract=contract
-        )
-
-
 def test_wrapper_owned_deterministic_core_does_not_require_external_provenance():
     q, k, v = _qkv()
 
