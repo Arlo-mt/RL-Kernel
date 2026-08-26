@@ -109,8 +109,10 @@ void deterministic_collective_all_gather(int64_t handle, torch::Tensor& output);
 
 // Batch-Invariant Deterministic GEMM Declarations
 torch::Tensor det_gemm_fwd(torch::Tensor a, torch::Tensor b);
+torch::Tensor det_gemm_fwd_rhs_transposed(torch::Tensor a, torch::Tensor bt);
 torch::Tensor det_gemm_da(torch::Tensor dc, torch::Tensor b);
 torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc);
+torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc);
 // SiLU / SwiGLU Declarations (elementwise activation, general CUDA)
 torch::Tensor silu_forward_cuda(torch::Tensor x);
 torch::Tensor silu_backward_cuda(torch::Tensor dy, torch::Tensor x);
@@ -420,8 +422,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // registry Batch-Invariant Deterministic GEMM
     m.def("det_gemm_fwd", &det_gemm_fwd, "Batch-invariant deterministic GEMM forward (C=A@B)");
+    m.def(
+        "det_gemm_fwd_rhs_transposed",
+        &det_gemm_fwd_rhs_transposed,
+        "Batch-invariant deterministic GEMM with physical Bt[N,K] (C=A@Bt^T)");
     m.def("det_gemm_da", &det_gemm_da, "Batch-invariant deterministic GEMM backward dA (dC@B^T)");
     m.def("det_gemm_db", &det_gemm_db, "Batch-invariant deterministic GEMM backward dB (A^T@dC)");
+    m.def(
+        "det_gemm_db_transposed",
+        &det_gemm_db_transposed,
+        "Batch-invariant deterministic GEMM backward in canonical [N,K] layout");
     // registry RMSNorm
     m.def("rmsnorm_forward", &rmsnorm_forward, "Batch-invariant RMSNorm forward CUDA");
     m.def("rmsnorm_backward_dx", &rmsnorm_backward_dx, "Batch-invariant RMSNorm backward dx CUDA");
