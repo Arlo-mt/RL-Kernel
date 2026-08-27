@@ -42,6 +42,10 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_CK = "rl_engine.kernels.ops.rocm.composable_kernel.CKOp"
     ROCM_FLASH_ATTN = "rl_engine.kernels.ops.rocm.attention.flash_attn.RocmFlashAttentionOp"
 
+    # Moore Threads MUSA correctness-first adapters
+    MUSA_LOGP = "rl_engine.kernels.ops.musa.loss.logp.MusaLogpOp"
+    MUSA_LINEAR_LOGP = "rl_engine.kernels.ops.musa.loss.linear_logp.MusaLinearLogpOp"
+
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
     PYTORCH_GRPO_LOSS = "rl_engine.kernels.ops.pytorch.loss.grpo_loss.NativeGRPOLossOp"
@@ -161,7 +165,7 @@ def resolve_logp_op_type(
 class KernelRegistry:
     """
     Central dispatcher for high-performance kernels.
-    Handles dynamic routing between ROCm and CUDA backends at runtime.
+    Handles dynamic routing between CUDA, ROCm, and MUSA backends at runtime.
     """
 
     def __init__(self):
@@ -196,7 +200,11 @@ class KernelRegistry:
                     OpBackend.CUDA_DETERMINISTIC_LOGP,
                     OpBackend.PYTORCH_NATIVE,
                 ],
-                "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
+                "attn": [
+                    OpBackend.FLASH_ATTN,
+                    OpBackend.TRITON_GENERIC,
+                    OpBackend.PYTORCH_ATTN,
+                ],
                 "attention": [
                     OpBackend.CUDA_DETERMINISTIC_ATTENTION,
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
@@ -252,7 +260,10 @@ class KernelRegistry:
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
-                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
+                "linear_logp": [
+                    OpBackend.TRITON_LINEAR_LOGP,
+                    OpBackend.PYTORCH_LINEAR_LOGP,
+                ],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
@@ -266,6 +277,30 @@ class KernelRegistry:
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
+            },
+            "musa": {
+                "logp": [OpBackend.MUSA_LOGP],
+                "logp_indexed": [OpBackend.MUSA_LOGP],
+                "logp_online": [OpBackend.MUSA_LOGP],
+                "logp_online_indexed": [OpBackend.MUSA_LOGP],
+                "logp_deterministic": [OpBackend.MUSA_LOGP],
+                "logp_deterministic_indexed": [OpBackend.MUSA_LOGP],
+                "attn": [OpBackend.PYTORCH_ATTN],
+                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
+                "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
+                "linear_logp": [OpBackend.MUSA_LINEAR_LOGP],
+                "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "pack": [OpBackend.PYTORCH_PACK],
+                "det_gemm": [],
+                "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
+                "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
+                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],
@@ -405,6 +440,8 @@ class KernelRegistry:
         if device is None:
             if device_ctx.is_rocm:
                 return "rocm"
+            if device_ctx.is_musa:
+                return "musa"
             if device_ctx.device_type == "cuda":
                 return "cuda"
             return "cpu"
@@ -412,6 +449,8 @@ class KernelRegistry:
         resolved = torch.device(device)
         if resolved.type == "cuda":
             return "rocm" if torch.version.hip is not None else "cuda"
+        if resolved.type == "musa":
+            return "musa"
         if resolved.type in self._priority_map:
             return resolved.type
         return "cpu"
