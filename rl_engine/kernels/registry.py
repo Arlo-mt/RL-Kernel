@@ -42,10 +42,6 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ROCM_CK = "rl_engine.kernels.ops.rocm.composable_kernel.CKOp"
     ROCM_FLASH_ATTN = "rl_engine.kernels.ops.rocm.attention.flash_attn.RocmFlashAttentionOp"
 
-    # Moore Threads MUSA correctness-first adapters
-    MUSA_LOGP = "rl_engine.kernels.ops.musa.loss.logp.MusaLogpOp"
-    MUSA_LINEAR_LOGP = "rl_engine.kernels.ops.musa.loss.linear_logp.MusaLinearLogpOp"
-
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
     PYTORCH_GRPO_LOSS = "rl_engine.kernels.ops.pytorch.loss.grpo_loss.NativeGRPOLossOp"
@@ -279,21 +275,21 @@ class KernelRegistry:
                 "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
             "musa": {
-                "logp": [OpBackend.MUSA_LOGP],
-                "logp_indexed": [OpBackend.MUSA_LOGP],
-                "logp_online": [OpBackend.MUSA_LOGP],
-                "logp_online_indexed": [OpBackend.MUSA_LOGP],
-                "logp_deterministic": [OpBackend.MUSA_LOGP],
-                "logp_deterministic_indexed": [OpBackend.MUSA_LOGP],
+                "logp": [OpBackend.PYTORCH_NATIVE],
+                "logp_indexed": [OpBackend.PYTORCH_NATIVE],
+                "logp_online": [OpBackend.PYTORCH_NATIVE],
+                "logp_online_indexed": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
-                "linear_logp": [OpBackend.MUSA_LINEAR_LOGP],
+                "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
-                "det_gemm": [],
+                "det_gemm": [OpBackend.PYTORCH_GEMM],
                 "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
