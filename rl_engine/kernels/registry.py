@@ -196,11 +196,7 @@ class KernelRegistry:
                     OpBackend.CUDA_DETERMINISTIC_LOGP,
                     OpBackend.PYTORCH_NATIVE,
                 ],
-                "attn": [
-                    OpBackend.FLASH_ATTN,
-                    OpBackend.TRITON_GENERIC,
-                    OpBackend.PYTORCH_ATTN,
-                ],
+                "attn": [OpBackend.FLASH_ATTN, OpBackend.TRITON_GENERIC, OpBackend.PYTORCH_ATTN],
                 "attention": [
                     OpBackend.CUDA_DETERMINISTIC_ATTENTION,
                     OpBackend.PYTORCH_NATIVE_ATTENTION,
@@ -256,10 +252,7 @@ class KernelRegistry:
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.TRITON_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.TRITON_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
-                "linear_logp": [
-                    OpBackend.TRITON_LINEAR_LOGP,
-                    OpBackend.PYTORCH_LINEAR_LOGP,
-                ],
+                "linear_logp": [OpBackend.TRITON_LINEAR_LOGP, OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.TRITON_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [OpBackend.TRITON_DET_GEMM],
