@@ -116,6 +116,88 @@ __global__ void det_gemm_naive(const nv_bf16* __restrict__ A,
       __bfloat162float(k_tree_naive(A, B, row, col, N, K, 0, K)));
 }
 
+// Weight gradients in the FFN are an outer-product GEMM when the token batch
+// is small: dW = dY^T @ X.  The regular scalar fallback assigns one 16x16
+// block to each output tile.  For Qwen3's [out,in] projections that creates
+// roughly 200k blocks at M=1/8 and repeatedly reloads the same token rows.
+// This path keeps the exact scalar accumulation order (tokens are visited in
+// ascending order and the result is rounded once to BF16), but stages one
+// token tile and computes a 128x128 output tile with 256 threads.  It also
+// consumes X in its native [tokens,in] layout, so no X.T.contiguous() helper
+// allocation is needed.
+constexpr int SMALL_K_TILE = K_TREE_LEAF;
+constexpr int SMALL_M_TILE = 128;
+constexpr int SMALL_N_TILE = 128;
+constexpr int SMALL_THREADS = 256;
+
+template <typename output_t>
+__global__ void det_gemm_db_small_k(const nv_bf16* __restrict__ X,
+                                    const nv_bf16* __restrict__ dY,
+                                    output_t* __restrict__ dW,
+                                    int tokens,
+                                    int in_features,
+                                    int out_features) {
+  extern __shared__ __align__(1024) nv_bf16 smem[];
+  nv_bf16* sX = smem;
+  nv_bf16* sY = sX + SMALL_K_TILE * SMALL_N_TILE;
+
+  const int tid = threadIdx.x;
+  const int in_base = blockIdx.x * SMALL_N_TILE;
+  const int out_base = blockIdx.y * SMALL_M_TILE;
+
+  // The shared tile is padded to 32 tokens. Zero padding makes the launch
+  // shape independent of the token count while the loop below still visits
+  // exactly the original [0,tokens) reduction range.
+  for (int index = tid; index < SMALL_K_TILE * SMALL_N_TILE; index += blockDim.x) {
+    const int token = index / SMALL_N_TILE;
+    const int feature = index % SMALL_N_TILE;
+    const int global_feature = in_base + feature;
+    sX[index] = (token < tokens && global_feature < in_features)
+                    ? X[token * in_features + global_feature]
+                    : __float2bfloat16(0.0f);
+  }
+  for (int index = tid; index < SMALL_K_TILE * SMALL_M_TILE; index += blockDim.x) {
+    const int token = index / SMALL_M_TILE;
+    const int output = index % SMALL_M_TILE;
+    const int global_output = out_base + output;
+    sY[index] = (token < tokens && global_output < out_features)
+                    ? dY[token * out_features + global_output]
+                    : __float2bfloat16(0.0f);
+  }
+  __syncthreads();
+
+  // dW is physically [out_features,in_features]. Each thread computes eight
+  // elements; neighboring threads therefore issue contiguous stores.
+  for (int index = tid; index < SMALL_M_TILE * SMALL_N_TILE; index += blockDim.x) {
+    const int output = index / SMALL_N_TILE;
+    const int feature = index % SMALL_N_TILE;
+    const int global_output = out_base + output;
+    const int global_feature = in_base + feature;
+    if (global_output >= out_features || global_feature >= in_features) continue;
+
+    float acc = 0.0f;
+    for (int token = 0; token < tokens; ++token)
+      acc += __bfloat162float(sX[token * SMALL_N_TILE + feature]) *
+             __bfloat162float(sY[token * SMALL_M_TILE + output]);
+    dW[global_output * in_features + global_feature] = cast_output<output_t>(acc);
+  }
+}
+
+template <typename output_t>
+void launch_db_small_k(const nv_bf16* X,
+                       const nv_bf16* dY,
+                       output_t* dW,
+                       int tokens,
+                       int in_features,
+                       int out_features,
+                       cudaStream_t stream) {
+  dim3 block(SMALL_THREADS);
+  dim3 grid(cdiv(in_features, SMALL_N_TILE), cdiv(out_features, SMALL_M_TILE));
+  constexpr int smem_elements = SMALL_K_TILE * (SMALL_N_TILE + SMALL_M_TILE);
+  det_gemm_db_small_k<output_t><<<grid, block, smem_elements * sizeof(nv_bf16), stream>>>(
+      X, dY, dW, tokens, in_features, out_features);
+}
+
 template <typename output_t, bool TRANSPOSE_OUTPUT>
 void launch_naive(const nv_bf16* A, const nv_bf16* B, output_t* C,
                   int M, int N, int K, cudaStream_t stream) {
@@ -478,11 +560,29 @@ torch::Tensor det_gemm_db(torch::Tensor a, torch::Tensor dc) {
 
 torch::Tensor det_gemm_db_transposed(torch::Tensor a, torch::Tensor dc) {
   check_in(a, "A"); check_in(dc, "dC");
-  dc = dc.contiguous();
   TORCH_CHECK(a.dim() == 2 && dc.dim() == 2,
               "det_gemm_db_transposed: expect A[M,K] and dC[M,N]");
+  const int tokens = a.size(0);
+  const int in_features = a.size(1);
+  const int out_features = dc.size(1);
+  TORCH_CHECK(dc.size(0) == tokens, "det_gemm_db_transposed: M mismatch");
+
+  // The normal SM90 path expects A^T to be physically contiguous. For short
+  // token batches, materializing that transpose and launching the 16x16
+  // scalar fallback dominates the actual outer-product work. The tiled path
+  // reads A directly and preserves the same ascending-token reduction order.
+  if (tokens > 0 && tokens < SMALL_K_TILE) {
+    a = a.contiguous();
+    dc = dc.contiguous();
+    auto output = torch::empty({out_features, in_features}, a.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_db_small_k<nv_bf16>(
+        bf16(a), bf16(dc), bf16o(output), tokens, in_features, out_features, stream);
+    return output;
+  }
+
+  dc = dc.contiguous();
   auto at = a.t().contiguous();
-  TORCH_CHECK(dc.size(0) == at.size(1), "det_gemm_db_transposed: M mismatch");
   // Preserve the exact A^T @ dC MMA/tree evaluation and change only the final
   // address mapping so the canonical [N,K] weight-gradient is born contiguous.
   return gemm_dispatch(at, dc, RhsLayout::kKN, OutputLayout::kNM);
