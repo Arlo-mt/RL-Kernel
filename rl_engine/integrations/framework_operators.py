@@ -947,7 +947,8 @@ class MegatronLogpOperator:
 
     def __call__(self, request: Any) -> Any:
         logits = getattr(request, "logits", None)
-        hidden = getattr(request, "hidden", None)
+        context = getattr(request, "context", None)
+        hidden = getattr(context, "hidden", None)
         strict = os.getenv("VIME_RL_KERNEL_STRICT", "").strip().lower() in {
             "1",
             "true",
