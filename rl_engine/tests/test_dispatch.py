@@ -53,6 +53,20 @@ class TestMusaPlatform:
             lambda name: object() if name == "torch_musa" else None,
         )
 
+    @staticmethod
+    def _mock_musa_device(monkeypatch):
+        real_device = device_module.torch.device
+
+        class FakeMusaDevice:
+            type = "musa"
+
+        def fake_device(value):
+            if value == "musa":
+                return FakeMusaDevice()
+            return real_device(value)
+
+        monkeypatch.setattr(device_module.torch, "device", fake_device)
+
     def test_musa_import_failure_falls_back_to_unavailable(self, monkeypatch):
         def failing_import(name):
             if name == "torch_musa":
@@ -80,6 +94,7 @@ class TestMusaPlatform:
                 return True
 
         self._mock_torch_musa_import(monkeypatch)
+        self._mock_musa_device(monkeypatch)
         monkeypatch.setattr(device_module.torch, "musa", AvailableMusaRuntime(), raising=False)
 
         context = device_module.DeviceContext()
@@ -88,14 +103,16 @@ class TestMusaPlatform:
         assert context.is_musa is True
         assert context.device.type == "musa"
 
-    def test_musa_dispatch_uses_only_pytorch_fallbacks(self):
+    def test_musa_dispatch_uses_only_pytorch_fallbacks(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
         registry = KernelRegistry()
 
-        assert registry._platform_for_device(torch.device("musa")) == "musa"
+        assert registry._platform_for_device("musa") == "musa"
         for candidates in registry._priority_map["musa"].values():
             assert all(candidate.name.startswith("PYTORCH_") for candidate in candidates)
 
-    def test_musa_det_gemm_fails_closed(self):
+    def test_musa_det_gemm_fails_closed(self, monkeypatch):
+        self._mock_musa_device(monkeypatch)
         registry = KernelRegistry()
 
         with pytest.raises(RuntimeError, match="No functional backend"):
