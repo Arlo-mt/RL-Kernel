@@ -137,8 +137,12 @@ __global__ void det_gemm_db_small_k(const nv_bf16* __restrict__ X,
                                     int tokens,
                                     int in_features,
                                     int out_features) {
-  extern __shared__ __align__(1024) nv_bf16 smem[];
-  nv_bf16* sX = smem;
+  // Give this dynamic shared-memory symbol a kernel-specific name.  CUDA
+  // 12.4 diagnoses same-TU extern __shared__ declarations with different
+  // element types as incompatible, even though they belong to different
+  // kernels.
+  extern __shared__ __align__(1024) nv_bf16 small_k_smem[];
+  nv_bf16* sX = small_k_smem;
   nv_bf16* sY = sX + SMALL_K_TILE * SMALL_N_TILE;
 
   const int tid = threadIdx.x;
@@ -252,8 +256,8 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   const int col_base = blockIdx.x * BN;
   const int kd = K / BK;
 
-  extern __shared__ __align__(1024) char smem[];
-  nv_bf16* sA = reinterpret_cast<nv_bf16*>(smem);
+  extern __shared__ __align__(1024) char sm90_smem[];
+  nv_bf16* sA = reinterpret_cast<nv_bf16*>(sm90_smem);
   nv_bf16* sB = reinterpret_cast<nv_bf16*>(sA + STAGES * BM * BK);
   int* mbar_base = reinterpret_cast<int*>(sB + STAGES * BN * BK);
 
