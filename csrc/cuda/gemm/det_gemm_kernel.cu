@@ -71,22 +71,6 @@ __device__ __forceinline__ nv_bf16 bf16_add(nv_bf16 a, nv_bf16 b) {
   return __float2bfloat16(__bfloat162float(a) + __bfloat162float(b));
 }
 
-// True iff [lo, hi) is a node of the mid-split tree over [0, n).
-__device__ __forceinline__ bool is_mid_split_node(int lo, int hi, int n) {
-  int a = 0, b = n;
-  while (b - a > 1) {
-    if (a == lo && b == hi) return true;
-    const int m = a + (b - a) / 2;
-    if (hi <= m)
-      b = m;
-    else if (lo >= m)
-      a = m;
-    else
-      return false;
-  }
-  return a == lo && b == hi;
-}
-
 __device__ nv_bf16 k_tree_naive(const nv_bf16* __restrict__ A, const nv_bf16* __restrict__ B,
                                 int row, int col, int N, int K, int lo, int hi) {
   if (hi - lo <= K_TREE_LEAF) {
@@ -231,6 +215,21 @@ constexpr int K_TILES = BK / MMA_K;       // 2
 constexpr int KK_GROUPS = BK / 32;        // 1
 constexpr int TREE_DEPTH = 16;
 
+__device__ __forceinline__ int mid_tree_merge_count(int leaf, int n) {
+  int lo = 0, hi = n, count = 0;
+  while (hi - lo > 1) {
+    const int mid = lo + (hi - lo) / 2;
+    if (leaf < mid) {
+      hi = mid;
+      count = 0;
+    } else {
+      lo = mid;
+      ++count;
+    }
+  }
+  return count;
+}
+
 __device__ __forceinline__ void ldmatrix_x4(uint32_t regs[4], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
@@ -290,9 +289,8 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   for (int s = 0; s < STAGES; ++s) phase[s] = 0;
 
   float tile_acc[M_TILES][N_TILES][4];
-  nv_bf16 tree_v[M_TILES][N_TILES][4];
-  nv_bf16 tree_stk[TREE_DEPTH][M_TILES][N_TILES][4];
-  int tree_lo[TREE_DEPTH], tree_hi[TREE_DEPTH];
+  __nv_bfloat162 tree_v[M_TILES][N_TILES][2];
+  __nv_bfloat162 tree_stk[TREE_DEPTH][M_TILES][N_TILES][2];
   int sp = 0;
 
   if (tid == 0)
@@ -303,7 +301,7 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
   for (int k = 0; k < kd; ++k) {       // fixed ascending tile order, NO split-K
     const int buf = k % STAGES;
     if (tid == 0 && k + (STAGES - 1) < kd) issue_load(k + (STAGES - 1));
-    det_gemm::mbar_wait(mbar[buf], phase[buf]);
+    if (tid == 0) det_gemm::mbar_wait(mbar[buf], phase[buf]);
     phase[buf] ^= 1;
     __syncthreads();
 
@@ -352,29 +350,28 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
 #pragma unroll
       for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) tree_v[mi][n][i] = __float2bfloat16(tile_acc[mi][n][i]);
+        for (int i = 0; i < 2; ++i)
+          tree_v[mi][n][i] = __floats2bfloat162_rn(tile_acc[mi][n][2 * i + 0],
+                                                    tile_acc[mi][n][2 * i + 1]);
 
-    int lo = k, hi = k + 1;
-    while (sp > 0 && tree_hi[sp - 1] == lo && is_mid_split_node(tree_lo[sp - 1], hi, kd)) {
+    const int merge_count = mid_tree_merge_count(k, kd);
+    for (int merge = 0; merge < merge_count; ++merge) {
 #pragma unroll
       for (int mi = 0; mi < M_TILES; ++mi)
 #pragma unroll
         for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-          for (int i = 0; i < 4; ++i)
-            tree_v[mi][n][i] = bf16_add(tree_stk[sp - 1][mi][n][i], tree_v[mi][n][i]);
-      lo = tree_lo[sp - 1];
+          for (int i = 0; i < 2; ++i)
+            tree_v[mi][n][i] = __hadd2(tree_stk[sp - 1][mi][n][i], tree_v[mi][n][i]);
       --sp;
     }
-    if (hi < kd) {
+    if (k + 1 < kd) {
 #pragma unroll
       for (int mi = 0; mi < M_TILES; ++mi)
 #pragma unroll
         for (int n = 0; n < N_TILES; ++n)
 #pragma unroll
-          for (int i = 0; i < 4; ++i) tree_stk[sp][mi][n][i] = tree_v[mi][n][i];
-      tree_lo[sp] = lo;
-      tree_hi[sp] = hi;
+          for (int i = 0; i < 2; ++i) tree_stk[sp][mi][n][i] = tree_v[mi][n][i];
       ++sp;
     }
   }
@@ -387,15 +384,15 @@ __global__ void det_gemm_sm90_kernel(const __grid_constant__ CUtensorMap a_tmap,
       const int col = col_base + n * MMA_N + (lane % 4) * 2;
       if (row < M && col + 1 < N) {
         C[output_offset<TRANSPOSE_OUTPUT>(row, col + 0, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][0]));
+            cast_output<output_t>(__low2float(tree_v[mi][n][0]));
         C[output_offset<TRANSPOSE_OUTPUT>(row, col + 1, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][1]));
+            cast_output<output_t>(__high2float(tree_v[mi][n][0]));
       }
       if (row + 8 < M && col + 1 < N) {
         C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 0, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][2]));
+            cast_output<output_t>(__low2float(tree_v[mi][n][1]));
         C[output_offset<TRANSPOSE_OUTPUT>(row + 8, col + 1, M, N)] =
-            cast_output<output_t>(__bfloat162float(tree_v[mi][n][3]));
+            cast_output<output_t>(__high2float(tree_v[mi][n][1]));
       }
     }
   }
