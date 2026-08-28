@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+import importlib
+
 import torch
 
 from rl_engine.platforms.constants import DeviceType
@@ -10,10 +12,11 @@ from rl_engine.utils.logger import logger
 def is_musa_available() -> bool:
     """Return whether torch_musa is installed and a MUSA device is usable."""
     try:
-        import torch_musa  # noqa: F401
-    except ImportError:
+        importlib.import_module("torch_musa")
+        return bool(hasattr(torch, "musa") and torch.musa.is_available())
+    except Exception as exc:
+        logger.warning("MUSA availability check failed: %s", exc)
         return False
-    return bool(hasattr(torch, "musa") and torch.musa.is_available())
 
 
 class DeviceContext:
