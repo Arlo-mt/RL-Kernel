@@ -7,7 +7,7 @@
     .small { font: 13px sans-serif; fill: #334155; }
     .axis { font: 12px sans-serif; fill: #64748b; }
   </style>
-  <text x="70" y="45" class="title">Before — H100 CUDA kernel-time flamegraph</text>
+  <text x="70" y="45" class="title">Before — H100 CUDA kernel-time breakdown</text>
   <text x="70" y="72" class="subtitle">Nsight Systems cuda_gpu_kern_sum; tokens=1,8; aggregated over the profiled benchmark process</text>
   <text x="70" y="105" class="small">Total selected det_gemm kernel time: 666.24 ms</text>
 
