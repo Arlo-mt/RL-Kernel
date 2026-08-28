@@ -20,7 +20,7 @@ from rl_engine.integrations.framework_operators import (
 from rl_engine.integrations.linear_logp import LinearLogpWrapper
 from rl_engine.integrations.megatron import MegatronIntegration
 from rl_engine.integrations.state import get_active_integration, set_active_integration
-from rl_engine.integrations.vime.logp import _provider_impl
+from rl_engine.integrations.vime.linear_logp_provider import _provider_impl
 
 _PATCH_MARKER = "__rl_kernel_original_forward__"
 _STRICT_ATTENTION_PATCH_MARKER = "__rl_kernel_original_strict_attention_init__"
@@ -207,7 +207,7 @@ def install_megatron_integration(
             "ffn",
             ",".join(f"{cls.__module__}.{cls.__name__}.forward" for cls in resolved_ffn),
         )
-    integration.record_installed_hook("logp", "rl_engine.integrations.vime.logp.provider")
+    integration.record_installed_hook("logp", "rl_engine.integrations.vime.linear_logp_provider.provider")
     return integration
 
 
