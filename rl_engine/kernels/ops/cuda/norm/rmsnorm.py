@@ -1,6 +1,8 @@
 import torch
 
+from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
+from rl_engine.kernels.ops.vjp_fp32 import reduce_rows_fp32, rmsnorm_dweight_rows_fp32
 
 
 class RMSNormCuda(torch.autograd.Function):
@@ -55,14 +57,30 @@ class RMSNormCuda(torch.autograd.Function):
         """
         Backward:
           dx = CUDA row-wise deterministic kernel
-          dw = CUDA two-pass deterministic kernel
+          dw = FP32 row contributions followed by an ascending-row left fold
         """
         x, weight, rstd, mask = ctx.saved_tensors
         dy = grad_out.contiguous()
 
         dx = _C.rmsnorm_backward_dx(dy, x, weight, rstd)
 
-        dw = _C.rmsnorm_backward_dw(dy, x, rstd, mask).to(weight.dtype)
+        # The shape-independent FP32 left fold preserves the C2 Batch/Chunk
+        # reduction order while the CUDA reducer executes it in one launch.
+        rows = rmsnorm_dweight_rows_fp32(x, dy, rstd=rstd)
+        # Multiplication is part of the pre-existing mask contract, including
+        # IEEE propagation for non-finite inactive contributions.
+        rows = rows * mask.to(dtype=rows.dtype).unsqueeze(-1)
+        dw = reduce_rows_fp32(rows).to(weight.dtype)
+        record_backward(
+            "rms_norm",
+            kernel_id=(
+                "rl_engine._C.rmsnorm_backward_dx"
+                "+rl_engine.kernels.ops.vjp_fp32.rmsnorm_dweight_rows_fp32"
+                "+rl_engine.kernels.ops.vjp_fp32.reduce_rows_fp32"
+            ),
+            impl="cuda_rmsnorm_dx_declared_fp32_rowfold_dw",
+            family="cuda",
+        )
 
         return dx, dw, None, None
 
@@ -79,6 +97,8 @@ def rmsnorm_cuda(x, weight, eps=1e-6, mask=None):
 class RMSNormCudaOp:
     """CUDA RMSNorm wrapper compatible with the shared operator harness."""
 
+    backward_impl = "cuda_rmsnorm_dx_declared_fp32_rowfold_dw"
+
     def __call__(self, x, weight, *, eps=1e-6):
         return self.forward(x, weight, eps=eps)
 
@@ -87,3 +107,10 @@ class RMSNormCudaOp:
         x_2d = x.contiguous().view(-1, hidden)
         y_2d = rmsnorm_cuda(x_2d, weight.contiguous(), eps=eps)
         return y_2d.view_as(x)
+
+    def parameter_vjp_contributions_fp32(self, *, x, weight, grad_output, eps=1e-6):
+        del weight
+        x32 = x.float()
+        rstd = torch.rsqrt(x32.square().mean(dim=-1) + float(eps))
+        rows = grad_output.float() * x32 * rstd.unsqueeze(-1)
+        return {"weight": rows}
