@@ -818,6 +818,10 @@ def test_qwen_ffn_backward_matches_autograd_reference(monkeypatch):
     monkeypatch.setattr(ffn_module, "_C", stub)
     monkeypatch.setattr(ffn_module, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(ffn_module, "_validate_ffn_inputs", lambda *args: None)
+    monkeypatch.setattr(
+        "rl_engine.kernels.ops.cuda.matmul.det_gemm._require_sm90_backend",
+        lambda: None,
+    )
 
     hidden = _randn((2, 3, 8), seed=0)
     gate_weight = _randn((12, 8), seed=1)
@@ -903,7 +907,7 @@ def test_qwen_ffn_deterministic_false_uses_production_gemm(monkeypatch):
 
     tensors = [torch.empty(1)] * 4
     assert qwen3_ffn(*tensors, deterministic=False) is False
-    assert modes == [{"disable_split_k": False}]
+    assert modes == [{"disable_split_k": False, "packed_gate_up": False}]
 
 
 def test_qwen_ffn_rejects_conflicting_backend_switches():
