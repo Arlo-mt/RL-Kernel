@@ -655,7 +655,7 @@ def _cache_worker(rank, world_size, init_method, result_queue):
         assert len(ffn_module._COLLECTIVES) == 1
         grown_collective = next(iter(ffn_module._COLLECTIVES.values()))
         assert grown_collective is not first_collective
-        assert first_collective._handle == 0
+        assert first_collective._handle == first_handle
         assert grown_collective.max_size_bytes > first_capacity
         assert grown_collective._handle != 0
 
@@ -674,6 +674,7 @@ def _cache_worker(rank, world_size, init_method, result_queue):
         assert len(ffn_module._COLLECTIVES) == 2
 
         _close_ffn_collectives()
+        first_collective.close()
         result_queue.put({"ok": True, "rank": rank})
     except Exception:  # pragma: no cover - forwarded to the parent process.
         result_queue.put({"ok": False, "rank": rank, "traceback": traceback.format_exc()})
@@ -1111,7 +1112,7 @@ def test_qwen_ffn_world8_tp4_cp2_match_tp1_cp1_bitwise():
     _spawn_nccl_workers(_topology_worker, 8, (_WORLD8_TP4_CP2_CONFIGS,), timeout=120)
 
 
-def test_qwen_ffn_collective_cache_reuses_grows_closes_and_rebuilds_group():
+def test_qwen_ffn_collective_cache_growth_preserves_borrowers_and_rebuilds_group():
     _spawn_nccl_workers(_cache_worker, 2, timeout=120)
 
 
