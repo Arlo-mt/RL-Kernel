@@ -16,6 +16,9 @@ def _npu_available() -> bool:
 
         return hasattr(torch, "npu") and torch.npu.is_available()
     except Exception:
+        return False
+
+
 def is_musa_available() -> bool:
     """Return whether torch_musa is installed and a MUSA device is usable."""
     try:

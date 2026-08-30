@@ -128,25 +128,15 @@ def matmul_kernel_persistent(
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
             else:
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (
-                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-            )
-            b_ptrs = b_ptr + (
-                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            )
+            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-            a = tl.load(
-                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
-            b = tl.load(
-                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
+            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
             accumulator = tl.dot(a, b, accumulator)
 
         tile_id_c += NUM_SMS
-        pid_m, pid_n = _compute_pid(
-            tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M
-        )
+        pid_m, pid_n = _compute_pid(tile_id_c, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         if C_LARGE:
@@ -200,9 +190,7 @@ def _select_matmul_config(
     return selected, selected is not default
 
 
-def matmul_config_metadata(
-    M: int, N: int, K: int, dtype: torch.dtype
-) -> dict[str, Any]:
+def matmul_config_metadata(M: int, N: int, K: int, dtype: torch.dtype) -> dict[str, Any]:
     """Return the exact launch config and whether it came from the tuned table."""
 
     config, is_tuned = _select_matmul_config(M, N, K, dtype)
@@ -224,9 +212,9 @@ def matmul_persistent(
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
+    assert (
+        bias is None or bias.dim() == 1
+    ), "Currently assuming bias is 1D, let Horace know if you run into this"
     NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
     M, K = a.shape
     K, N = b.shape
@@ -239,8 +227,7 @@ def matmul_persistent(
         return (
             min(
                 NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+                triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
             ),
         )
 

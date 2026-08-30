@@ -47,9 +47,7 @@ from rl_engine.kernels.attention_contract import (
     ReductionSpec,
     ShardingSpec,
 )
-from rl_engine.kernels.ops.cuda.attention.strict_runtime import (
-    StrictCUDAAttentionRuntime,
-)
+from rl_engine.kernels.ops.cuda.attention.strict_runtime import StrictCUDAAttentionRuntime
 
 
 def test_framework_adapters_do_not_construct_registered_kernels_directly():

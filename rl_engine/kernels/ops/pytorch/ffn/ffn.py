@@ -10,11 +10,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from rl_engine.distributed.collectives import (
-    _COLLECTIVES as _SHARED_COLLECTIVES,
-    collective_for_group,
-    deterministic_all_reduce_inplace,
-)
+from rl_engine.distributed.collectives import _COLLECTIVES as _SHARED_COLLECTIVES
+from rl_engine.distributed.collectives import collective_for_group, deterministic_all_reduce_inplace
 from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
 from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
     det_gemm_linear,
@@ -121,12 +118,10 @@ def qwen3_ffn_packed_inference(
     )
 
 
-def _require_ffn_kernels(
-    *, disable_split_k: bool, packed_gate_up: bool = False
-) -> None:
-    required = _REQUIRED_SYMBOLS if disable_split_k else _SWIGLU_SYMBOLS
+def _require_ffn_kernels(*, disable_split_k: bool, packed_gate_up: bool = False) -> None:
+    required: tuple[str, ...] = _REQUIRED_SYMBOLS if disable_split_k else _SWIGLU_SYMBOLS
     if packed_gate_up:
-        required += _PACKED_SWIGLU_SYMBOLS
+        required = tuple(required) + tuple(_PACKED_SWIGLU_SYMBOLS)
     missing = [name for name in required if not hasattr(_C, name)]
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
@@ -181,9 +176,7 @@ def _require_parallel_group(group: Any, name: str):
     if not dist.is_available():
         raise RuntimeError(f"{name}-parallel FFN requires torch.distributed.")
     if not dist.is_initialized():
-        raise RuntimeError(
-            f"{name}-parallel FFN requires an initialized process group."
-        )
+        raise RuntimeError(f"{name}-parallel FFN requires an initialized process group.")
     if dist.get_world_size(group=group) <= 1:
         raise ValueError(f"{name}_group must contain at least two ranks.")
     return dist
@@ -238,9 +231,7 @@ def _validate_ffn_inputs(
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must have dtype bfloat16, got {tensor.dtype}.")
         if not tensor.is_cuda:
-            raise RuntimeError(
-                f"{name} must be on a CUDA device, got '{tensor.device}'."
-            )
+            raise RuntimeError(f"{name} must be on a CUDA device, got '{tensor.device}'.")
         if tensor.device != rmsnorm_output.device:
             raise RuntimeError(
                 f"all FFN inputs must be on {rmsnorm_output.device}, "
@@ -260,14 +251,10 @@ def _all_gather_tokens(tensor: Tensor, collective: Any) -> Tensor:
     return collective.all_gather(tensor.contiguous())
 
 
-def _all_gather_packed_tokens(
-    *tensors: Tensor, collective: Any
-) -> tuple[Tensor, ...]:
+def _all_gather_packed_tokens(*tensors: Tensor, collective: Any) -> tuple[Tensor, ...]:
     """Gather same-row tensors with one handshake and no repacking copies."""
 
-    return collective.all_gather_many(
-        tuple(tensor.contiguous() for tensor in tensors)
-    )
+    return collective.all_gather_many(tuple(tensor.contiguous() for tensor in tensors))
 
 
 def _reduce_scatter_tokens(tensor: Tensor, collective: Any) -> Tensor:
@@ -316,10 +303,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             down_weight.numel() * element_size,
         )
         if cp_group is not None:
-            packed_width = (
-                2 * rmsnorm_output_2d.size(1)
-                + 3 * gate_weight.size(0)
-            )
+            packed_width = 2 * rmsnorm_output_2d.size(1) + 3 * gate_weight.size(0)
             min_size_bytes = max(
                 min_size_bytes,
                 gemm_tokens * packed_width * element_size,
@@ -333,6 +317,7 @@ class _DeterministicFFNFunction(torch.autograd.Function):
 
         packed_gate_up = fused_gate_up_weight is not None and disable_split_k
         if packed_gate_up:
+            assert fused_gate_up_weight is not None
             gate_up = _linear_fwd(
                 rmsnorm_output_2d,
                 fused_gate_up_weight,
@@ -610,9 +595,7 @@ def _resolve_deterministic_mode(
         and disable_split_k is not None
         and deterministic != disable_split_k
     ):
-        raise ValueError(
-            "deterministic and disable_split_k select conflicting FFN backends."
-        )
+        raise ValueError("deterministic and disable_split_k select conflicting FFN backends.")
     if deterministic is not None:
         return deterministic
     if disable_split_k is not None:

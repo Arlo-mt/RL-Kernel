@@ -371,11 +371,7 @@ class CUDAAGRSAttentionCPCommunication:
             ) from exc
         try:
             dist = self._dist()
-            group = (
-                self._process_group
-                if self._process_group is not None
-                else dist.group.WORLD
-            )
+            group = self._process_group if self._process_group is not None else dist.group.WORLD
             self._collective = collective_for_group(
                 group=group,
                 device=torch.device("cuda", torch.cuda.current_device()),

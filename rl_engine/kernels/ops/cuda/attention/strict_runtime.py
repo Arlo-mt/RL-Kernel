@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -245,9 +246,7 @@ class StrictCUDAAttentionRuntime:
                 "core_launch_count": 1,
                 "core_batch_size": q.size(0),
                 "core_actual_backends": [
-                    result.provenance.get(
-                        "attention_backend", "flash_attention_4.cute.paged"
-                    )
+                    result.provenance.get("attention_backend", "flash_attention_4.cute.paged")
                 ],
             },
         )
@@ -352,10 +351,7 @@ class StrictCUDAAttentionRuntime:
                 )
         if causal:
             torch._assert_async(
-                torch.all(
-                    query_positions
-                    == key_positions[:, -query_positions.size(1) :]
-                ),
+                torch.all(query_positions == key_positions[:, -query_positions.size(1) :]),
                 "causal Attention queries must be the trailing global KV positions",
             )
 

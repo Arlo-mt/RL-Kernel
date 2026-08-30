@@ -31,10 +31,7 @@ from rl_engine.integrations.linear_logp import (
 from rl_engine.integrations.state import get_active_integration, set_active_integration
 from rl_engine.integrations.vllm import VllmIntegration
 from rl_engine.kernels.ops.pytorch.ffn.ffn import register_packed_inference_observer
-from rl_engine.kernels.ops.pytorch.norm.rms_norm import (
-    strict_add_rms_norm,
-    strict_rms_norm,
-)
+from rl_engine.kernels.ops.pytorch.norm.rms_norm import strict_add_rms_norm, strict_rms_norm
 
 _PATCH_MARKER = "__rl_kernel_original_forward__"
 _STRICT_MODEL_PATCH_MARKER = "__rl_kernel_original_strict_model_init__"
@@ -96,9 +93,7 @@ def plan_from_environment() -> IntegrationPlan:
     return integration_plan_from_environment()
 
 
-def configure_vllm_environment(
-    plan: IntegrationPlan, *, readback_dir: str | None = None
-) -> None:
+def configure_vllm_environment(plan: IntegrationPlan, *, readback_dir: str | None = None) -> None:
     """Export the plan inherited by Vime's vLLM server subprocess."""
 
     os.environ["RL_KERNEL_VLLM_INTEGRATION"] = "1"
@@ -136,9 +131,7 @@ def _patch_qwen_lm_head_padding() -> None:
     original = ParallelLMHead.__init__
     original_weight_loader = VocabParallelEmbedding.weight_loader
 
-    def strict_weight_loader(
-        instance: Any, param: Any, loaded_weight: torch.Tensor
-    ) -> None:
+    def strict_weight_loader(instance: Any, param: Any, loaded_weight: torch.Tensor) -> None:
         strict_real_vocab = getattr(instance, "_rl_kernel_real_vocab_size", None)
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
@@ -183,11 +176,13 @@ def _patch_qwen_lm_head_padding() -> None:
 
     setattr(ParallelLMHead, _PATCH_MARKER, original)
     if not hasattr(VocabParallelEmbedding, "__rl_kernel_original_weight_loader__"):
-        VocabParallelEmbedding.__rl_kernel_original_weight_loader__ = (
-            original_weight_loader
+        setattr(
+            VocabParallelEmbedding,
+            "__rl_kernel_original_weight_loader__",
+            original_weight_loader,
         )
-        VocabParallelEmbedding.weight_loader = strict_weight_loader
-    ParallelLMHead.__init__ = wrapped
+        setattr(VocabParallelEmbedding, "weight_loader", strict_weight_loader)
+    setattr(ParallelLMHead, "__init__", wrapped)
 
 
 def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
@@ -202,7 +197,7 @@ def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
     for cls in classes:
         if hasattr(cls, _PATCH_MARKER):
             continue
-        original = cls.compute_logits
+        original = cls.compute_logits  # type: ignore[attr-defined]
 
         def wrapped(
             instance: Any,
@@ -219,14 +214,8 @@ def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
                 return logits
             shard_indices = getattr(lm_head, "shard_indices", None)
             weight = getattr(lm_head, "weight", None)
-            if (
-                lm_head is None
-                or shard_indices is None
-                or not isinstance(weight, torch.Tensor)
-            ):
-                raise RuntimeError(
-                    "strict rollout linear_logp requires a real Qwen LM-head shard"
-                )
+            if lm_head is None or shard_indices is None or not isinstance(weight, torch.Tensor):
+                raise RuntimeError("strict rollout linear_logp requires a real Qwen LM-head shard")
             tp = get_tp_group()
             tp_world = int(tp.world_size)
             publish_rollout_linear_logp_context(
@@ -237,15 +226,13 @@ def _patch_qwen_compute_logits(integration: VllmIntegration) -> None:
                 vocab_start_index=int(shard_indices.padded_org_vocab_start_index),
                 global_vocab_size=int(lm_head.num_embeddings_padded),
                 real_vocab_size=int(
-                    getattr(
-                        lm_head, "_rl_kernel_real_vocab_size", lm_head.org_vocab_size
-                    )
+                    getattr(lm_head, "_rl_kernel_real_vocab_size", lm_head.org_vocab_size)
                 ),
             )
             return logits
 
         setattr(cls, _PATCH_MARKER, original)
-        cls.compute_logits = wrapped
+        setattr(cls, "compute_logits", wrapped)
         installed.append(f"{cls.__module__}.{cls.__name__}.compute_logits")
     if installed:
         integration.record_installed_hook("logp", ",".join(installed))
@@ -259,9 +246,7 @@ def _patch_strict_lm_head_linear(
     """Route vLLM's existing LM-head projection through RL-Kernel det_gemm."""
 
     if linear_method_cls is None:
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            UnquantizedEmbeddingMethod,
-        )
+        from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
 
         linear_method_cls = UnquantizedEmbeddingMethod
     if hasattr(linear_method_cls, _STRICT_LM_HEAD_LINEAR_PATCH_MARKER):
@@ -290,7 +275,7 @@ def _patch_strict_lm_head_linear(
         _STRICT_LM_HEAD_LINEAR_PATCH_MARKER,
         previous_apply,
     )
-    linear_method_cls.apply = wrapped
+    setattr(linear_method_cls, "apply", wrapped)
 
 
 def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
@@ -301,32 +286,23 @@ def _configure_strict_ffn_compilation(vllm_config: Any | None = None) -> None:
 
         vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
-        raise RuntimeError(
-            "strict TP FFN initialization requires an active vLLM config"
-        )
+        raise RuntimeError("strict TP FFN initialization requires an active vLLM config")
 
     compilation = vllm_config.compilation_config
     splitting_ops = compilation.splitting_ops
     if splitting_ops is None:
-        raise RuntimeError(
-            "vLLM splitting operators were not finalized before model init"
-        )
+        raise RuntimeError("vLLM splitting operators were not finalized before model init")
     # Older strict runtimes split this op because their host-owned sequence
     # value was frozen at graph capture. Sequence allocation is now device
     # owned, so remove stale entries and preserve the user's graph mode.
-    splitting_ops[:] = [
-        op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP
-    ]
+    splitting_ops[:] = [op for op in splitting_ops if op != DETERMINISTIC_ALL_REDUCE_OP]
 
 
 def _patch_qwen_ffn(integration: VllmIntegration) -> None:
     from vllm.model_executor.models.qwen2 import Qwen2MLP
 
     operator: VllmFFNOperator | None = None
-    if (
-        integration.plan.implementation_for("ffn", "rollout")
-        is Implementation.RL_KERNEL
-    ):
+    if integration.plan.implementation_for("ffn", "rollout") is Implementation.RL_KERNEL:
         operator = VllmFFNOperator()
         integration.install_operator("ffn", operator)
     if hasattr(Qwen2MLP, _PATCH_MARKER):
@@ -354,7 +330,7 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
                 _configure_strict_ffn_compilation()
 
         setattr(Qwen2MLP, _STRICT_FFN_INIT_MARKER, original_init)
-        Qwen2MLP.__init__ = wrapped_init
+        setattr(Qwen2MLP, "__init__", wrapped_init)
 
     def wrapped(instance: Any, hidden_states: Any) -> Any:
         def native(_module: Any, value: Any) -> Any:
@@ -363,10 +339,8 @@ def _patch_qwen_ffn(integration: VllmIntegration) -> None:
         return integration.execute("ffn", native, instance, hidden_states)
 
     setattr(Qwen2MLP, _PATCH_MARKER, original)
-    Qwen2MLP.forward = wrapped
-    integration.record_installed_hook(
-        "ffn", "vllm.model_executor.models.qwen2.Qwen2MLP.forward"
-    )
+    setattr(Qwen2MLP, "forward", wrapped)
+    integration.record_installed_hook("ffn", "vllm.model_executor.models.qwen2.Qwen2MLP.forward")
 
 
 def _install_flash_attn_ops_compatibility() -> None:
@@ -397,9 +371,7 @@ def _patch_qwen3_strict_model(
 ) -> None:
     """Align vLLM's RMSNorm and Attention projections with Megatron."""
 
-    production_classes = (
-        rms_norm_cls is None or linear_method_cls is None or attention_cls is None
-    )
+    production_classes = rms_norm_cls is None or linear_method_cls is None or attention_cls is None
     if production_classes:
         from vllm.model_executor.layers.layernorm import RMSNorm
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -526,13 +498,11 @@ def _patch_sampler(integration: VllmIntegration, *, strict_linear_logp: bool) ->
         return integration.execute("logp", native, instance, *args, **kwargs)
 
     setattr(Sampler, _PATCH_MARKER, original)
-    Sampler.forward = wrapped
+    setattr(Sampler, "forward", wrapped)
     integration.record_installed_hook("logp", "vllm.v1.sample.sampler.Sampler.forward")
 
 
-def _patch_worker_sampler(
-    integration: VllmIntegration, *, strict_linear_logp: bool
-) -> None:
+def _patch_worker_sampler(integration: VllmIntegration, *, strict_linear_logp: bool) -> None:
     """Patch the CUDA worker sampler used by vLLM 0.27's V1 runner.
 
     vLLM has two sampler implementations: the graph-friendly
@@ -559,17 +529,13 @@ def _patch_worker_sampler(
         def native(_sampler: Any, *call_args: Any, **call_kwargs: Any) -> Any:
             return original(instance, *call_args, **call_kwargs)
 
-        if args and _is_worker_sampler_profile_batch(
-            args[1] if len(args) > 1 else None
-        ):
+        if args and _is_worker_sampler_profile_batch(args[1] if len(args) > 1 else None):
             return original(instance, *args, **kwargs)
         return integration.execute("logp", native, instance, *args, **kwargs)
 
     setattr(Sampler, _PATCH_MARKER, original)
-    Sampler.__call__ = wrapped
-    integration.record_installed_hook(
-        "logp", "vllm.v1.worker.gpu.sample.sampler.Sampler.__call__"
-    )
+    setattr(Sampler, "__call__", wrapped)
+    integration.record_installed_hook("logp", "vllm.v1.worker.gpu.sample.sampler.Sampler.__call__")
 
 
 def _register_attention_backend(integration: VllmIntegration) -> None:
@@ -580,16 +546,10 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
         FlashAttentionImpl,
         FlashAttentionMetadataBuilder,
     )
-    from vllm.v1.attention.backends.registry import (
-        AttentionBackendEnum,
-        register_backend,
-    )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
     operator: VllmAttentionOperator | None = None
-    if (
-        integration.plan.implementation_for("attention", "rollout")
-        is Implementation.RL_KERNEL
-    ):
+    if integration.plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL:
         operator = VllmAttentionOperator()
         integration.install_operator("attention", operator)
 
@@ -602,9 +562,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
         def forward(self, *args: Any, **kwargs: Any) -> Any:
             active = get_active_integration("vllm")
             if active is not integration:
-                raise RuntimeError(
-                    "vLLM Attention executed without its installed integration"
-                )
+                raise RuntimeError("vLLM Attention executed without its installed integration")
 
             def native(_impl: Any, *call_args: Any, **call_kwargs: Any) -> Any:
                 return FlashAttentionImpl.forward(self, *call_args, **call_kwargs)
@@ -626,18 +584,14 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
     RlKernelFlashAttentionImpl.__module__ = __name__
     RlKernelFlashAttentionImpl.__qualname__ = "RlKernelFlashAttentionImpl"
     RlKernelFlashAttentionMetadataBuilder.__module__ = __name__
-    RlKernelFlashAttentionMetadataBuilder.__qualname__ = (
-        "RlKernelFlashAttentionMetadataBuilder"
-    )
+    RlKernelFlashAttentionMetadataBuilder.__qualname__ = "RlKernelFlashAttentionMetadataBuilder"
     RlKernelFlashAttentionBackend.__module__ = __name__
     RlKernelFlashAttentionBackend.__qualname__ = "RlKernelFlashAttentionBackend"
     _RLK_ATTENTION_IMPL = RlKernelFlashAttentionImpl
     _RLK_ATTENTION_BUILDER = RlKernelFlashAttentionMetadataBuilder
     _RLK_ATTENTION_BACKEND = RlKernelFlashAttentionBackend
     globals()["RlKernelFlashAttentionImpl"] = RlKernelFlashAttentionImpl
-    globals()[
-        "RlKernelFlashAttentionMetadataBuilder"
-    ] = RlKernelFlashAttentionMetadataBuilder
+    globals()["RlKernelFlashAttentionMetadataBuilder"] = RlKernelFlashAttentionMetadataBuilder
     globals()["RlKernelFlashAttentionBackend"] = RlKernelFlashAttentionBackend
     # vLLM 0.27 selects FLASH_ATTN for Qwen on CUDA before custom third-party
     # names are considered. Override the selected enum in-place so the launcher
@@ -646,9 +600,7 @@ def _register_attention_backend(integration: VllmIntegration) -> None:
         AttentionBackendEnum.FLASH_ATTN,
         f"{__name__}.RlKernelFlashAttentionBackend",
     )
-    integration.record_installed_hook(
-        "attention", f"{__name__}.RlKernelFlashAttentionBackend"
-    )
+    integration.record_installed_hook("attention", f"{__name__}.RlKernelFlashAttentionBackend")
 
 
 def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
@@ -659,9 +611,7 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
         if not isinstance(existing, VllmIntegration):
             raise RuntimeError("active vLLM integration has an unexpected type")
         if existing.plan != plan:
-            raise RuntimeError(
-                "vLLM integration is already installed with another plan"
-            )
+            raise RuntimeError("vLLM integration is already installed with another plan")
         return existing
     integration = VllmIntegration(plan, rl_kernel_operators={})
     set_active_integration("vllm", integration)
@@ -669,12 +619,8 @@ def install_vllm_integration(plan: IntegrationPlan) -> VllmIntegration:
     # to production. FA4-only installations need the bundled compatibility
     # namespace before any attention backend is imported.
     _install_flash_attn_ops_compatibility()
-    strict_linear_logp = (
-        plan.implementation_for("logp", "rollout") is Implementation.RL_KERNEL
-    )
-    strict_attention = (
-        plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL
-    )
+    strict_linear_logp = plan.implementation_for("logp", "rollout") is Implementation.RL_KERNEL
+    strict_attention = plan.implementation_for("attention", "rollout") is Implementation.RL_KERNEL
     if strict_attention:
         _patch_qwen3_strict_model()
     if strict_linear_logp:

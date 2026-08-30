@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from rl_engine.integrations.ablation import operator_ablation_case
 
 
@@ -122,9 +123,7 @@ class LinearLogpWrapper:
                 "sm90_deterministic_linear_logp entry points"
             ) from exc
         op = (
-            sm90_deterministic_linear_logp_tp
-            if tensor_parallel
-            else sm90_deterministic_linear_logp
+            sm90_deterministic_linear_logp_tp if tensor_parallel else sm90_deterministic_linear_logp
         )
         # This wrapper is the strict boundary. Fail closed if a refactor ever
         # swaps in the native/provider logp path under the same API.
@@ -177,10 +176,10 @@ class LinearLogpWrapper:
             elif not bool(positive):
                 raise ValueError("temperature must be positive")
             return value
-        value = float(temperature)
-        if value <= 0.0:
-            raise ValueError(f"temperature must be positive, got {value}")
-        return torch.full((rows,), value, device=device, dtype=torch.float32)
+        scalar = float(temperature)
+        if scalar <= 0.0:
+            raise ValueError(f"temperature must be positive, got {scalar}")
+        return torch.full((rows,), scalar, device=device, dtype=torch.float32)
 
     @staticmethod
     def _validate_targets(target_ids: torch.Tensor, *, rows: int, real_vocab_size: int) -> None:
@@ -297,9 +296,7 @@ class LinearLogpWrapper:
         expected_global = local_vocab * world
         expected_start = rank * local_vocab
         if requested_global != expected_global or int(vocab_start_index) != expected_start:
-            raise ValueError(
-                "reused rollout LM-head logits must use equal rank-ordered TP shards"
-            )
+            raise ValueError("reused rollout LM-head logits must use equal rank-ordered TP shards")
         real = int(real_vocab_size)
         if not 0 < real <= requested_global:
             raise ValueError("real_vocab_size must be within the padded global vocabulary")
