@@ -28,9 +28,7 @@ class _MatmulShapeConfig(NamedTuple):
     m_buckets: tuple[tuple[int, _MatmulMConfig], ...]
 
 
-_BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
-    str, dict[tuple[int, int], _MatmulShapeConfig]
-] = {
+_BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[str, dict[tuple[int, int], _MatmulShapeConfig]] = {
     "ada": {
         (12288, 2048): _MatmulShapeConfig(
             block_k=64,
@@ -187,9 +185,7 @@ _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS: dict[
     },
 }
 
-_TUNED_MATMUL_CONFIGS_FOR_DEVICE: dict[tuple[int, int], _MatmulShapeConfig] | None = (
-    None
-)
+_TUNED_MATMUL_CONFIGS_FOR_DEVICE: dict[tuple[int, int], _MatmulShapeConfig] | None = None
 _TUNED_MATMUL_CONFIGS_RESOLVED = False
 
 
@@ -218,9 +214,7 @@ def resolve_tuned_matmul_configs() -> None:
     if arch_family is None:
         _TUNED_MATMUL_CONFIGS_FOR_DEVICE = None
     else:
-        _TUNED_MATMUL_CONFIGS_FOR_DEVICE = _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS.get(
-            arch_family
-        )
+        _TUNED_MATMUL_CONFIGS_FOR_DEVICE = _BATCH_INVARIANT_MATMUL_TUNED_CONFIGS.get(arch_family)
     _TUNED_MATMUL_CONFIGS_RESOLVED = True
 
 

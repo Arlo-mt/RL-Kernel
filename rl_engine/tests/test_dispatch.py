@@ -10,7 +10,6 @@ import torch
 import rl_engine.platforms.device as device_module
 from rl_engine.executors.rollout import RolloutExecutor
 from rl_engine.kernels.registry import KernelRegistry, OpBackend, kernel_registry
-from rl_engine.platforms import device as device_module
 from rl_engine.platforms.device import device_ctx
 from rl_engine.utils.logger import logger
 

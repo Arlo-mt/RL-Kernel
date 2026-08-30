@@ -18,10 +18,7 @@ from typing import Any, Mapping, cast
 import torch
 
 from rl_engine.alignment.cross_config.operators import OperatorBridge, OperatorOverride
-from rl_engine.integrations.linear_logp import (
-    LinearLogpWrapper,
-    take_rollout_linear_logp_context,
-)
+from rl_engine.integrations.linear_logp import LinearLogpWrapper, take_rollout_linear_logp_context
 from rl_engine.kernels.attention_contract import (
     STRICT_ATTENTION_FA4_SCHEDULE_ID,
     STRICT_ATTENTION_PRODUCTION_CORE_ID,
@@ -29,26 +26,17 @@ from rl_engine.kernels.attention_contract import (
     AttentionDType,
     AttentionMode,
     AttentionRole,
-    SplitKVSpec,
 )
 from rl_engine.kernels.attention_contract import ReductionSpec as AttentionReductionSpec
 from rl_engine.kernels.attention_contract import ShardingSpec as AttentionShardingSpec
-from rl_engine.kernels.logprob_contract import (
-    LogprobContract,
-    LogprobDType,
-    LogprobRole,
-    MaskSpec,
-)
+from rl_engine.kernels.attention_contract import SplitKVSpec
+from rl_engine.kernels.logprob_contract import LogprobContract, LogprobDType, LogprobRole, MaskSpec
 from rl_engine.kernels.logprob_contract import ReductionSpec as LogprobReductionSpec
 from rl_engine.kernels.logprob_contract import ShardingSpec as LogprobShardingSpec
 from rl_engine.kernels.ops.cuda.matmul.det_gemm import det_gemm_backend_id
 from rl_engine.kernels.ops.pytorch.attention.ablation import AttentionAblationConfig
-from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
-    BACKEND_ID as LOGP_BACKEND_ID,
-)
-from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import (
-    DEFAULT_NUM_VOCAB_TILES,
-)
+from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import BACKEND_ID as LOGP_BACKEND_ID
+from rl_engine.kernels.ops.pytorch.loss.vocab_parallel_logp import DEFAULT_NUM_VOCAB_TILES
 from rl_engine.kernels.semantic_registry import OperatorRequirements
 from rl_engine.runtime_mode import strict_contract_enabled
 
@@ -85,6 +73,35 @@ def _tensor_metadata(tensor: torch.Tensor) -> dict[str, Any]:
         "device": str(tensor.device),
         "numel": int(tensor.numel()),
     }
+
+
+def _tensor_debug_stats(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach()
+    stats = _tensor_metadata(detached)
+    if detached.numel() == 0:
+        return stats
+    values = detached.float()
+    stats.update(
+        {
+            "min": float(values.min().item()),
+            "max": float(values.max().item()),
+            "mean": float(values.mean().item()),
+        }
+    )
+    return stats
+
+
+def _diff_debug_stats(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
+    if left.shape != right.shape:
+        return {
+            "shape_mismatch": True,
+            "left_shape": list(left.shape),
+            "right_shape": list(right.shape),
+        }
+    diff = (left.detach().float() - right.detach().float()).abs()
+    stats = _tensor_debug_stats(diff)
+    stats["mismatch_count"] = int(torch.ne(left.detach(), right.detach()).sum().item())
+    return stats
 
 
 def _attention_dtype(tensor: torch.Tensor) -> AttentionDType:
@@ -138,10 +155,7 @@ class SemanticOperatorHandle:
             # TP=2. The operator receives the live group at invocation time;
             # keep device and dtype strict, but do not reject this topology
             # transition after the semantic instance is resolved.
-            if (
-                tensor.device != self._runtime_device
-                or tensor.dtype != self._runtime_dtype
-            ):
+            if tensor.device != self._runtime_device or tensor.dtype != self._runtime_dtype:
                 raise RuntimeError(
                     f"{self.semantic_op} runtime device/dtype changed after resolution"
                 )
@@ -226,13 +240,9 @@ def _fused_rms_norm_input(
     )
 
 
-def _split_gate_up(
-    weight: torch.Tensor, name: str
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _split_gate_up(weight: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.size(0) % 2:
-        raise RuntimeError(
-            f"{name}.weight first dimension must contain equal gate/up shards"
-        )
+        raise RuntimeError(f"{name}.weight first dimension must contain equal gate/up shards")
     gate, up = weight.chunk(2, dim=0)
     return gate.contiguous(), up.contiguous()
 
@@ -275,47 +285,34 @@ def _packed_local_sequence_layout(
     """Recover local THD sequence offsets from Megatron's global cu_seqlens."""
 
     if str(getattr(packed_seq_params, "qkv_format", "")).lower() != "thd":
-        raise RuntimeError(
-            "strict RL-Kernel packed Attention requires qkv_format='thd'"
-        )
+        raise RuntimeError("strict RL-Kernel packed Attention requires qkv_format='thd'")
     query_cu = getattr(packed_seq_params, "cu_seqlens_q", None)
     kv_cu = getattr(packed_seq_params, "cu_seqlens_kv", None)
     if not isinstance(query_cu, torch.Tensor) or not isinstance(kv_cu, torch.Tensor):
-        raise RuntimeError(
-            "packed Attention requires tensor cu_seqlens_q/cu_seqlens_kv"
-        )
+        raise RuntimeError("packed Attention requires tensor cu_seqlens_q/cu_seqlens_kv")
     query_offsets = tuple(
-        int(value)
-        for value in query_cu.detach().to(device="cpu", dtype=torch.int64).tolist()
+        int(value) for value in query_cu.detach().to(device="cpu", dtype=torch.int64).tolist()
     )
     kv_offsets = tuple(
-        int(value)
-        for value in kv_cu.detach().to(device="cpu", dtype=torch.int64).tolist()
+        int(value) for value in kv_cu.detach().to(device="cpu", dtype=torch.int64).tolist()
     )
     if query_offsets != kv_offsets:
-        raise RuntimeError(
-            "strict self-Attention requires identical Q and KV cu_seqlens"
-        )
+        raise RuntimeError("strict self-Attention requires identical Q and KV cu_seqlens")
     if len(query_offsets) < 2 or query_offsets[0] != 0:
         raise RuntimeError("packed Attention cu_seqlens must start at zero")
     global_lengths = tuple(
-        right - left
-        for left, right in zip(query_offsets[:-1], query_offsets[1:], strict=True)
+        right - left for left, right in zip(query_offsets[:-1], query_offsets[1:], strict=True)
     )
     if any(length <= 0 for length in global_lengths):
         raise RuntimeError("packed Attention cu_seqlens must be strictly increasing")
     if any(length % cp_world_size for length in global_lengths):
-        raise RuntimeError(
-            "packed Attention sequence lengths must be divisible by CP size"
-        )
+        raise RuntimeError("packed Attention sequence lengths must be divisible by CP size")
     local_lengths = tuple(length // cp_world_size for length in global_lengths)
     local_offsets = [0]
     for length in local_lengths:
         local_offsets.append(local_offsets[-1] + length)
     if local_offsets[-1] != local_query_tokens or local_offsets[-1] != local_kv_tokens:
-        raise RuntimeError(
-            "packed Attention cu_seqlens do not cover the local Q/KV token rows"
-        )
+        raise RuntimeError("packed Attention cu_seqlens do not cover the local Q/KV token rows")
     return tuple(local_offsets), global_lengths
 
 
@@ -424,12 +421,8 @@ class MegatronAttentionOperator:
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         query_cu = getattr(packed_seq_params, "cu_seqlens_q", None)
         kv_cu = getattr(packed_seq_params, "cu_seqlens_kv", None)
-        if not isinstance(query_cu, torch.Tensor) or not isinstance(
-            kv_cu, torch.Tensor
-        ):
-            raise RuntimeError(
-                "packed Attention requires tensor cu_seqlens_q/cu_seqlens_kv"
-            )
+        if not isinstance(query_cu, torch.Tensor) or not isinstance(kv_cu, torch.Tensor):
+            raise RuntimeError("packed Attention requires tensor cu_seqlens_q/cu_seqlens_kv")
         key = (
             _tensor_cache_token(query_cu),
             _tensor_cache_token(kv_cu),
@@ -437,10 +430,7 @@ class MegatronAttentionOperator:
             local_query_tokens,
             local_kv_tokens,
         )
-        if (
-            self._packed_layout_owner is packed_seq_params
-            and self._packed_layout_key == key
-        ):
+        if self._packed_layout_owner is packed_seq_params and self._packed_layout_key == key:
             if self._packed_layout_value is None:
                 raise RuntimeError("packed Attention layout cache is empty")
             return self._packed_layout_value
@@ -483,15 +473,9 @@ class MegatronAttentionOperator:
         if num_splits not in (None, 1):
             raise RuntimeError("strict RL-Kernel Attention requires num_splits=1")
         if attention_mask is not None and attention_mask.numel() > 1:
-            raise RuntimeError(
-                "strict RL-Kernel Attention supports only its causal contract"
-            )
+            raise RuntimeError("strict RL-Kernel Attention supports only its causal contract")
         expected_ndim = 3 if packed_seq_params is not None else 4
-        if (
-            query.ndim != expected_ndim
-            or key.ndim != expected_ndim
-            or value.ndim != expected_ndim
-        ):
+        if query.ndim != expected_ndim or key.ndim != expected_ndim or value.ndim != expected_ndim:
             layout = "[T, H, D]" if packed_seq_params is not None else "[S, B, H, D]"
             raise RuntimeError(f"Megatron Attention Q/K/V must use {layout}")
         _require_nvidia_cuda(query, "Attention")
@@ -520,12 +504,10 @@ class MegatronAttentionOperator:
             *,
             global_sequence_length: int,
         ) -> Any:
-            positions, block_indices, block_starts, block_offsets = (
-                _megatron_zigzag_layout(
-                    q_ready.size(2),
-                    cp_rank=cp_rank,
-                    cp_world_size=cp_world,
-                )
+            positions, block_indices, block_starts, block_offsets = _megatron_zigzag_layout(
+                q_ready.size(2),
+                cp_rank=cp_rank,
+                cp_world_size=cp_world,
             )
             position_ids = torch.tensor(
                 positions,
@@ -598,29 +580,21 @@ class MegatronAttentionOperator:
                 )
 
             outputs: list[torch.Tensor | None] = [None] * len(global_lengths)
-            sequence_provenance: list[dict[str, Any] | None] = [None] * len(
-                global_lengths
-            )
+            sequence_provenance: list[dict[str, Any] | None] = [None] * len(global_lengths)
             launch_group_count = 0
             for (local_length, global_length), sequences in grouped_sequences.items():
                 q_ready = (
-                    torch.stack(
-                        [query[start:end] for _index, start, end in sequences], dim=0
-                    )
+                    torch.stack([query[start:end] for _index, start, end in sequences], dim=0)
                     .permute(0, 2, 1, 3)
                     .contiguous()
                 )
                 k_ready = (
-                    torch.stack(
-                        [key[start:end] for _index, start, end in sequences], dim=0
-                    )
+                    torch.stack([key[start:end] for _index, start, end in sequences], dim=0)
                     .permute(0, 2, 1, 3)
                     .contiguous()
                 )
                 v_ready = (
-                    torch.stack(
-                        [value[start:end] for _index, start, end in sequences], dim=0
-                    )
+                    torch.stack([value[start:end] for _index, start, end in sequences], dim=0)
                     .permute(0, 2, 1, 3)
                     .contiguous()
                 )
@@ -630,9 +604,7 @@ class MegatronAttentionOperator:
                     v_ready,
                     global_sequence_length=global_length,
                 )
-                group_output = (
-                    result.out.permute(0, 2, 1, 3).contiguous().flatten(start_dim=2)
-                )
+                group_output = result.out.permute(0, 2, 1, 3).contiguous().flatten(start_dim=2)
                 operator_provenance = _compact_attention_provenance(result.provenance)
                 for batch_index, (sequence_index, _start, _end) in enumerate(sequences):
                     outputs[sequence_index] = group_output[batch_index]
@@ -646,9 +618,7 @@ class MegatronAttentionOperator:
             if any(item is None for item in outputs) or any(
                 item is None for item in sequence_provenance
             ):
-                raise RuntimeError(
-                    "packed Attention failed to materialize every sequence"
-                )
+                raise RuntimeError("packed Attention failed to materialize every sequence")
             output = torch.cat(cast(list[torch.Tensor], outputs), dim=0)
             execution_provenance = {
                 "packed_sequence_count": len(global_lengths),
@@ -708,13 +678,9 @@ class MegatronFFNOperator:
                 if name != "padding_mask" or value is not None
             }
             if unexpected:
-                raise RuntimeError(
-                    "strict dense Qwen3 FFN does not accept expert token scaling"
-                )
+                raise RuntimeError("strict dense Qwen3 FFN does not accept expert token scaling")
         if per_token_scale is not None:
-            raise RuntimeError(
-                "strict dense Qwen3 FFN does not accept expert token scaling"
-            )
+            raise RuntimeError("strict dense Qwen3 FFN does not accept expert token scaling")
         _require_nvidia_cuda(hidden_states, "FFN")
         config = module.config
         if bool(getattr(config, "add_bias_linear", False)):
@@ -791,8 +757,7 @@ def _vllm_kv_cache_views(
         key_cache, value_cache = kv_cache.unbind(0)
         return key_cache, value_cache
     raise RuntimeError(
-        "vLLM FlashAttention KV cache must use "
-        "[blocks, kv_heads, block, 2 * head_size]"
+        "vLLM FlashAttention KV cache must use " "[blocks, kv_heads, block, 2 * head_size]"
     )
 
 
@@ -809,9 +774,7 @@ class VllmAttentionOperator:
         self._tp_coordinates: tuple[int, int, Any] | None = None
         self._metadata_cache_key: tuple[Any, ...] | None = None
         self._metadata_cache_owners: set[int] = set()
-        self._metadata_cache_value: (
-            tuple[list[dict[str, Any]], dict[str, Any]] | None
-        ) = None
+        self._metadata_cache_value: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
 
     def bind_inference(self) -> None:
         """Resolve the backend after vLLM has selected the worker CUDA device."""
@@ -863,9 +826,7 @@ class VllmAttentionOperator:
         query_starts_source = self._metadata_tensor(
             attn_metadata, "query_start_loc", "query_start_loc_cpu"
         )
-        seq_lens_source = self._metadata_tensor(
-            attn_metadata, "seq_lens", "seq_lens_cpu"
-        )
+        seq_lens_source = self._metadata_tensor(attn_metadata, "seq_lens", "seq_lens_cpu")
         if num_actual == 0:
             return [], {
                 "row_count": 0,
@@ -875,17 +836,13 @@ class VllmAttentionOperator:
                 "metadata_source": "vllm_gpu",
             }
 
-        query_starts = query_starts_source.to(
-            device=query.device, dtype=torch.int32
-        )
+        query_starts = query_starts_source.to(device=query.device, dtype=torch.int32)
         seq_lens = seq_lens_source.to(device=query.device, dtype=torch.int32)
-        query_indices = torch.arange(
-            num_actual, dtype=torch.int32, device=query.device
-        )
+        query_indices = torch.arange(num_actual, dtype=torch.int32, device=query.device)
         query_ends = query_starts[1:]
-        request_indices = torch.searchsorted(
-            query_ends, query_indices, right=True
-        ).to(dtype=torch.long)
+        request_indices = torch.searchsorted(query_ends, query_indices, right=True).to(
+            dtype=torch.long
+        )
         active_queries = query_indices < query_starts[-1]
         request_indices = request_indices.clamp_max(seq_lens.numel() - 1)
         request_query_ends = query_ends.index_select(0, request_indices)
@@ -897,12 +854,8 @@ class VllmAttentionOperator:
             torch.ones_like(seqused_k),
         )
 
-        max_seq_len = int(
-            getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size)
-        )
-        page_count = min(
-            block_table.size(1), (max_seq_len + block_size - 1) // block_size
-        )
+        max_seq_len = int(getattr(attn_metadata, "max_seq_len", block_table.size(1) * block_size))
+        page_count = min(block_table.size(1), (max_seq_len + block_size - 1) // block_size)
         cache_key = (
             _tensor_cache_token(query_starts_source),
             _tensor_cache_token(seq_lens_source),
@@ -971,9 +924,7 @@ class VllmAttentionOperator:
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
-            raise RuntimeError(
-                "strict vLLM Attention does not support quantized output"
-            )
+            raise RuntimeError("strict vLLM Attention does not support quantized output")
         if attn_metadata is None:
             if output is None:
                 raise RuntimeError("vLLM profiling Attention requires an output buffer")
@@ -988,9 +939,7 @@ class VllmAttentionOperator:
         if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("strict vLLM Attention requires an unquantized KV cache")
 
-        block_table = self._metadata_tensor(
-            attn_metadata, "block_table", "block_table_tensor"
-        )
+        block_table = self._metadata_tensor(attn_metadata, "block_table", "block_table_tensor")
         num_actual = int(getattr(attn_metadata, "num_actual_tokens", query.size(0)))
         if num_actual < 0 or num_actual > query.size(0):
             raise RuntimeError("vLLM num_actual_tokens is outside the query buffer")
@@ -1056,9 +1005,9 @@ class VllmAttentionOperator:
             )
             result_output = result.out.squeeze(2)
             if group["query_contiguous"]:
-                output_heads.narrow(
-                    0, int(group["query_start"]), int(group["query_count"])
-                ).copy_(result_output)
+                output_heads.narrow(0, int(group["query_start"]), int(group["query_count"])).copy_(
+                    result_output
+                )
             else:
                 output_heads.index_copy_(0, query_indices, result.out.squeeze(2))
             last_operator_provenance = _compact_attention_provenance(result.provenance)
@@ -1169,9 +1118,7 @@ class VllmFFNOperator:
         if self._packed_inference_binding is not None:
             collective_handle, bound_tp_world, _ = self._packed_inference_binding
             if bound_tp_world != tp_world:
-                raise RuntimeError(
-                    "packed rollout FFN TP topology changed after binding"
-                )
+                raise RuntimeError("packed rollout FFN TP topology changed after binding")
             output = operator.packed_inference(
                 hidden_states,
                 fused_gate_up,
@@ -1181,9 +1128,7 @@ class VllmFFNOperator:
             )
         else:
             if torch._dynamo.is_compiling():
-                raise RuntimeError(
-                    "packed rollout FFN was not bound before torch.compile capture"
-                )
+                raise RuntimeError("packed rollout FFN was not bound before torch.compile capture")
             gate, up = _split_gate_up(fused_gate_up, "gate_up_proj")
             output = operator(
                 hidden_states,
@@ -1382,9 +1327,7 @@ class VllmLogpOperator:
                 "vLLM logprob result does not contain every sampled token",
             )
         elif not bool(every_sample_present):
-            raise RuntimeError(
-                "vLLM logprob result does not contain every sampled token"
-            )
+            raise RuntimeError("vLLM logprob result does not contain every sampled token")
         # vLLM prepends the sampled token and then appends top-k tokens. When
         # the sample is also in top-k, its API conversion keeps the last
         # duplicate, so every matching column must carry the strict value.
@@ -1547,9 +1490,7 @@ class VllmLogpOperator:
         contract = _full_vocab_contract(source_logits)
         from rl_engine.kernels.registry import kernel_registry
 
-        dispatch = kernel_registry.get_logprob_op(
-            contract, requested_backend=self.backend_id
-        )
+        dispatch = kernel_registry.get_logprob_op(contract, requested_backend=self.backend_id)
         if (
             dispatch.provenance["actual_backend"] != self.backend_id
             or dispatch.provenance["fallback"]
@@ -1605,10 +1546,7 @@ class VllmLogpOperator:
                                     logprobs_tensors.logprobs.size(0),
                                     device=logprobs_tensors.logprobs.device,
                                 ),
-                                (
-                                    logprobs_tensors.logprob_token_ids
-                                    == token_ids.unsqueeze(1)
-                                )
+                                (logprobs_tensors.logprob_token_ids == token_ids.unsqueeze(1))
                                 .to(torch.int64)
                                 .argmax(dim=1),
                             ],

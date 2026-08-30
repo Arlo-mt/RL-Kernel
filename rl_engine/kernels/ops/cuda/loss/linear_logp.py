@@ -15,16 +15,11 @@ from rl_engine.kernels.ops.cuda.matmul.det_gemm import (
     det_gemm_linear_weight_gradient,
 )
 from rl_engine.kernels.ops.pytorch.loss.linear_logp import (
-    _merge_tp_local_logp,
-    _require_distributed_initialized,
-    _validate_global_targets,
-    _validate_tp_targets_enabled,
-    _validate_tp_vocab_partition_cached,
     _assert_global_targets_async,
     _deterministic_tp_all_reduce_,
-    _validate_even_tp_vocab_partition_local,
     _merge_tp_local_logp,
     _require_distributed_initialized,
+    _validate_even_tp_vocab_partition_local,
     _validate_global_targets,
     _validate_tp_targets_enabled,
     _validate_tp_vocab_partition_cached,
@@ -1053,9 +1048,7 @@ class _StrictLinearLogpAutograd(torch.autograd.Function):
             logp_grad = (
                 torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
             )
-            lse_grad = (
-                torch.zeros_like(lse) if grad_lse is None else grad_lse.reshape(-1).float()
-            )
+            lse_grad = torch.zeros_like(lse) if grad_lse is None else grad_lse.reshape(-1).float()
             # d(logp) / d(logits) = onehot(target) - softmax(logits), while
             # d(lse) / d(logits) = softmax(logits).
             dlogits = probs * (lse_grad - logp_grad).reshape(-1, 1)
@@ -1117,9 +1110,9 @@ def _strict_tp_run(
         # unique ownership during normal execution.
         _validate_global_targets(target, int(real_vocab), tp_group)
         dist = _require_distributed_initialized()
-        owners = (
-            (target >= int(vocab_start)) & (target < int(vocab_start) + weight.size(0))
-        ).to(torch.int32)
+        owners = ((target >= int(vocab_start)) & (target < int(vocab_start) + weight.size(0))).to(
+            torch.int32
+        )
         dist.all_reduce(owners, op=dist.ReduceOp.SUM, group=tp_group)
         if bool((owners != 1).any().item()):
             raise ValueError("each selected target must have exactly one TP LM-head owner")
@@ -1145,9 +1138,7 @@ def _strict_tp_run(
         logits = logits.clone()
         logits[:, local_real:] = float("-inf")
     logits = logits.contiguous()
-    local_target, local_lse = _C.linear_logp_local_bf16_forward(
-        logits, target, int(vocab_start)
-    )
+    local_target, local_lse = _C.linear_logp_local_bf16_forward(logits, target, int(vocab_start))
     logp, lse = _merge_tp_local_logp(local_lse, local_target, tp_group=tp_group)
     return logp, lse, hidden_2d, weight, target, logits, temp
 
@@ -1181,14 +1172,8 @@ def sm90_deterministic_logp_from_local_logits_tp(
     )
     real_vocab = global_vocab if int(real_vocab_size) < 0 else int(real_vocab_size)
     if not 0 < real_vocab <= global_vocab:
-        raise ValueError(
-            f"invalid real_vocab_size={real_vocab} for padded vocab={global_vocab}"
-        )
-    target = (
-        target_ids.reshape(-1)
-        .to(device=local_logits.device, dtype=torch.long)
-        .contiguous()
-    )
+        raise ValueError(f"invalid real_vocab_size={real_vocab} for padded vocab={global_vocab}")
+    target = target_ids.reshape(-1).to(device=local_logits.device, dtype=torch.long).contiguous()
     if target.numel() != local_logits.size(0):
         raise ValueError("target_ids must contain one id per local-logits row")
     _assert_global_targets_async(target, real_vocab)
@@ -1259,18 +1244,14 @@ class _StrictTensorParallelLinearLogpAutograd(torch.autograd.Function):
         hidden, weight, target, logits, lse, temp = ctx.saved_tensors
         if grad_logp is None and grad_lse is None:
             return (None, None, None, None, None, None, None, None, None)
-        logp_grad = (
-            torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
-        )
+        logp_grad = torch.zeros_like(lse) if grad_logp is None else grad_logp.reshape(-1).float()
         dlogits = torch.empty_like(logits)
         _C.linear_logp_logits_bf16_to_dlogits(
             logits, dlogits, target, logp_grad, lse, ctx.vocab_start
         )
         if grad_lse is not None:
             probs = torch.exp(logits.float() - lse.reshape(-1, 1))
-            dlogits = (
-                dlogits.float() + probs * grad_lse.reshape(-1, 1).float()
-            ).to(torch.bfloat16)
+            dlogits = (dlogits.float() + probs * grad_lse.reshape(-1, 1).float()).to(torch.bfloat16)
         if temp.numel():
             dlogits = (dlogits.float() / temp.reshape(-1, 1)).to(torch.bfloat16).contiguous()
         else:
@@ -1283,9 +1264,7 @@ class _StrictTensorParallelLinearLogpAutograd(torch.autograd.Function):
                 ctx.hidden_dtype
             )
         if ctx.needs_input_grad[1]:
-            grad_weight = det_gemm_linear_weight_gradient(hidden, dlogits).to(
-                ctx.weight_dtype
-            )
+            grad_weight = det_gemm_linear_weight_gradient(hidden, dlogits).to(ctx.weight_dtype)
         grad_bias = None
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = dlogits.float().sum(dim=0).to(ctx.bias_dtype)
@@ -1331,18 +1310,12 @@ def sm90_deterministic_linear_logp(
     lead_shape = hidden.shape[:-1]
     hidden_2d = hidden.reshape(-1, hidden.size(-1)).contiguous()
     weight = lm_head_weight.contiguous()
-    target_1d = (
-        target_ids.reshape(-1)
-        .to(device=hidden_2d.device, dtype=torch.long)
-        .contiguous()
-    )
+    target_1d = target_ids.reshape(-1).to(device=hidden_2d.device, dtype=torch.long).contiguous()
     if target_1d.numel() != hidden_2d.size(0):
         raise ValueError("target_ids must have one id per hidden row")
     real_vocab = weight.size(0) if int(real_vocab_size) < 0 else int(real_vocab_size)
     if not 0 < real_vocab <= weight.size(0):
-        raise ValueError(
-            f"real_vocab_size must be in [1, {weight.size(0)}], got {real_vocab_size}"
-        )
+        raise ValueError(f"real_vocab_size must be in [1, {weight.size(0)}], got {real_vocab_size}")
     if bool(((target_1d < 0) | (target_1d >= real_vocab)).any().item()):
         target_min = int(target_1d.min().item())
         target_max = int(target_1d.max().item())
@@ -1358,11 +1331,15 @@ def sm90_deterministic_linear_logp(
             temp_arg = temp_arg.expand(hidden_2d.size(0)).contiguous()
         if temp_arg.numel() != hidden_2d.size(0) or bool((temp_arg <= 0).any().item()):
             raise ValueError("temperature must be positive and scalar or per-token")
-    if torch.is_grad_enabled() and (
-        hidden.requires_grad
-        or lm_head_weight.requires_grad
-        or (bias is not None and bias.requires_grad)
-    ) and not return_logits:
+    if (
+        torch.is_grad_enabled()
+        and (
+            hidden.requires_grad
+            or lm_head_weight.requires_grad
+            or (bias is not None and bias.requires_grad)
+        )
+        and not return_logits
+    ):
         return _StrictLinearLogpAutograd.apply(
             hidden, lm_head_weight, bias, target_ids, temp_arg, int(real_vocab_size)
         )

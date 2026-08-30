@@ -94,9 +94,7 @@ class StrictFlashAttention4Core:
             raise ValueError("strict FA4 Attention requires Split-KV to be disabled")
         if _op is None:
             op, package_version, api_source = _load_fa4_cute_op()
-            paged_op = getattr(
-                importlib.import_module(api_source), "flash_attn_varlen_func", None
-            )
+            paged_op = getattr(importlib.import_module(api_source), "flash_attn_varlen_func", None)
         else:
             op = _op
             paged_op = _paged_op
@@ -136,8 +134,7 @@ class StrictFlashAttention4Core:
         missing = sorted(_FA4_PAGED_REQUIRED_PARAMETERS.difference(parameters))
         if missing:
             raise StrictFlashAttentionUnavailable(
-                "FlashAttention CuTe paged API is missing strict controls: "
-                + ", ".join(missing)
+                "FlashAttention CuTe paged API is missing strict controls: " + ", ".join(missing)
             )
 
     def __call__(
@@ -367,9 +364,7 @@ class StrictFlashAttention4Core:
                 "num_splits": self.num_splits,
                 "deterministic_backward": self.deterministic_backward,
                 "dropout_p": 0.0,
-                "split_kv": self.split_kv.resolve(
-                    max_seqlen_k, backend=self.backend_id
-                ).to_dict(),
+                "split_kv": self.split_kv.resolve(max_seqlen_k, backend=self.backend_id).to_dict(),
                 "merge_order": self.merge_order,
                 "accum_dtype": self.accum_dtype,
                 "downcast_at": self.downcast_at,

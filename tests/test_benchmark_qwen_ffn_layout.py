@@ -344,9 +344,7 @@ def test_report_csv_and_comparison_svg_are_self_contained(tmp_path):
     report = tmp_path / "report.md"
     results_csv = tmp_path / "results.csv"
     comparison = tmp_path / "qwen_ffn_cublas_comparison.svg"
-    forward_backward_comparison = (
-        tmp_path / "qwen_ffn_forward_backward_comparison.svg"
-    )
+    forward_backward_comparison = tmp_path / "qwen_ffn_forward_backward_comparison.svg"
 
     benchmark._write_report(payload, report)
     benchmark._write_csv(payload, results_csv)

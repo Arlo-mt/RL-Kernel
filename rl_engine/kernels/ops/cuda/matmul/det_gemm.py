@@ -106,22 +106,18 @@ def _configure_cublaslt_nosplitk(a: torch.Tensor | None = None) -> None:
     if _CUBLASLT_CONFIGURED:
         return
     if torch._dynamo.is_compiling():
-        raise RuntimeError(
-            "cublaslt_nosplitk must be configured before torch.compile tracing"
-        )
+        raise RuntimeError("cublaslt_nosplitk must be configured before torch.compile tracing")
     device = None if a is None else a.device
     if torch.cuda.get_device_capability(device)[0] != 9:
         raise RuntimeError("cublaslt_nosplitk is currently validated only on SM90")
     workspace = os.getenv("CUBLAS_WORKSPACE_CONFIG", "").strip()
     if workspace != ":16:8":
         raise RuntimeError(
-            "cublaslt_nosplitk requires CUBLAS_WORKSPACE_CONFIG=:16:8 before "
-            "the process starts"
+            "cublaslt_nosplitk requires CUBLAS_WORKSPACE_CONFIG=:16:8 before " "the process starts"
         )
     if os.getenv("CUBLASLT_WORKSPACE_SIZE", "").strip() != "1":
         raise RuntimeError(
-            "cublaslt_nosplitk requires CUBLASLT_WORKSPACE_SIZE=1 before the "
-            "process starts"
+            "cublaslt_nosplitk requires CUBLASLT_WORKSPACE_SIZE=1 before the " "process starts"
         )
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -216,9 +212,7 @@ class _DetGemmFn(torch.autograd.Function):
         ctx.save_for_backward(a, b)
         if output_fp32:
             if not hasattr(_C, "det_gemm_fwd_fp32"):
-                raise RuntimeError(
-                    "FP32 deterministic GEMM output requires the rebuilt extension"
-                )
+                raise RuntimeError("FP32 deterministic GEMM output requires the rebuilt extension")
             return _C.det_gemm_fwd_fp32(a, b)
         return _C.det_gemm_fwd(a, b)
 
@@ -327,9 +321,7 @@ class DetGemmOp:
             "det_gemm_db_transposed",
         )
         missing = (
-            list(required)
-            if _C is None
-            else [name for name in required if not hasattr(_C, name)]
+            list(required) if _C is None else [name for name in required if not hasattr(_C, name)]
         )
         if not _EXT_AVAILABLE or _C is None or missing:
             detail = (
@@ -367,9 +359,7 @@ class DetGemmOp:
             "det_gemm_db_transposed",
         )
         if not self.has_hardware_op or any(not hasattr(_C, name) for name in required):
-            raise RuntimeError(
-                "DetGemmOp.linear requires the rebuilt native-weight CUDA extension"
-            )
+            raise RuntimeError("DetGemmOp.linear requires the rebuilt native-weight CUDA extension")
         return _DetLinearFn.apply(a.contiguous(), weight.contiguous())
 
     def forward_fp32(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

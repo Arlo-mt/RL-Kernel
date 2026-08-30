@@ -91,10 +91,7 @@ def _patch_strict_attention_projections(
     """Use the shared deterministic GEMM for Megatron Attention projections."""
 
     if self_attention_cls is None or column_linear_cls is None or row_linear_cls is None:
-        from megatron.core.tensor_parallel.layers import (
-            ColumnParallelLinear,
-            RowParallelLinear,
-        )
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
         from megatron.core.transformer.attention import SelfAttention
 
         self_attention_cls = SelfAttention
@@ -282,7 +279,9 @@ def install_megatron_integration(
             "ffn",
             ",".join(f"{cls.__module__}.{cls.__name__}.forward" for cls in resolved_ffn),
         )
-    integration.record_installed_hook("logp", "rl_engine.integrations.vime.linear_logp_provider.provider")
+    integration.record_installed_hook(
+        "logp", "rl_engine.integrations.vime.linear_logp_provider.provider"
+    )
     return integration
 
 

@@ -386,12 +386,8 @@ def _balanced_permutation_cycle(names: tuple[str, ...]) -> tuple[tuple[str, ...]
 
     remaining = list(permutations(names))
     ordered: list[tuple[str, ...]] = []
-    position_counts = {
-        (name, position): 0 for name in names for position in range(len(names))
-    }
-    predecessor_counts = {
-        (left, right): 0 for left in names for right in names if left != right
-    }
+    position_counts = {(name, position): 0 for name in names for position in range(len(names))}
+    predecessor_counts = {(left, right): 0 for left in names for right in names if left != right}
 
     while remaining:
 
@@ -744,8 +740,7 @@ def _verify_vllm_batch_invariance(
             )
     reference = outputs[1][0]
     mismatches = {
-        str(tokens): _raw_bf16_mismatch(reference, outputs[tokens][0])
-        for tokens in tested_tokens
+        str(tokens): _raw_bf16_mismatch(reference, outputs[tokens][0]) for tokens in tested_tokens
     }
     if any(mismatches.values()):
         raise RuntimeError(
@@ -932,8 +927,7 @@ def _benchmark_case(
                     "optimized_overhead_vs_vllm_percent": 100.0
                     * (optimized_median / vllm_median - 1.0),
                     "cublas_speedup_vs_vllm": vllm_median / cublas_median,
-                    "vllm_overhead_vs_cublas_percent": 100.0
-                    * (vllm_median / cublas_median - 1.0),
+                    "vllm_overhead_vs_cublas_percent": 100.0 * (vllm_median / cublas_median - 1.0),
                 }
             )
         rows.append(row)
@@ -1216,9 +1210,7 @@ def _write_production_context_figure(payload: dict[str, Any], output_path: Path)
     plot_height = plot_bottom - plot_top
 
     def y_position(value: float) -> float:
-        fraction = (math.log10(value) - math.log10(low)) / (
-            math.log10(high) - math.log10(low)
-        )
+        fraction = (math.log10(value) - math.log10(low)) / (math.log10(high) - math.log10(low))
         return plot_bottom - fraction * plot_height
 
     parts = [
@@ -1325,9 +1317,7 @@ def _write_production_context_figure(payload: dict[str, Any], output_path: Path)
     output_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
-def _write_forward_backward_context_figure(
-    payload: dict[str, Any], output_path: Path
-) -> None:
+def _write_forward_backward_context_figure(payload: dict[str, Any], output_path: Path) -> None:
     methodology = payload["methodology"]
     rows = sorted(
         (row for row in payload["results"] if row["direction"] == "forward_backward"),
@@ -1353,9 +1343,7 @@ def _write_forward_backward_context_figure(
     plot_height = plot_bottom - plot_top
 
     def y_position(value: float) -> float:
-        fraction = (math.log10(value) - math.log10(low)) / (
-            math.log10(high) - math.log10(low)
-        )
+        fraction = (math.log10(value) - math.log10(low)) / (math.log10(high) - math.log10(low))
         return plot_bottom - fraction * plot_height
 
     parts = [
@@ -1615,9 +1603,7 @@ def _write_report(payload: dict[str, Any], output_path: Path) -> None:
     for row in rows:
         direction = "Forward" if row["direction"] == "forward" else "Forward + backward"
         vllm_latency = f"{row['vllm']['median_ms']:.4f}" if "vllm" in row else "—"
-        vllm_gap = (
-            f"{row['vllm_speedup_vs_optimized']:.2f}x" if "vllm" in row else "—"
-        )
+        vllm_gap = f"{row['vllm_speedup_vs_optimized']:.2f}x" if "vllm" in row else "—"
         lines.append(
             f"| {row['tokens']} | {direction} | {row['baseline']['median_ms']:.4f} | "
             f"{row['optimized']['median_ms']:.4f} | {row['cublas']['median_ms']:.4f} | "
@@ -1715,9 +1701,7 @@ def _write_report(payload: dict[str, Any], output_path: Path) -> None:
         if batch_invariance:
             mismatch_text = ", ".join(
                 f"M={tokens}: {count}"
-                for tokens, count in batch_invariance[
-                    "first_row_bitwise_mismatch_count"
-                ].items()
+                for tokens, count in batch_invariance["first_row_bitwise_mismatch_count"].items()
             )
             lines.extend(
                 (
@@ -1971,9 +1955,7 @@ def main() -> None:
                     "tokens": tokens,
                     "forward_layout_speedup": case_rows[0]["optimized_speedup_vs_legacy"],
                     "forward_determinism_overhead": case_rows[0]["cublas_speedup_vs_optimized"],
-                    "forward_vllm_speedup_vs_optimized": case_rows[0][
-                        "vllm_speedup_vs_optimized"
-                    ],
+                    "forward_vllm_speedup_vs_optimized": case_rows[0]["vllm_speedup_vs_optimized"],
                     "forward_backward_layout_speedup": case_rows[1]["optimized_speedup_vs_legacy"],
                     "forward_backward_determinism_overhead": case_rows[1][
                         "cublas_speedup_vs_optimized"

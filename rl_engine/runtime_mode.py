@@ -31,15 +31,9 @@ _POLICIES = {
     RLKernelMode.STRICT: RLKernelModePolicy(
         RLKernelMode.STRICT, True, "R/R", "strict", True, False
     ),
-    RLKernelMode.AUDIT: RLKernelModePolicy(
-        RLKernelMode.AUDIT, True, "R/R", "strict", False, True
-    ),
-    RLKernelMode.AUTO: RLKernelModePolicy(
-        RLKernelMode.AUTO, True, "P/P", "auto", False, False
-    ),
-    RLKernelMode.OFF: RLKernelModePolicy(
-        RLKernelMode.OFF, False, "P/P", None, False, False
-    ),
+    RLKernelMode.AUDIT: RLKernelModePolicy(RLKernelMode.AUDIT, True, "R/R", "strict", False, True),
+    RLKernelMode.AUTO: RLKernelModePolicy(RLKernelMode.AUTO, True, "P/P", "auto", False, False),
+    RLKernelMode.OFF: RLKernelModePolicy(RLKernelMode.OFF, False, "P/P", None, False, False),
 }
 
 
@@ -52,9 +46,7 @@ def rl_kernel_mode(value: str | RLKernelMode | None = None) -> RLKernelMode:
         return RLKernelMode(normalized)
     except ValueError as exc:
         choices = ", ".join(mode.value for mode in RLKernelMode)
-        raise RuntimeError(
-            f"RL_KERNEL_MODE must be one of {choices}; got {raw!r}"
-        ) from exc
+        raise RuntimeError(f"RL_KERNEL_MODE must be one of {choices}; got {raw!r}") from exc
 
 
 def rl_kernel_mode_policy(

@@ -71,9 +71,7 @@ class DeterministicCollective:
         max_size_bytes: int = _DEFAULT_MAX_SIZE_BYTES,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
-            raise RuntimeError(
-                "torch.distributed must be initialized before collectives"
-            )
+            raise RuntimeError("torch.distributed must be initialized before collectives")
         if not torch.cuda.is_available():
             raise RuntimeError("deterministic collectives require CUDA")
         if max_size_bytes <= 0:
@@ -95,9 +93,7 @@ class DeterministicCollective:
         else:
             normalized_device = torch.device(device)
         if normalized_device.type != "cuda":
-            raise ValueError(
-                f"deterministic collectives require a CUDA device, got {device!r}"
-            )
+            raise ValueError(f"deterministic collectives require a CUDA device, got {device!r}")
         if normalized_device.index is None:
             normalized_device = torch.device("cuda", torch.cuda.current_device())
         if normalized_device.index != torch.cuda.current_device():
@@ -136,15 +132,12 @@ class DeterministicCollective:
         self._handle = 0
         self._validated_signatures: set[tuple[Any, ...]] = set()
         self._staging = torch.zeros(
-            _COLLECTIVE_STAGING_FRAMES
-            * (self.max_size_bytes + _COLLECTIVE_FRAME_METADATA_BYTES),
+            _COLLECTIVE_STAGING_FRAMES * (self.max_size_bytes + _COLLECTIVE_FRAME_METADATA_BYTES),
             dtype=torch.uint8,
             device=self.device,
         )
 
-        handle, offset = self._extension.deterministic_collective_ipc_meta(
-            self._staging
-        )
+        handle, offset = self._extension.deterministic_collective_ipc_meta(self._staging)
         local_meta = {
             "handle": handle,
             "offset": int(offset),
@@ -196,9 +189,7 @@ class DeterministicCollective:
         with self._lock:
             if validate_signature:
                 self._validate_matching_signature("all_reduce", input)
-            self._extension.deterministic_collective_all_reduce_fused(
-                self._handle, input, out
-            )
+            self._extension.deterministic_collective_all_reduce_fused(self._handle, input, out)
         return out
 
     def all_gather(
@@ -224,9 +215,7 @@ class DeterministicCollective:
         with self._lock:
             if validate_signature:
                 self._validate_matching_signature("all_gather", input)
-            self._extension.deterministic_collective_all_gather_fused(
-                self._handle, input, out
-            )
+            self._extension.deterministic_collective_all_gather_fused(self._handle, input, out)
         return out
 
     def all_gather_many(
@@ -240,8 +229,7 @@ class DeterministicCollective:
         if not inputs:
             raise ValueError("all_gather_many requires at least one input")
         return tuple(
-            self.all_gather(input, validate_signature=validate_signature)
-            for input in inputs
+            self.all_gather(input, validate_signature=validate_signature) for input in inputs
         )
 
     def reduce_scatter(
@@ -289,8 +277,7 @@ class DeterministicCollective:
         if not inputs:
             raise ValueError("reduce_scatter_many requires at least one input")
         return tuple(
-            self.reduce_scatter(input, validate_signature=validate_signature)
-            for input in inputs
+            self.reduce_scatter(input, validate_signature=validate_signature) for input in inputs
         )
 
     def close(self) -> None:
@@ -375,9 +362,7 @@ class DeterministicCollective:
         if output.dtype != input.dtype:
             raise TypeError("out must have the same dtype as input")
         if output.shape != output_shape:
-            raise ValueError(
-                f"out must have shape {output_shape}, got {tuple(output.shape)}"
-            )
+            raise ValueError(f"out must have shape {output_shape}, got {tuple(output.shape)}")
         if not output.is_contiguous():
             raise ValueError("out must be contiguous")
 
@@ -400,10 +385,7 @@ class DeterministicCollective:
     ) -> None:
         signature = (
             op_name,
-            tuple(
-                (tuple(input.shape), str(input.dtype), input.numel())
-                for input in inputs
-            ),
+            tuple((tuple(input.shape), str(input.dtype), input.numel()) for input in inputs),
         )
         if signature in self._validated_signatures:
             return
@@ -455,7 +437,9 @@ def collective_for_group(
     if device is None:
         device_index = torch.cuda.current_device()
     else:
-        normalized_device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        normalized_device = (
+            torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        )
         device_index = (
             torch.cuda.current_device()
             if normalized_device.index is None
