@@ -1028,6 +1028,58 @@ class DeterministicCollectiveState {
       return;
     }
 
+    // Small collectives are launch-bound. The fast kernel folds the peer
+    // stage wait, fixed-tree reduction, and completion publication into one
+    // launch while preserving the exact reduction order.
+    if (staged_fast_path_ && staged_bytes_ <= kSingleBlockFastPathMaxBytes) {
+      if (element_count > 0) {
+        switch (output.scalar_type()) {
+          case at::ScalarType::Float:
+            launch_all_reduce_fast<float>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<float*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+          case at::ScalarType::Half:
+            launch_all_reduce_fast<half>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<half*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+          case at::ScalarType::BFloat16:
+            launch_all_reduce_fast<nv_bfloat16>(
+                peers_,
+                local_stage_sequence_,
+                local_done_sequence_,
+                static_cast<nv_bfloat16*>(output.data_ptr()),
+                element_count,
+                world_size_,
+                stream);
+            break;
+#endif
+          default:
+            TORCH_CHECK(
+                false,
+                "deterministic all-reduce supports float32, float16, and bfloat16; got ",
+                output.scalar_type());
+        }
+        AT_CUDA_CHECK(cudaGetLastError());
+      } else {
+        publish_done(stream);
+      }
+      has_staged_input_ = false;
+      return;
+    }
+
     wait_for_staged_peers(stream);
     if (element_count == 0) {
       publish_done(stream);
