@@ -147,8 +147,7 @@ class TritonGRPOLossOp:
         """Per-sequence reward normalization, computed by the Triton group kernel."""
         if rewards.device.type not in ("cuda", "hip", "xpu", "musa"):
             raise RuntimeError(
-                "TritonGRPOLossOp requires accelerator tensors "
-                "(CUDA / ROCm / XPU / MUSA)."
+                "TritonGRPOLossOp requires accelerator tensors " "(CUDA / ROCm / XPU / MUSA)."
             )
         flat = rewards.reshape(-1).to(torch.float32)
         n = flat.numel()
@@ -200,8 +199,7 @@ class TritonGRPOLossOp:
         """Evaluate the loss from logits + per-sequence advantages."""
         if policy_logits.device.type not in ("cuda", "hip", "xpu", "musa"):
             raise RuntimeError(
-                "TritonGRPOLossOp requires accelerator tensors "
-                "(CUDA / ROCm / XPU / MUSA)."
+                "TritonGRPOLossOp requires accelerator tensors " "(CUDA / ROCm / XPU / MUSA)."
             )
         if completion_mask.ndim != 2:
             raise ValueError("completion_mask must be 2D [num_sequences, completion_len].")

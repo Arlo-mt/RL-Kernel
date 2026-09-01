@@ -132,8 +132,7 @@ class _RatioKLFunction(torch.autograd.Function):
     def forward(ctx, policy_logits, ref_logits, action_ids, attention_mask, old_logps):
         if policy_logits.device.type not in ("cuda", "hip", "xpu", "musa"):
             raise RuntimeError(
-                "TritonRatioKLOp requires accelerator tensors "
-                "(CUDA / ROCm / XPU / MUSA)."
+                "TritonRatioKLOp requires accelerator tensors " "(CUDA / ROCm / XPU / MUSA)."
             )
         expected = tuple(policy_logits.shape[:-1])
         for name, t in (

@@ -244,8 +244,7 @@ class TritonEmbeddingOp:
             or weight.device.type not in supported_devices
         ):
             raise RuntimeError(
-                "TritonEmbeddingOp requires accelerator tensors "
-                "(CUDA / ROCm / XPU / MUSA)"
+                "TritonEmbeddingOp requires accelerator tensors " "(CUDA / ROCm / XPU / MUSA)"
             )
         return _TritonEmbeddingFunction.apply(token_ids, weight)
 

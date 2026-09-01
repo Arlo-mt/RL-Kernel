@@ -4,7 +4,6 @@
 import sys
 from types import ModuleType
 
-import pytest
 import torch
 
 import rl_engine.platforms.device as device_module
@@ -153,9 +152,7 @@ class TestMusaPlatform:
         self._mock_musa_device(monkeypatch)
         registry = KernelRegistry()
 
-        assert registry._priority_map["musa"]["det_gemm"] == [
-            OpBackend.TRITON_DET_GEMM
-        ]
+        assert registry._priority_map["musa"]["det_gemm"] == [OpBackend.TRITON_DET_GEMM]
 
 
 def test_registry_explicit_device_selects_device_platform(monkeypatch):

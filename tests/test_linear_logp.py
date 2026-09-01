@@ -30,11 +30,7 @@ requires_triton_cuda = pytest.mark.skipif(
 )
 
 requires_triton_musa = pytest.mark.skipif(
-    not (
-        _HAS_TRITON
-        and hasattr(torch, "musa")
-        and torch.musa.is_available()
-    ),
+    not (_HAS_TRITON and hasattr(torch, "musa") and torch.musa.is_available()),
     reason="Triton linear log-prob requires a MUSA device and Triton.",
 )
 
@@ -1297,9 +1293,7 @@ def test_registry_dispatch_matches_native():
 
     op = kernel_registry.get_op("linear_logp")
     device = (
-        device_ctx.device
-        if device_ctx.device_type in {"cuda", "hip", "xpu", "musa"}
-        else "cpu"
+        device_ctx.device if device_ctx.device_type in {"cuda", "hip", "xpu", "musa"} else "cpu"
     )
     hidden, weight, target, bias = _inputs(6, device=device)
     out = op(hidden, weight, target, bias)
