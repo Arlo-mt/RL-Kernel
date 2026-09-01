@@ -44,17 +44,19 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
 
     # Moore Threads MUSA native generic LogP kernel.
     MUSA_FUSED_LOGP = "rl_engine.kernels.ops.musa.loss.logp.MusaFusedLogpOp"
-    MUSA_DETERMINISTIC_LOGP = "rl_engine.kernels.ops.musa.native.MusaDeterministicLogpOp"
-    MUSA_DETERMINISTIC_ATTENTION = (
-        "rl_engine.kernels.ops.musa.native.MusaDeterministicAttentionOp"
+    MUSA_DETERMINISTIC_LOGP = (
+        "rl_engine.kernels.ops.musa.loss.batch_invariant_logp.MusaDeterministicLogpOp"
     )
-    MUSA_DET_GEMM = "rl_engine.kernels.ops.musa.native.MusaDetGemmOp"
-    MUSA_RMS_NORM = "rl_engine.kernels.ops.musa.native.MusaRMSNormOp"
-    MUSA_EMBEDDING = "rl_engine.kernels.ops.musa.native.MusaEmbeddingOp"
-    MUSA_LM_HEAD = "rl_engine.kernels.ops.musa.native.MusaLMHeadOp"
-    MUSA_ROPE = "rl_engine.kernels.ops.musa.native.MusaRoPEOp"
-    MUSA_SILU = "rl_engine.kernels.ops.musa.native.MusaSiLUOp"
-    MUSA_SWIGLU = "rl_engine.kernels.ops.musa.native.MusaSwiGLUOp"
+    MUSA_DETERMINISTIC_ATTENTION = (
+        "rl_engine.kernels.ops.musa.attention.deterministic_attn.MusaDeterministicAttentionOp"
+    )
+    MUSA_DET_GEMM = "rl_engine.kernels.ops.musa.matmul.det_gemm.MusaDetGemmOp"
+    MUSA_RMS_NORM = "rl_engine.kernels.ops.musa.norm.rmsnorm.MusaRMSNormOp"
+    MUSA_EMBEDDING = "rl_engine.kernels.ops.musa.linear.embedding.MusaEmbeddingOp"
+    MUSA_LM_HEAD = "rl_engine.kernels.ops.musa.linear.lm_head.MusaLMHeadOp"
+    MUSA_ROPE = "rl_engine.kernels.ops.musa.rotary_embedding.rope.MusaRoPEOp"
+    MUSA_SILU = "rl_engine.kernels.ops.musa.activation.swiglu.MusaSiLUOp"
+    MUSA_SWIGLU = "rl_engine.kernels.ops.musa.activation.swiglu.MusaSwiGLUOp"
 
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"

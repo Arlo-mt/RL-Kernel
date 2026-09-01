@@ -438,7 +438,9 @@ def test_registry_dispatches_native_attention_op():
     """Resolve attention to the deterministic CUDA op or native fallback."""
     op = kernel_registry.get_op("attention")
     if device_ctx.is_musa:
-        from rl_engine.kernels.ops.musa.native import MusaDeterministicAttentionOp
+        from rl_engine.kernels.ops.musa.attention.deterministic_attn import (
+            MusaDeterministicAttentionOp,
+        )
 
         assert isinstance(op, MusaDeterministicAttentionOp)
         return

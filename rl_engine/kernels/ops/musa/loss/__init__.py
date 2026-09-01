@@ -2,5 +2,6 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 
 from .logp import MusaFusedLogpOp
+from .batch_invariant_logp import MusaDeterministicLogpOp
 
-__all__ = ["MusaFusedLogpOp"]
+__all__ = ["MusaFusedLogpOp", "MusaDeterministicLogpOp"]

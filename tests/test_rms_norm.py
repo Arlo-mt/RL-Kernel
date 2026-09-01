@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from rl_engine.kernels.ops.cuda.norm.rmsnorm import rmsnorm_cuda
-from rl_engine.kernels.ops.musa.native import MusaRMSNormOp
+from rl_engine.kernels.ops.musa.norm.rmsnorm import MusaRMSNormOp
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
 
