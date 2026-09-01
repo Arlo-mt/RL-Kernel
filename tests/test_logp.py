@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from rl_engine.kernels.ops.pytorch.loss.logp import NativeLogpOp
+from rl_engine.platforms.device import device_ctx
 
 
 def _make_inputs(
@@ -155,4 +156,13 @@ class TestNativeLogpOpRegistry:
         from rl_engine.kernels.registry import kernel_registry
 
         op = kernel_registry.get_op("logp")
-        assert isinstance(op, NativeLogpOp)
+        if device_ctx.is_musa:
+            from rl_engine.kernels.ops.base import _EXT_AVAILABLE
+            from rl_engine.kernels.ops.musa.loss.logp import MusaFusedLogpOp
+
+            if _EXT_AVAILABLE:
+                assert isinstance(op, MusaFusedLogpOp)
+            else:
+                assert isinstance(op, NativeLogpOp)
+        else:
+            assert isinstance(op, NativeLogpOp)
