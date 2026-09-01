@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 from rl_engine.kernels.ops.cuda.norm.rmsnorm import RMSNormCudaOp, rmsnorm_cuda
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
-from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
+from rl_engine.kernels.ops.triton.rmsnorm_triton import RMSNormTritonOp, rmsnorm_triton
+from rl_engine.platforms.device import device_ctx
 
 try:
     from rl_engine.kernels.ops.base import _C, _EXT_AVAILABLE
@@ -239,7 +240,10 @@ def test_registry_dispatches_rms_norm():
     from rl_engine.kernels.registry import kernel_registry
 
     op = kernel_registry.get_op("rms_norm")
-    if torch.cuda.is_available() and _HAS_CUDA_RMSNORM:
+    if device_ctx.is_musa:
+        assert isinstance(op, RMSNormTritonOp)
+        assert hasattr(op, "forward")
+    elif torch.cuda.is_available() and _HAS_CUDA_RMSNORM:
         assert isinstance(op, RMSNormCudaOp)
         assert hasattr(op, "forward")
     else:
