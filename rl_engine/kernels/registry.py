@@ -44,6 +44,17 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
 
     # Moore Threads MUSA native generic LogP kernel.
     MUSA_FUSED_LOGP = "rl_engine.kernels.ops.musa.loss.logp.MusaFusedLogpOp"
+    MUSA_DETERMINISTIC_LOGP = "rl_engine.kernels.ops.musa.native.MusaDeterministicLogpOp"
+    MUSA_DETERMINISTIC_ATTENTION = (
+        "rl_engine.kernels.ops.musa.native.MusaDeterministicAttentionOp"
+    )
+    MUSA_DET_GEMM = "rl_engine.kernels.ops.musa.native.MusaDetGemmOp"
+    MUSA_RMS_NORM = "rl_engine.kernels.ops.musa.native.MusaRMSNormOp"
+    MUSA_EMBEDDING = "rl_engine.kernels.ops.musa.native.MusaEmbeddingOp"
+    MUSA_LM_HEAD = "rl_engine.kernels.ops.musa.native.MusaLMHeadOp"
+    MUSA_ROPE = "rl_engine.kernels.ops.musa.native.MusaRoPEOp"
+    MUSA_SILU = "rl_engine.kernels.ops.musa.native.MusaSiLUOp"
+    MUSA_SWIGLU = "rl_engine.kernels.ops.musa.native.MusaSwiGLUOp"
 
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
@@ -282,24 +293,30 @@ class KernelRegistry:
                 "logp_indexed": [OpBackend.PYTORCH_NATIVE],
                 "logp_online": [OpBackend.PYTORCH_NATIVE],
                 "logp_online_indexed": [OpBackend.PYTORCH_NATIVE],
-                "logp_deterministic": [OpBackend.PYTORCH_NATIVE],
-                "logp_deterministic_indexed": [OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic": [OpBackend.MUSA_DETERMINISTIC_LOGP, OpBackend.PYTORCH_NATIVE],
+                "logp_deterministic_indexed": [
+                    OpBackend.MUSA_DETERMINISTIC_LOGP,
+                    OpBackend.PYTORCH_NATIVE,
+                ],
                 "attn": [OpBackend.PYTORCH_ATTN],
-                "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
+                "attention": [OpBackend.MUSA_DETERMINISTIC_ATTENTION, OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
                 "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
-                "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
+                "rope": [OpBackend.MUSA_ROPE, OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
                 "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
-                "det_gemm": [OpBackend.PYTORCH_GEMM],
-                "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],
+                "det_gemm": [OpBackend.MUSA_DET_GEMM, OpBackend.PYTORCH_GEMM],
+                "batch_invariant_logp": [
+                    OpBackend.MUSA_DETERMINISTIC_LOGP,
+                    OpBackend.PYTORCH_BATCH_INVARIANT_LOGP,
+                ],
                 "matmul": [OpBackend.PYTORCH_NATIVE_MATMUL],
-                "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
-                "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
-                "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
-                "silu": [OpBackend.PYTORCH_NATIVE_SILU],
-                "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
+                "rms_norm": [OpBackend.MUSA_RMS_NORM, OpBackend.PYTORCH_NATIVE_RMS_NORM],
+                "lm_head": [OpBackend.MUSA_LM_HEAD, OpBackend.PYTORCH_NATIVE_LM_HEAD],
+                "embedding": [OpBackend.MUSA_EMBEDDING, OpBackend.PYTORCH_NATIVE_EMBEDDING],
+                "silu": [OpBackend.MUSA_SILU, OpBackend.PYTORCH_NATIVE_SILU],
+                "swiglu": [OpBackend.MUSA_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
             },
             "cpu": {
                 "logp": [OpBackend.PYTORCH_NATIVE],

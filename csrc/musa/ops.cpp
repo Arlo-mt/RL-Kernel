@@ -29,6 +29,7 @@ torch::Tensor lm_head_sm90_forward_fp32(
     torch::Tensor hidden,
     torch::Tensor weight,
     torch::optional<torch::Tensor> bias);
+torch::Tensor det_gemm_rowwise_fwd_fp32(torch::Tensor a, torch::Tensor b);
 torch::Tensor rope_apply_sm90(
     torch::Tensor x,
     torch::Tensor cos,
@@ -101,6 +102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("embedding_fp32", &embedding_sm90_forward_fp32);
     m.def("lm_head_fp32", &lm_head_sm90_forward_fp32, py::arg("hidden"),
           py::arg("weight"), py::arg("bias") = py::none());
+    m.def("det_gemm_rowwise_fwd_fp32", &det_gemm_rowwise_fwd_fp32);
     m.def("rope_apply", &rope_apply_sm90);
     m.def("deterministic_attention_fp32", &deterministic_attention_forward_fp32,
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal"),

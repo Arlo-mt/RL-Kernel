@@ -1027,6 +1027,7 @@ def test_registry_dispatches_correctly():
         isinstance(op, NativeBatchInvariantLogpOp)
         or type(op).__name__ == "TritonBatchInvariantLogpOp"
         or type(op).__name__ == "BatchInvariantLogpSM90Op"
+        or type(op).__name__ == "MusaDeterministicLogpOp"
     )
     logits = torch.randn(4, _V, device=device_ctx.device)
     target = torch.randint(0, _V, (4,), device=logits.device)

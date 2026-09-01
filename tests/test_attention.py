@@ -29,6 +29,7 @@ import torch
 
 from rl_engine.kernels.ops.pytorch.attention.standard_attn import NativeAttentionOp
 from rl_engine.kernels.registry import kernel_registry
+from rl_engine.platforms.device import device_ctx
 
 # Qwen3-8B attention dims (synthetic tensors, no checkpoint). Unlike embedding /
 # lm_head (whose multi-GB weight forces shrinking), attention's cost is the
@@ -436,6 +437,11 @@ def test_gradient_matches_reference():
 def test_registry_dispatches_native_attention_op():
     """Resolve attention to the deterministic CUDA op or native fallback."""
     op = kernel_registry.get_op("attention")
+    if device_ctx.is_musa:
+        from rl_engine.kernels.ops.musa.native import MusaDeterministicAttentionOp
+
+        assert isinstance(op, MusaDeterministicAttentionOp)
+        return
     # On CUDA with the extension built, the registry prefers DeterministicAttentionOp.
     # On CPU or without the CUDA extension, it falls back to NativeAttentionOp.
     from rl_engine.kernels.ops.cuda.attention.deterministic_attn import DeterministicAttentionOp
