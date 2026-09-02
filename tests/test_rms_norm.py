@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from rl_engine.kernels.ops.cuda.norm.rmsnorm import RMSNormCudaOp, rmsnorm_cuda
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.triton.rmsnorm_triton import (
-    RMSNormTritonOp,
     _TRITON_AVAILABLE,
+    RMSNormTritonOp,
     rmsnorm_triton,
 )
 from rl_engine.platforms.device import device_ctx
