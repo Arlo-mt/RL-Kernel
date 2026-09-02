@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from rl_engine.kernels.ops.cuda.norm.rmsnorm import rmsnorm_cuda
-from rl_engine.kernels.ops.musa.norm.rmsnorm import MusaRMSNormOp
+from rl_engine.kernels.ops.musa.norm.rmsnorm import RMSNormOp
 from rl_engine.kernels.ops.pytorch.norm.rms_norm import NativeRMSNormOp
 from rl_engine.kernels.ops.triton.rmsnorm_triton import rmsnorm_triton
 
@@ -238,7 +238,7 @@ def test_registry_dispatches_rms_norm():
 
     op = kernel_registry.get_op("rms_norm")
     if torch.musa.is_available():
-        assert isinstance(op, MusaRMSNormOp)
+        assert isinstance(op, RMSNormOp)
     else:
         assert isinstance(op, NativeRMSNormOp)
     assert hasattr(op, "forward") and hasattr(op, "forward_fp32")

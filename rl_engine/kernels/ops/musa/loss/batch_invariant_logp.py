@@ -30,7 +30,7 @@ class _MusaDeterministicLogpFunction(torch.autograd.Function):
         return grad.to(ctx.input_dtype).reshape(ctx.input_shape), None
 
 
-class MusaDeterministicLogpOp:
+class DeterministicLogpOp:
     """Batch-invariant selected log-probability using the native MUSA kernel."""
 
     is_batch_invariant = True

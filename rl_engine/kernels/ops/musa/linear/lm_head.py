@@ -29,7 +29,7 @@ class _MusaLMHeadFunction(torch.autograd.Function):
         return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), grad_bias, None
 
 
-class MusaLMHeadOp:
+class LMHeadOp:
     def __init__(self):
         require_musa_symbol("lm_head_fp32")
 

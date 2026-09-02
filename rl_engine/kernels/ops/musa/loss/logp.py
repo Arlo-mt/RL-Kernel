@@ -29,7 +29,7 @@ class _MusaFusedLogpFunction(torch.autograd.Function):
         return grad.to(ctx.input_dtype).reshape(ctx.input_shape), None
 
 
-class MusaFusedLogpOp:
+class FusedLogpOp:
     """Generic MUSA fused LogP; backward uses a portable PyTorch formula."""
 
     is_fused_logp = True
@@ -40,5 +40,5 @@ class MusaFusedLogpOp:
 
     def __call__(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         if logits.device.type != "musa":
-            raise RuntimeError(f"MusaFusedLogpOp requires a MUSA tensor, got {logits.device}")
+            raise RuntimeError(f"FusedLogpOp requires a MUSA tensor, got {logits.device}")
         return _MusaFusedLogpFunction.apply(logits, token_ids)

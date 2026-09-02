@@ -34,7 +34,7 @@ class _MusaRoPEFunction(torch.autograd.Function):
         return _C.rope_apply(grad, cos, sin, -1.0).reshape_as(grad_output), None, None
 
 
-class MusaRoPEOp:
+class RoPEOp:
     def __init__(self):
         require_musa_symbol("rope_apply")
 

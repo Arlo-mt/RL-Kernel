@@ -30,7 +30,7 @@ class _MusaEmbeddingFunction(torch.autograd.Function):
         return None, grad_weight
 
 
-class MusaEmbeddingOp:
+class EmbeddingOp:
     def __init__(self):
         require_musa_symbol("embedding_fp32")
 

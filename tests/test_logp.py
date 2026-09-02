@@ -158,10 +158,10 @@ class TestNativeLogpOpRegistry:
         op = kernel_registry.get_op("logp")
         if device_ctx.is_musa:
             from rl_engine.kernels.ops.base import _EXT_AVAILABLE
-            from rl_engine.kernels.ops.musa.loss.logp import MusaFusedLogpOp
+            from rl_engine.kernels.ops.musa.loss.logp import FusedLogpOp
 
             if _EXT_AVAILABLE:
-                assert isinstance(op, MusaFusedLogpOp)
+                assert isinstance(op, FusedLogpOp)
             else:
                 assert isinstance(op, NativeLogpOp)
         else:

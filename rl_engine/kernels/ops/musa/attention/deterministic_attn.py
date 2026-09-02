@@ -34,7 +34,7 @@ class _MusaDeterministicAttentionFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None
 
 
-class MusaDeterministicAttentionOp:
+class DeterministicAttentionOp:
     def __init__(self):
         require_musa_symbol("deterministic_attention_fp32")
         require_musa_symbol("deterministic_attention_backward")

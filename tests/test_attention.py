@@ -439,10 +439,10 @@ def test_registry_dispatches_native_attention_op():
     op = kernel_registry.get_op("attention")
     if device_ctx.is_musa:
         from rl_engine.kernels.ops.musa.attention.deterministic_attn import (
-            MusaDeterministicAttentionOp,
+            DeterministicAttentionOp,
         )
 
-        assert isinstance(op, MusaDeterministicAttentionOp)
+        assert isinstance(op, DeterministicAttentionOp)
         return
     # On CUDA with the extension built, the registry prefers DeterministicAttentionOp.
     # On CPU or without the CUDA extension, it falls back to NativeAttentionOp.

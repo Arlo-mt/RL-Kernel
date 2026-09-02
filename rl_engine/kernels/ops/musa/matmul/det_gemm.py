@@ -7,7 +7,7 @@ from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.musa._common import check_musa, require_musa_symbol
 
 
-class MusaDetGemmOp:
+class DetGemmOp:
     def __init__(self):
         require_musa_symbol("det_gemm_rowwise_fwd_fp32")
 

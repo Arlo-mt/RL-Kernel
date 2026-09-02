@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-from .embedding import MusaEmbeddingOp
-from .lm_head import MusaLMHeadOp
+from .embedding import EmbeddingOp
+from .lm_head import LMHeadOp
 
-__all__ = ["MusaEmbeddingOp", "MusaLMHeadOp"]
+__all__ = ["EmbeddingOp", "LMHeadOp"]

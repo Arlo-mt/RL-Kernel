@@ -31,7 +31,7 @@ class _MusaRMSNormFunction(torch.autograd.Function):
         return dx.reshape(ctx.input_shape), dw, None
 
 
-class MusaRMSNormOp:
+class RMSNormOp:
     def __init__(self):
         require_musa_symbol("rmsnorm_forward")
         require_musa_symbol("rmsnorm_backward_dx")

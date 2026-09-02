@@ -21,7 +21,7 @@ class _MusaSiLUFunction(torch.autograd.Function):
         return _C.silu_backward(grad_output.contiguous(), x)
 
 
-class MusaSiLUOp:
+class SiLUOp:
     def __init__(self):
         require_musa_symbol("silu_forward")
 
@@ -50,7 +50,7 @@ class _MusaSwiGLUFunction(torch.autograd.Function):
         return d_gate, d_up
 
 
-class MusaSwiGLUOp:
+class SwiGLUOp:
     def __init__(self):
         require_musa_symbol("swiglu_forward")
 
