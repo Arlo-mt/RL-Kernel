@@ -188,3 +188,15 @@ python examples/vime_rocm_attention_ablation/validate_artifacts.py \
 Do not add `matrix-plan.json`, validation JSON, rollout dumps, mismatch
 sidecars, checkpoints, or MI300X result files to the PR. Publish them as CI/job
 artifacts when needed.
+
+## Full-native PR377 workload
+
+The standalone P/P runner selects production attention, FFN, and logp on both
+the Megatron and vLLM sides. It uses actor TP4/CP2, two TP4 rollout engines,
+round-robin routing, eight samples, a 7168-token response limit, and Vime's
+rollout-logprob framework consistency mode. Three rounds are the default:
+
+```bash
+python -m examples.vime_rocm_attention_ablation.run_full_pp_pr377_workload \
+  --run-dir /app/model/vime-runs/pr394-full-native-pp-vime-tis
+```
