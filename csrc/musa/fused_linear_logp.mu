@@ -11,6 +11,7 @@
 namespace {
 
 constexpr int64_t kVocabTile = 32768;
+constexpr int kDlogitsBlockSize = 256;
 
 void check_inputs(
     const torch::Tensor& hidden,
@@ -154,6 +155,30 @@ __global__ void merge_vocab_tile_kernel(
     }
 }
 
+__global__ void linear_logp_dlogits_kernel(
+    const float* logits,
+    const float* lse,
+    const float* grad_logp,
+    const int64_t* target,
+    float* dlogits,
+    int rows,
+    int tile_size,
+    int vocab_start) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * tile_size;
+    if (index >= total) {
+        return;
+    }
+    const int row = index / tile_size;
+    const int column = index % tile_size;
+    const float probability = expf(logits[index] - lse[row]);
+    float gradient = -grad_logp[row] * probability;
+    if (target[row] == vocab_start + column) {
+        gradient += grad_logp[row];
+    }
+    dlogits[index] = gradient;
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> fused_linear_logp_musa_forward(
@@ -222,23 +247,33 @@ std::vector<torch::Tensor> fused_linear_logp_musa_backward(
     for (int64_t vocab_start = 0; vocab_start < vocab; vocab_start += kVocabTile) {
         const int64_t vocab_count = std::min(kVocabTile, vocab - vocab_start);
         auto logits = project_tile(hidden, weight, bias, vocab_start, vocab_count).to(torch::kFloat);
-        auto probabilities = (logits - lse_f.unsqueeze(1)).exp();
-        auto local_target = (target - vocab_start).clamp(0, vocab_count - 1);
-        auto owns_target = (target >= vocab_start) & (target < vocab_start + vocab_count);
-        probabilities.mul_(-grad_f.unsqueeze(1));
-        probabilities.scatter_add_(
-            1,
-            local_target.unsqueeze(1),
-            torch::where(owns_target, grad_f, torch::zeros_like(grad_f)).unsqueeze(1));
+        auto dlogits = torch::empty(
+            {rows, vocab_count}, hidden.options().dtype(torch::kFloat));
+        auto stream = at::musa::getCurrentMUSAStream();
+        const int total = static_cast<int>(rows * vocab_count);
+        linear_logp_dlogits_kernel<<<
+            (total + kDlogitsBlockSize - 1) / kDlogitsBlockSize,
+            kDlogitsBlockSize,
+            0,
+            stream>>>(
+            logits.data_ptr<float>(),
+            lse_f.data_ptr<float>(),
+            grad_f.data_ptr<float>(),
+            target.data_ptr<int64_t>(),
+            dlogits.data_ptr<float>(),
+            rows,
+            vocab_count,
+            vocab_start);
+        C10_MUSA_KERNEL_LAUNCH_CHECK();
         if (compute_grad_hidden) {
-            grad_hidden_f.add_(at::mm(probabilities, weight_f.narrow(0, vocab_start, vocab_count)));
+            grad_hidden_f.add_(at::mm(dlogits, weight_f.narrow(0, vocab_start, vocab_count)));
         }
         if (compute_grad_weight) {
             grad_weight_f.narrow(0, vocab_start, vocab_count).copy_(
-                at::mm(probabilities.t(), hidden_f));
+                at::mm(dlogits.t(), hidden_f));
         }
         if (compute_grad_bias && bias.has_value()) {
-            grad_bias_f.narrow(0, vocab_start, vocab_count).copy_(probabilities.sum(0));
+            grad_bias_f.narrow(0, vocab_start, vocab_count).copy_(dlogits.sum(0));
         }
     }
     torch::Tensor grad_hidden;
