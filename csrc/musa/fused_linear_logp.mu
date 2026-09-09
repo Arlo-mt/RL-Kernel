@@ -215,10 +215,9 @@ std::vector<torch::Tensor> fused_linear_logp_musa_backward(
     if (bias.has_value()) {
         logits.add_(bias->to(torch::kFloat));
     }
-    auto probabilities = at::_softmax(logits, 1, false);
-    auto one_hot = torch::zeros_like(probabilities);
-    one_hot.scatter_(1, target.unsqueeze(1), 1.0);
-    auto dlogits = (one_hot - probabilities) * grad_f.unsqueeze(1);
+    auto dlogits = at::_softmax(logits, 1, false);
+    dlogits.mul_(-grad_f.unsqueeze(1));
+    dlogits.scatter_add_(1, target.unsqueeze(1), grad_f.unsqueeze(1));
 
     torch::Tensor grad_hidden;
     torch::Tensor grad_weight;
