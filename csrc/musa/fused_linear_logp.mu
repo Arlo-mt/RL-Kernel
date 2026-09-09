@@ -224,8 +224,12 @@ std::vector<torch::Tensor> fused_linear_logp_musa_backward(
         auto logits = project_tile(hidden, weight, bias, vocab_start, vocab_count).to(torch::kFloat);
         auto probabilities = (logits - lse_f.unsqueeze(1)).exp();
         auto local_target = (target - vocab_start).clamp(0, vocab_count - 1);
+        auto owns_target = (target >= vocab_start) & (target < vocab_start + vocab_count);
         probabilities.mul_(-grad_f.unsqueeze(1));
-        probabilities.scatter_add_(1, local_target.unsqueeze(1), grad_f.unsqueeze(1));
+        probabilities.scatter_add_(
+            1,
+            local_target.unsqueeze(1),
+            torch::where(owns_target, grad_f, torch::zeros_like(grad_f)).unsqueeze(1));
         if (compute_grad_hidden) {
             grad_hidden_f.add_(at::mm(probabilities, weight_f.narrow(0, vocab_start, vocab_count)));
         }
