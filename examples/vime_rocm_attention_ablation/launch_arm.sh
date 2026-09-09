@@ -53,8 +53,9 @@ if [[ "${RL_KERNEL_ATTENTION_CASE:-}" != "${RLK_ABLATION_CASE_ID}" ]]; then
   echo "RL_KERNEL_ATTENTION_CASE disagrees with the arm ID" >&2
   exit 2
 fi
-if [[ "${RL_KERNEL_FFN_CASE:-}" != "R/R" || "${RL_KERNEL_LOGP_CASE:-}" != "R/R" ]]; then
-  echo "the strict dense matrix requires FFN=R/R and Logp=R/R" >&2
+if [[ "${RL_KERNEL_FFN_CASE:-}" != "${RL_KERNEL_LOGP_CASE:-}" ]] ||
+   [[ "${RL_KERNEL_FFN_CASE:-}" != "R/R" && "${RL_KERNEL_FFN_CASE:-}" != "P/P" ]]; then
+  echo "FFN and Logp must both use P/P or both use R/R" >&2
   exit 2
 fi
 if [[ "${RL_KERNEL_VLLM_INTEGRATION:-}" != "1" ]]; then
@@ -201,7 +202,11 @@ names = [
     "RL_KERNEL_READBACK_DIR",
     "RL_KERNEL_MISMATCH_SIDECAR_DIR",
 ]
-print(json.dumps({"env_vars": {name: os.environ[name] for name in names}}))
+env_vars = {name: os.environ[name] for name in names}
+for name in ("RL_KERNEL_ROCM_FIXED_PAGED_TILE", "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS"):
+    if name in os.environ:
+        env_vars[name] = os.environ[name]
+print(json.dumps({"env_vars": env_vars}))
 PY
 )"
 
@@ -247,6 +252,18 @@ sleep 10
 
 # The RL-Kernel paged CK path and device-sequenced IPC collectives are captured
 # by vLLM's HIP graph runtime after adapter-owned warmup.
+LINEAR_LOGP_ARGS=()
+if [[ "${RL_KERNEL_LOGP_CASE%%/*}" == "R" ]]; then
+  LINEAR_LOGP_ARGS+=(
+    --linear-logp-provider
+    rl_engine.integrations.vime.linear_logp_provider.provider
+    --linear-logp-provider-mode strict
+  )
+fi
+ROLLOUT_LOGPROBS_ARGS=()
+if [[ "${RLK_ABLATION_USE_ROLLOUT_LOGPROBS:-0}" == "1" ]]; then
+  ROLLOUT_LOGPROBS_ARGS+=(--use-rollout-logprobs)
+fi
 ray job submit \
   --address="${ray_job_address}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -313,9 +330,8 @@ ray job submit \
   --attention-backend flash \
   --train-memory-margin-bytes 2147483648 \
   --no-gradient-accumulation-fusion \
-  --linear-logp-provider \
-  rl_engine.integrations.vime.linear_logp_provider.provider \
-  --linear-logp-provider-mode strict \
+  "${LINEAR_LOGP_ARGS[@]}" \
+  "${ROLLOUT_LOGPROBS_ARGS[@]}" \
   --get-mismatch-metrics \
   --custom-tis-function-path \
   vime_rocm_attention_ablation.tis_metrics.metrics_only_tis \

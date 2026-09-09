@@ -33,14 +33,12 @@ Those rows describe one-at-a-time root-cause probes; most still need concrete
 runtime mutation and restoration hooks. No row label is treated as execution
 evidence here.
 
-## Why every arm uses eager vLLM
+## HIP Graph execution
 
-All four arms pass `--vllm-enforce-eager`. The current strict ROCm QKV/O
-projection uses a fixed-tree collective with Python/lock bookkeeping, so it is
-not a valid vLLM fullgraph capture target. Freezing eager mode across `P` and
-`R` arms makes this a correctness-first, one-factor experiment. A future graph
-path should be introduced as a separate controlled variable, not enabled only
-for some arms.
+The launcher uses `FULL_AND_PIECEWISE` graph mode for every arm, with a maximum
+capture size of 32. Stateful strict collectives remain at piecewise graph
+boundaries. ROCm uses PyTorch's `torch.cuda` graph API to capture HIP work.
+Attention routes and fixed-paged settings participate in the graph cache key.
 
 ## Prerequisites
 
@@ -63,9 +61,11 @@ The default formal topology reuses PR #377's colocated eight-GPU schedule:
 - strict Logp vocabulary layout: 151936 real rows, padded to 152064 rows for TP4.
 
 The batch defaults are deliberately small correctness settings for the strict
-path and may be overridden consistently on the CLI. On the rollout side, the current strict route logically gathers the
-vLLM paged KV layout before invoking dense AITER Attention; it does not claim a
-native paged Attention kernel or publishable performance numbers.
+path and may be overridden consistently on the CLI. Supported strict rollout
+calls consume the vLLM paged KV cache directly. Readbacks report
+`dense_kv_materialized` so a materialized fallback can be distinguished from
+this direct path. See [fixed paged CK attention](fixed_paged_ck.md) for the
+opt-in arithmetic schedule, supported shapes, and one-round long-workload runner.
 
 The command refuses to reuse a non-empty run directory or an already-running
 Ray cluster. Each arm receives its own dump, readback, and log directory. A
@@ -188,3 +188,15 @@ python examples/vime_rocm_attention_ablation/validate_artifacts.py \
 Do not add `matrix-plan.json`, validation JSON, rollout dumps, mismatch
 sidecars, checkpoints, or MI300X result files to the PR. Publish them as CI/job
 artifacts when needed.
+
+## Full-native PR377 workload
+
+The standalone P/P runner selects production attention, FFN, and logp on both
+the Megatron and vLLM sides. It uses actor TP4/CP2, two TP4 rollout engines,
+round-robin routing, eight samples, a 7168-token response limit, and Vime's
+rollout-logprob framework consistency mode. Three rounds are the default:
+
+```bash
+python -m examples.vime_rocm_attention_ablation.run_full_pp_pr377_workload \
+  --run-dir /app/model/vime-runs/pr394-full-native-pp-vime-tis
+```
