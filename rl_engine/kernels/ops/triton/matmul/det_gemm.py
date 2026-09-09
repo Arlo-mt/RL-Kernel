@@ -176,6 +176,9 @@ class _DeviceTreePlan:
     leaf_lengths: torch.Tensor
     leaf_nodes: torch.Tensor
     reduction_levels: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]
+    rocm_fused_reduction_pairs: tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...
+    ]
 
 
 def _build_tree_plan(k_size: int) -> _TreePlan:
@@ -239,12 +242,35 @@ def _device_tree_plan(k_size: int, device: torch.device) -> _DeviceTreePlan:
         for operations in host.reduction_levels:
             lower, upper, output = zip(*operations, strict=True)
             levels.append((indices(lower), indices(upper), indices(output)))
+        fused_pairs = []
+        if _device_arch(device_index) == "gfx942":
+            for level_index in range(0, len(host.reduction_levels) - 1, 2):
+                first = {
+                    output: (lower, upper)
+                    for lower, upper, output in host.reduction_levels[level_index]
+                }
+                grandchildren = []
+                outputs = []
+                for lower, upper, output in host.reduction_levels[level_index + 1]:
+                    grandchildren.append((*first[lower], *first[upper]))
+                    outputs.append(output)
+                node0, node1, node2, node3 = zip(*grandchildren, strict=True)
+                fused_pairs.append(
+                    (
+                        indices(node0),
+                        indices(node1),
+                        indices(node2),
+                        indices(node3),
+                        indices(tuple(outputs)),
+                    )
+                )
         result = _DeviceTreePlan(
             host=host,
             leaf_starts=indices(host.leaf_starts),
             leaf_lengths=indices(host.leaf_lengths),
             leaf_nodes=indices(host.leaf_nodes),
             reduction_levels=tuple(levels),
+            rocm_fused_reduction_pairs=tuple(fused_pairs),
         )
         _TREE_PLANS[key] = result
         return result
@@ -393,6 +419,60 @@ if _TRITON_AVAILABLE:
             result.to(output_ptr.dtype.element_ty),
             mask=mask,
         )
+
+    @triton.jit
+    def _det_gemm_tree_reduce_two_levels_rocm_kernel(
+        workspace_ptr,
+        output_ptr,
+        node0_ptr,
+        node1_ptr,
+        node2_ptr,
+        node3_ptr,
+        output_nodes_ptr,
+        M,
+        N: tl.constexpr,
+        BLOCK: tl.constexpr,
+        WRITE_OUTPUT: tl.constexpr,
+    ):
+        operation = tl.program_id(0)
+        block = tl.program_id(1)
+        offsets = (block * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+        elements = M * N
+        mask = offsets < elements
+        node0 = tl.load(node0_ptr + operation).to(tl.int64)
+        node1 = tl.load(node1_ptr + operation).to(tl.int64)
+        node2 = tl.load(node2_ptr + operation).to(tl.int64)
+        node3 = tl.load(node3_ptr + operation).to(tl.int64)
+        value0 = tl.load(
+            workspace_ptr + node0 * elements + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        value1 = tl.load(
+            workspace_ptr + node1 * elements + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        value2 = tl.load(
+            workspace_ptr + node2 * elements + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        value3 = tl.load(
+            workspace_ptr + node3 * elements + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        # Match the two original kernel boundaries exactly: each first-level
+        # FP32 add is rounded to BF16 before the second-level FP32 add.
+        lower = (value0 + value1).to(workspace_ptr.dtype.element_ty).to(tl.float32)
+        upper = (value2 + value3).to(workspace_ptr.dtype.element_ty).to(tl.float32)
+        result = lower + upper
+        if WRITE_OUTPUT:
+            tl.store(
+                output_ptr + offsets,
+                result.to(output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+        else:
+            output_node = tl.load(output_nodes_ptr + operation).to(tl.int64)
+            tl.store(
+                workspace_ptr + output_node * elements + offsets,
+                result.to(workspace_ptr.dtype.element_ty),
+                mask=mask,
+            )
 
     @triton.jit
     def _copy_tree_root_kernel(
@@ -633,23 +713,24 @@ def _triton_tree_gemm(
     reduction_block = 256
     device_index = a.device.index if a.device.index is not None else torch.cuda.current_device()
     direct_root_output = not transpose_output and _device_arch(device_index) == "gfx942"
-    for level_index, (operations, (lower, upper, output)) in enumerate(
-        zip(
-            plan.host.reduction_levels,
-            plan.reduction_levels,
-            strict=True,
-        )
-    ):
-        write_final_output = (
-            direct_root_output and level_index == len(plan.host.reduction_levels) - 1
-        )
-        if write_final_output and len(operations) != 1:
-            raise RuntimeError("the final deterministic GEMM tree level must contain one root")
-        if write_final_output:
-            grid = (triton.cdiv(m_size * n_size, reduction_block),)
-            # direct_root_output is true only for gfx942; CUDA retains its
-            # established constexpr-M reduction and root-copy path.
-            _det_gemm_tree_reduce_to_output_rocm_kernel[grid](
+    if direct_root_output and torch.is_inference_mode_enabled():
+        blocks = triton.cdiv(m_size * n_size, reduction_block)
+        for pair_index, nodes in enumerate(plan.rocm_fused_reduction_pairs):
+            second_level = pair_index * 2 + 1
+            operations = plan.host.reduction_levels[second_level]
+            write_final_output = second_level == len(plan.host.reduction_levels) - 1
+            _det_gemm_tree_reduce_two_levels_rocm_kernel[(len(operations), blocks)](
+                workspace,
+                result,
+                *nodes,
+                M=m_size,
+                N=n_size,
+                BLOCK=reduction_block,
+                WRITE_OUTPUT=write_final_output,
+            )
+        if len(plan.host.reduction_levels) % 2:
+            lower, upper, _output = plan.reduction_levels[-1]
+            _det_gemm_tree_reduce_to_output_rocm_kernel[(blocks,)](
                 workspace,
                 result,
                 lower,
@@ -658,17 +739,45 @@ def _triton_tree_gemm(
                 N=n_size,
                 BLOCK=reduction_block,
             )
-        else:
-            grid = (len(operations), triton.cdiv(m_size * n_size, reduction_block))
-            _det_gemm_tree_reduce_kernel[grid](
-                workspace,
-                lower,
-                upper,
-                output,
-                M=m_size,
-                N=n_size,
-                BLOCK=reduction_block,
+    else:
+        for level_index, (operations, (lower, upper, output)) in enumerate(
+            zip(
+                plan.host.reduction_levels,
+                plan.reduction_levels,
+                strict=True,
             )
+        ):
+            write_final_output = (
+                direct_root_output and level_index == len(plan.host.reduction_levels) - 1
+            )
+            if write_final_output and len(operations) != 1:
+                raise RuntimeError(
+                    "the final deterministic GEMM tree level must contain one root"
+                )
+            if write_final_output:
+                grid = (triton.cdiv(m_size * n_size, reduction_block),)
+                # direct_root_output is true only for gfx942; CUDA retains its
+                # established reduction and root-copy path.
+                _det_gemm_tree_reduce_to_output_rocm_kernel[grid](
+                    workspace,
+                    result,
+                    lower,
+                    upper,
+                    M=m_size,
+                    N=n_size,
+                    BLOCK=reduction_block,
+                )
+            else:
+                grid = (len(operations), triton.cdiv(m_size * n_size, reduction_block))
+                _det_gemm_tree_reduce_kernel[grid](
+                    workspace,
+                    lower,
+                    upper,
+                    output,
+                    M=m_size,
+                    N=n_size,
+                    BLOCK=reduction_block,
+                )
 
     copy_block = 256
     if transpose_output:
