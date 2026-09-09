@@ -206,30 +206,42 @@ std::vector<torch::Tensor> fused_linear_logp_musa_backward(
     const int64_t vocab = weight.size(0);
     auto hidden_f = hidden.to(torch::kFloat).contiguous();
     auto weight_f = weight.to(torch::kFloat).contiguous();
-    torch::optional<torch::Tensor> bias_f;
-    if (bias.has_value()) {
-        bias_f = bias->to(torch::kFloat).contiguous();
-    }
     auto grad_f = grad_logp.to(torch::kFloat).contiguous();
-    auto logits = at::mm(hidden.to(torch::kFloat), weight.to(torch::kFloat).t());
-    if (bias.has_value()) {
-        logits.add_(bias->to(torch::kFloat));
-    }
-    auto dlogits = at::_softmax(logits, 1, false);
-    dlogits.mul_(-grad_f.unsqueeze(1));
-    dlogits.scatter_add_(1, target.unsqueeze(1), grad_f.unsqueeze(1));
+    auto lse_f = lse.to(torch::kFloat).contiguous();
+    auto grad_hidden_f = compute_grad_hidden
+        ? torch::zeros({rows, hidden.size(1)}, hidden.options().dtype(torch::kFloat))
+        : torch::Tensor();
+    auto grad_weight_f = compute_grad_weight
+        ? torch::empty({vocab, hidden.size(1)}, hidden.options().dtype(torch::kFloat))
+        : torch::Tensor();
+    auto grad_bias_f = compute_grad_bias && bias.has_value()
+        ? torch::empty({vocab}, hidden.options().dtype(torch::kFloat))
+        : torch::Tensor();
 
+    // Stream over vocabulary tiles so backward never materializes [N, V].
+    for (int64_t vocab_start = 0; vocab_start < vocab; vocab_start += kVocabTile) {
+        const int64_t vocab_count = std::min(kVocabTile, vocab - vocab_start);
+        auto logits = project_tile(hidden, weight, bias, vocab_start, vocab_count).to(torch::kFloat);
+        auto probabilities = (logits - lse_f.unsqueeze(1)).exp();
+        auto local_target = (target - vocab_start).clamp(0, vocab_count - 1);
+        probabilities.mul_(-grad_f.unsqueeze(1));
+        probabilities.scatter_add_(1, local_target.unsqueeze(1), grad_f.unsqueeze(1));
+        if (compute_grad_hidden) {
+            grad_hidden_f.add_(at::mm(probabilities, weight_f.narrow(0, vocab_start, vocab_count)));
+        }
+        if (compute_grad_weight) {
+            grad_weight_f.narrow(0, vocab_start, vocab_count).copy_(
+                at::mm(probabilities.t(), hidden_f));
+        }
+        if (compute_grad_bias && bias.has_value()) {
+            grad_bias_f.narrow(0, vocab_start, vocab_count).copy_(probabilities.sum(0));
+        }
+    }
     torch::Tensor grad_hidden;
     torch::Tensor grad_weight;
     torch::Tensor grad_bias;
-    if (compute_grad_hidden) {
-        grad_hidden = at::mm(dlogits, weight.to(torch::kFloat)).to(hidden.scalar_type());
-    }
-    if (compute_grad_weight) {
-        grad_weight = at::mm(dlogits.t(), hidden.to(torch::kFloat)).to(weight.scalar_type());
-    }
-    if (compute_grad_bias && bias.has_value()) {
-        grad_bias = dlogits.sum(0).to(bias->scalar_type());
-    }
+    if (compute_grad_hidden) grad_hidden = grad_hidden_f.to(hidden.scalar_type());
+    if (compute_grad_weight) grad_weight = grad_weight_f.to(weight.scalar_type());
+    if (compute_grad_bias && bias.has_value()) grad_bias = grad_bias_f.to(bias->scalar_type());
     return {grad_hidden, grad_weight, grad_bias};
 }
