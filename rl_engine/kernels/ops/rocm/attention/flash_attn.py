@@ -443,7 +443,7 @@ class StrictRocmAiterCKAttentionCore:
             source_digest.update(Path(inspect.getsourcefile(fixed_paged_prefill)).read_bytes())
             source_digest.update(
                 (
-                    Path(__file__).resolve().parents[5] / "csrc/rocm/attention/strict_paged_ck.cu"
+                    Path(__file__).resolve().parents[5] / "csrc/rocm/attention/fixed_paged_ck.hip"
                 ).read_bytes()
             )
             source_digest.update(fixed_tile.encode())

@@ -25,7 +25,7 @@ def load_fixed_paged_ck(tile_m: int = 128):
         raise RuntimeError("fixed CK attention requires the installed aiter_meta headers")
     meta = Path(next(iter(spec.submodule_search_locations)))
     ck = meta / "3rdparty/composable_kernel"
-    source = Path(__file__).resolve().parents[5] / "csrc/rocm/attention/strict_paged_ck.cu"
+    source = Path(__file__).resolve().parents[5] / "csrc/rocm/attention/fixed_paged_ck.hip"
     fingerprint = hashlib.sha256(source.read_bytes())
     for header in (
         ck / "example/ck_tile/01_fmha/fmha_fwd.hpp",
