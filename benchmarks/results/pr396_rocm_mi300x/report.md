@@ -98,7 +98,31 @@ Qwen3-8B, actor TP4/CP2/PP1, two TP4 vLLM engines, 8 samples, 7168-token
 response limit, 4096 training tokens/GPU, seeds 1234, HIP Graph
 FULL_AND_PIECEWISE (capture 32), `RL_KERNEL_ROCM_FIXED_PAGED_TILE=128`.
 
-### 4a. Same machine, same conditions (vLLM memory utilization 0.30)
+### 4a. Healthy node after host GPU reset (vLLM memory utilization 0.38)
+
+Primary numbers.  Health check before the pair: 8-GPU copy 3.82-3.90 TB/s,
+decode GEMM 23-28 us, prefill GEMM 335-360 us, TP4 all-reduce 1 MB 43-53 us.
+Runs `mxs-pair-v6-p-p` and `mxs-pair-v6-r-r-triton`.
+
+| Config | Mismatch Count | Max \|dlogp\| | torch.equal |
+|---|---:|---:|:---:|
+| P/P native | 23294 / 42042 | 2.342051 | false |
+| R/R strict (MFMA GEMM + Triton attention) | **0 / 28652** | **0** | **true** |
+
+| Metric | P/P native | R/R (Triton attn) | R/R vs P/P |
+|---|---:|---:|---:|
+| rollout time | **56.31 s** | 67.17 s | 19.3% slower |
+| effective tokens/GPU/s | **93.32** | 53.32 | 42.9% lower |
+| update weights | 2.59 s | **1.18 s** | **54.6% faster** |
+| log probs | 8.71 s | **7.19 s** | **17.4% faster** |
+| actor train | 14.92 s | **10.67 s** | **28.5% faster** |
+| train time | 24.31 s | **18.36 s** | **24.5% faster** |
+| actor train tok/s | 2886.6 | 2779.7 | 3.7% lower |
+| end-to-end step | **83.69 s** | 87.71 s | 4.8% slower |
+
+Mean sampled response length was 5255 tokens (P/P) vs 3581 (R/R), so the per-token rollout throughput (93 vs 53 tokens/GPU/s, 1.75x) is the honest measure of the remaining gap, not the 19% rollout-time difference. Against the #394 R/R baseline on a healthy node (round 0: 39 tokens/GPU/s, log probs 25.5 s, actor train 50.1 s, step 183.0 s) this branch is 1.36x faster in rollout throughput and 4.7x faster in actor train.
+
+### 4b. Same degraded node, same conditions (vLLM memory utilization 0.30)
 
 | Config | Mismatch Count | Max \|dlogp\| | torch.equal |
 |---|---:|---:|:---:|
@@ -117,7 +141,7 @@ FULL_AND_PIECEWISE (capture 32), `RL_KERNEL_ROCM_FIXED_PAGED_TILE=128`.
 | actor train tok/s | 601.6 | 629.3 | 616.2 | 2.4% higher |
 | end-to-end step | 276.24 s | 441.30 s | 409.79 s | 48.3% slower |
 
-### 4b. Healthy-node points (before the degradation described below)
+### 4c. Healthy-node points measured before the degradation
 
 | Run | rollout | log probs | actor train | step | consistency |
 |---|---:|---:|---:|---:|---|
@@ -138,9 +162,9 @@ container's PID 1 is `sleep infinity`, so killed Ray/vLLM workers become
 permanent zombies; reaping them (a ptrace-injected `wait4` on PID 1) removed
 2285 zombies but the driver still lists the GPU contexts of eight killed vLLM
 workers (73 GB and 11 GB per GPU, hardware queues still mapped) under
-`/sys/class/kfd/kfd/proc/`.  A host-side GPU reset is needed before the
-30-round comparison; the absolute numbers in 4a are inflated for every arm,
-the relative ones are same-condition.
+`/sys/class/kfd/kfd/proc/`.  A host-side GPU reset restored the node (section 4a was measured after
+it); the absolute numbers in 4b are inflated for every arm, the relative
+ones are same-condition.
 
 Two harness pitfalls fixed on the way: operator-shell `http_proxy` variables
 inherited by Ray turned every generation longer than 30 s into a 502 retry
@@ -150,11 +174,10 @@ strips the proxy variables and pins `GPU_ARCHS`.
 
 ## 6. What is still missing for a net win
 
-- Rollout decode is ~2x native per step even though the GEMMs are within
-  1.3x of hipBLASLt and the attention core is faster than CK.  The
-  remaining cost is outside the kernels: eager custom-op boundaries around
-  the deterministic all-reduce and the packed FFN, plus attention launch
-  overhead.  `profile_rocm_rollout_decode.py` + `summarize_rollout_trace.py`
+- Rollout decode is ~1.75x native per token even though the GEMMs are
+  within 1.3x of hipBLASLt and the attention core is faster than CK.  The
+  decode step runs inside a full HIP graph, so the gap has to be attributed
+  kernel by kernel.  `profile_rocm_rollout_decode.py` + `summarize_rollout_trace.py`
   capture per-rank kernel traces of one decode workload for this analysis.
 - Training attention at CP2 still all-gathers Q/K/V and computes the whole
   sequence on every CP rank; the per-row-invariant kernel allows computing
