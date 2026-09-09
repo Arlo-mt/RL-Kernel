@@ -35,9 +35,7 @@ class _MusaDetLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         a, weight = ctx.saved_tensors
         grad_a = _C.det_gemm_fwd(grad_output, weight) if ctx.needs_input_grad[0] else None
-        grad_weight = (
-            _C.det_gemm_db_transposed(a, grad_output) if ctx.needs_input_grad[1] else None
-        )
+        grad_weight = _C.det_gemm_db_transposed(a, grad_output) if ctx.needs_input_grad[1] else None
         return grad_a, grad_weight
 
 

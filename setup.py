@@ -21,6 +21,7 @@ def _load_envs_module():
 
 envs = _load_envs_module()
 
+
 def _musa_build_available(torch) -> bool:
     try:
         import torch_musa  # noqa: F401
@@ -28,10 +29,7 @@ def _musa_build_available(torch) -> bool:
         return False
     return bool(
         hasattr(torch, "musa")
-        and (
-            torch.musa.is_available()
-            or bool(os.environ.get("TORCH_MUSA_ARCH_LIST", "").strip())
-        )
+        and (torch.musa.is_available() or bool(os.environ.get("TORCH_MUSA_ARCH_LIST", "").strip()))
     )
 
 
@@ -143,6 +141,7 @@ def get_extensions():
                 sources=[
                     "csrc/musa/ops.cpp",
                     "csrc/musa/det_gemm.mu",
+                    "csrc/musa/fused_linear_logp.mu",
                 ],
                 include_dirs=[],
                 extra_compile_args={
