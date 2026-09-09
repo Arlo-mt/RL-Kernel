@@ -118,6 +118,10 @@ do
 done
 
 unset CUBLASLT_WORKSPACE_SIZE CUBLAS_WORKSPACE_CONFIG NCCL_ALGO
+# Vime's rollout client (httpx) and the router honor proxy variables. A host
+# proxy inherited from the operator's shell turns every generation longer than
+# the proxy's upstream timeout into a 502 retry loop, so never forward them.
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
 unset RL_KERNEL_CUDA_ONLY RL_KERNEL_DET_GEMM_SM90_ONLY RL_KERNEL_PRECOMPILE_FA4
 unset VLLM_BATCH_INVARIANT NVTE_FUSED_ATTN NVTE_FLASH_ATTN NVTE_UNFUSED_ATTN
 
@@ -128,6 +132,10 @@ export CUDA_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
 export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH:-gfx942}"
+# AITER's JIT resolves GPU_ARCHS=native to an empty offload list inside vLLM
+# workers and then compiles CK for the compiler default (gfx906), which fails.
+# Pin the build target to the same architecture PyTorch targets.
+export GPU_ARCHS="${PYTORCH_ROCM_ARCH}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE=0
@@ -184,6 +192,7 @@ names = [
     "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     "PYTORCH_ROCM_ARCH",
+    "GPU_ARCHS",
     "PYTORCH_ALLOC_CONF",
     "CUDA_DEVICE_MAX_CONNECTIONS",
     "NCCL_NVLS_ENABLE",
@@ -203,7 +212,12 @@ names = [
     "RL_KERNEL_MISMATCH_SIDECAR_DIR",
 ]
 env_vars = {name: os.environ[name] for name in names}
-for name in ("RL_KERNEL_ROCM_FIXED_PAGED_TILE", "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS"):
+for name in (
+    "RL_KERNEL_ROCM_FIXED_PAGED_TILE",
+    "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS",
+    "RL_KERNEL_DET_GEMM_BACKEND",
+    "RL_KERNEL_ROCM_ATTENTION_BACKEND",
+):
     if name in os.environ:
         env_vars[name] = os.environ[name]
 print(json.dumps({"env_vars": env_vars}))

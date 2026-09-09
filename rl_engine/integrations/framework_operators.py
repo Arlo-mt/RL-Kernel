@@ -1047,6 +1047,19 @@ class VllmAttentionOperator:
             torch.empty((1,), device=device, dtype=dtype)
         )
         page_size = 16
+        core = getattr(runtime, "_core", None)
+        if getattr(core, "attention_backend", "ck") == "triton":
+            from rl_engine.kernels.ops.triton.attention import chunked_flash_attn
+
+            chunked_flash_attn.warmup(
+                device,
+                num_q_heads=int(impl.num_heads),
+                num_kv_heads=int(impl.num_kv_heads),
+                dtype=dtype,
+            )
+            from rl_engine.kernels.ops.triton.matmul import mfma_gemm
+
+            mfma_gemm.warmup(device)
         q = torch.empty(
             (1, int(impl.num_heads), 1, int(impl.head_size)),
             device=device,
@@ -1291,19 +1304,51 @@ class VllmAttentionOperator:
         block_size: int,
         num_actual: int,
         cache_owner: Any,
+        runtime_core: Any = None,
     ) -> tuple[dict[str, Any], bool] | None:
         """Prepare graph-safe paged metadata once and share it across layers."""
 
         num_decodes = int(getattr(attn_metadata, "num_decodes", 0))
         num_prefills = int(getattr(attn_metadata, "num_prefills", 0))
         num_extends = int(getattr(attn_metadata, "num_extends", 0))
-        if num_extends or (num_decodes > 0) == (num_prefills > 0):
+        unified = bool(getattr(runtime_core, "supports_mixed_paged_batches", False))
+        if unified:
+            # The chunked Triton contract serves every request kind from one
+            # causal launch, so mixed decode/extend/prefill batches need no
+            # per-kind expansion.
+            if num_decodes + num_extends + num_prefills <= 0 or num_actual <= 0:
+                return None
+            if num_extends or (num_decodes > 0 and num_prefills > 0):
+                mode = "mixed"
+            elif num_prefills > 0:
+                mode = "prefill"
+            else:
+                mode = "decode"
+            sequence_count = num_decodes + num_extends + num_prefills
+            query_start_loc = self._metadata_tensor(attn_metadata, "query_start_loc")
+            max_seqlen_q = int(getattr(attn_metadata, "max_query_len", 0) or 0)
+            if max_seqlen_q <= 0:
+                lengths = [
+                    int(getattr(meta, "max_query_len", 0) or 0)
+                    for meta in (
+                        getattr(attn_metadata, "decode_metadata", None),
+                        getattr(attn_metadata, "extend_metadata", None),
+                        getattr(attn_metadata, "prefill_metadata", None),
+                    )
+                    if meta is not None
+                ]
+                max_seqlen_q = max(lengths) if lengths else 0
+            causal = True
+        elif num_extends or (num_decodes > 0) == (num_prefills > 0):
             return None
-        mode = "prefill" if num_prefills > 0 else "decode"
-        sequence_count = num_prefills if num_prefills > 0 else num_decodes
+        else:
+            mode = "prefill" if num_prefills > 0 else "decode"
+            sequence_count = num_prefills if num_prefills > 0 else num_decodes
         if sequence_count <= 0 or num_actual <= 0:
             return None
-        if mode == "prefill":
+        if unified:
+            pass
+        elif mode == "prefill":
             prefill = getattr(attn_metadata, "prefill_metadata", None)
             if prefill is None:
                 return None
@@ -1336,6 +1381,7 @@ class VllmAttentionOperator:
         )
         key = (
             mode,
+            unified,
             _tensor_cache_token(query_starts_source),
             _tensor_cache_token(seq_lens_source),
             _tensor_cache_token(block_table),
@@ -1365,7 +1411,23 @@ class VllmAttentionOperator:
             seq_lens = seq_lens.contiguous()
         # Graph metadata is request-level while packed Q is query-token-level.
         # Expand decode page rows to query rows without materializing KV.
-        if mode == "decode":
+        seq_of_token = None
+        if unified:
+            query_start_loc = query_start_loc[: sequence_count + 1]
+            seq_lens = seq_lens[:sequence_count]
+            active_rows = seq_lens > 0
+            seqused_k = seq_lens
+            pages = block_table[:sequence_count, :page_count]
+            if mode == "decode" and num_actual == sequence_count:
+                seq_of_token = torch.arange(
+                    num_actual, dtype=torch.int32, device=block_table.device
+                )
+            else:
+                tokens = torch.arange(num_actual, dtype=torch.int32, device=block_table.device)
+                seq_of_token = torch.searchsorted(
+                    query_start_loc[1:], tokens, right=True
+                ).to(torch.int32)
+        elif mode == "decode":
             query_starts = query_start_loc[: sequence_count + 1]
             query_ends = query_starts[1:]
             query_indices = torch.arange(
@@ -1399,7 +1461,7 @@ class VllmAttentionOperator:
             pages = block_table[:sequence_count, :page_count]
         if not pages.is_contiguous():
             pages = pages.contiguous()
-        if mode != "decode":
+        if mode != "decode" and not unified:
             active_rows = seqused_k > 0
         if configured_kv_limit is not None:
             # Zero-length rows are legal vLLM graph padding.  They must not
@@ -1455,6 +1517,7 @@ class VllmAttentionOperator:
             "max_seqlen_k": kernel_max_seqlen_k,
             "configured_kv_limit": configured_kv_limit,
             "causal": causal,
+            "seq_of_token": seq_of_token,
         }
         self._rocm_paged_metadata_key = key
         self._rocm_paged_metadata_owners = {owner_id}
@@ -1485,6 +1548,7 @@ class VllmAttentionOperator:
             block_size=key_cache.size(1),
             num_actual=num_actual,
             cache_owner=layer,
+            runtime_core=getattr(runtime, "_core", None),
         )
         if metadata_result is None:
             return None

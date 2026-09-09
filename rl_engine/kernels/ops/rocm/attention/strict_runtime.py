@@ -452,7 +452,7 @@ class StrictRocmAttentionRuntime:
                 "split_kv": "disabled",
                 "query_schedule": "paged_varlen_batch",
                 "paged_execution": "direct_vllm_pages_to_aiter_batch_prefill_ck",
-                "paged_kernel": "aiter_mha_batch_prefill_non_split_ck",
+                "paged_kernel": self._paged_kernel_id(),
                 "dense_kv_materialized": False,
                 "lse_returned": bool(return_lse),
                 "launch_granularity": "one_local_gqa_batch",
@@ -594,7 +594,7 @@ class StrictRocmAttentionRuntime:
                     "split_kv": "disabled",
                     "query_schedule": "paged_single_query_batch",
                     "paged_execution": "direct_vllm_pages_to_aiter_batch_prefill_ck",
-                    "paged_kernel": "aiter_mha_batch_prefill_non_split_ck",
+                    "paged_kernel": self._paged_kernel_id(),
                     "dense_kv_materialized": False,
                     "lse_returned": bool(return_lse),
                     "launch_granularity": "one_local_gqa_batch",
@@ -1275,6 +1275,9 @@ class StrictRocmAttentionRuntime:
             core_provenance,
             launches,
         )
+
+    def _paged_kernel_id(self) -> str:
+        return str(getattr(self._core, "paged_kernel_id", "aiter_mha_batch_prefill_non_split_ck"))
 
     @staticmethod
     def _storage_is_disjoint(output: torch.Tensor, *inputs: torch.Tensor) -> bool:

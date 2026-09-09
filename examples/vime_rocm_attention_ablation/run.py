@@ -42,6 +42,18 @@ FROZEN_SCHEMA_VERSION = "rlkernel.vime_rocm_attention_frozen_inputs.v1"
 CASE_ORDER = ("P/P", "P/R", "R/P", "R/R")
 RL_KERNEL_PLUGIN_ENTRY_POINT = "rl_engine.integrations.vllm_runtime:register_vllm_plugin"
 
+# Proxy settings inherited from an operator shell break long rollout requests
+# (httpx and the router honor them; a proxy's upstream timeout yields 502s).
+_PROXY_ENVIRONMENT = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
 _CUDA_ONLY_ENVIRONMENT = (
     "CUBLASLT_WORKSPACE_SIZE",
     "CUBLAS_WORKSPACE_CONFIG",
@@ -482,6 +494,8 @@ def build_arm_environment(
     env = dict(os.environ if base_environment is None else base_environment)
     for name in _CUDA_ONLY_ENVIRONMENT:
         env.pop(name, None)
+    for name in _PROXY_ENVIRONMENT:
+        env.pop(name, None)
     existing_pythonpath = env.get("PYTHONPATH", "")
     python_paths = [
         str((config.rl_kernel_root / "examples").resolve()),
@@ -561,6 +575,8 @@ def public_arm_environment(environment: Mapping[str, str]) -> dict[str, str]:
         "RL_KERNEL_ATTENTION_CASE",
         "RL_KERNEL_ROCM_FIXED_PAGED_TILE",
         "RL_KERNEL_ROCM_PAGED_KV_MAX_TOKENS",
+        "RL_KERNEL_DET_GEMM_BACKEND",
+        "RL_KERNEL_ROCM_ATTENTION_BACKEND",
         "RL_KERNEL_FFN_CASE",
         "RL_KERNEL_LOGP_CASE",
         "RL_KERNEL_VLLM_REAL_VOCAB_SIZE",

@@ -43,6 +43,8 @@ STRICT_ROCM_CORE_ID = "rlkernel.attention.rocm.aiter_ck_dense_mha.v1"
 STRICT_ROCM_SCHEDULE_ID = "single_batch_aiter_ck_dense_mha_no_splitkv"
 ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID = "rlkernel.rocm.triton_det_gemm"
 ROCM_PAGED_ATTENTION_BACKEND_ID = "aiter_mha_batch_prefill_non_split_ck"
+ROCM_TRITON_PAGED_ATTENTION_BACKEND_ID = "rlkernel.rocm.triton_chunked_flash_attention.v1"
+ROCM_TRITON_DET_GEMM_BACKEND_ID = "rlkernel.det_gemm.triton_mfma_rocm.v1"
 ROCM_DETERMINISTIC_COLLECTIVE_BACKEND_ID = "rocm_ipc_fixed_tree"
 ROCM_FFN_BACKEND_ID = "rlkernel.rocm.det_gemm_swiglu"
 STRICT_FFN_BACKEND_ID = "rlkernel.ffn.qwen3.deterministic.v1"
@@ -303,6 +305,8 @@ def _validate_rlkernel_record(
     # arithmetic and page-table reads remain inside native AITER/CK.
     allowed_triton_backends = {
         ROCM_DETERMINISTIC_PROJECTION_BACKEND_ID,
+        ROCM_TRITON_PAGED_ATTENTION_BACKEND_ID,
+        ROCM_TRITON_DET_GEMM_BACKEND_ID,
     }
     for key, item in _walk_key_values(provenance):
         if key in _TRITON_KEYS and item is True:
@@ -315,12 +319,16 @@ def _validate_rlkernel_record(
         layouts = _values_for_keys(provenance, {"framework_layout"})
         if "vllm_paged_kv" not in layouts:
             errors.append(f"{label} did not prove the vLLM paged-KV execution boundary")
-        if not _has_exact_value(
-            provenance,
-            {"paged_kernel"},
-            ROCM_PAGED_ATTENTION_BACKEND_ID,
+        if not (
+            _has_exact_value(provenance, {"paged_kernel"}, ROCM_PAGED_ATTENTION_BACKEND_ID)
+            or _has_exact_value(
+                provenance, {"paged_kernel"}, ROCM_TRITON_PAGED_ATTENTION_BACKEND_ID
+            )
         ):
-            errors.append(f"{label} did not prove direct non-Split-K paged CK execution")
+            errors.append(
+                f"{label} did not prove direct fixed-schedule paged execution "
+                "(CK non-Split-K or the Triton chunked contract)"
+            )
         if any(_values_for_keys(provenance, {"dense_kv_materialized"})):
             errors.append(f"{label} materialized dense KV during paged decode")
         tp_values = _values_for_keys(provenance, {"tp_world_size"})

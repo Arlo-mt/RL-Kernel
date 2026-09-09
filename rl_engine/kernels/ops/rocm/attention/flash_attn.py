@@ -94,6 +94,19 @@ _AITER_BATCH_PREFILL_REQUIRED_KEYWORDS = frozenset({"block_table", "seqlen_k"})
 # scope so contract-aware dispatch and the Vime adapter name one constant
 # instead of duplicating the string.
 BACKEND_ID = "aiter.rocm.ck_dense_mha"
+AITER_PAGED_KERNEL_ID = "aiter_mha_batch_prefill_non_split_ck"
+TRITON_CHUNKED_FLASH_ATTENTION_ID = "rlkernel.rocm.triton_chunked_flash_attention.v1"
+_ATTENTION_BACKEND_ENV = "RL_KERNEL_ROCM_ATTENTION_BACKEND"
+
+
+def _requested_attention_backend() -> str:
+    """Return ``ck`` (AITER/CK entry points) or ``triton`` (chunked flash contract)."""
+
+    value = os.environ.get(_ATTENTION_BACKEND_ENV, "ck").strip().lower()
+    value = {"aiter": "ck", "chunked_flash": "triton"}.get(value, value)
+    if value not in {"ck", "triton"}:
+        raise RuntimeError(f"{_ATTENTION_BACKEND_ENV} must be 'ck' or 'triton', got {value!r}")
+    return value
 
 
 class StrictRocmAttentionUnavailable(RuntimeError):
@@ -431,8 +444,19 @@ class StrictRocmAiterCKAttentionCore:
             mha_batch_prefill = _mha_batch_prefill
             source_sha256 = "test-double" if _source_sha256 is None else _source_sha256
         self._fixed_paged_tile = 0
+        self._attention_backend = "ck"
         fixed_tile = os.environ.get("RL_KERNEL_ROCM_FIXED_PAGED_TILE", "0")
-        if _mha_fwd is None and fixed_tile != "0":
+        requested_backend = _requested_attention_backend()
+        if _mha_fwd is None and requested_backend == "triton":
+            from rl_engine.kernels.ops.triton.attention import chunked_flash_attn
+
+            self._attention_backend = "triton"
+            mha_batch_prefill = chunked_flash_attn.triton_paged_prefill
+            source_digest = hashlib.sha256(source_sha256.encode())
+            source_digest.update(Path(inspect.getsourcefile(chunked_flash_attn)).read_bytes())
+            source_digest.update(chunked_flash_attn.CHUNKED_FLASH_ATTENTION_CONTRACT_ID.encode())
+            source_sha256 = source_digest.hexdigest()
+        elif _mha_fwd is None and fixed_tile != "0":
             if fixed_tile not in ("64", "128"):
                 raise ValueError("RL_KERNEL_ROCM_FIXED_PAGED_TILE must be 0, 64 or 128")
             from .fixed_paged_ck import fixed_paged_prefill
@@ -456,10 +480,31 @@ class StrictRocmAiterCKAttentionCore:
         self._mha_bwd = mha_bwd
         self._mha_batch_prefill = mha_batch_prefill
         self.supports_paged_schedule = callable(mha_batch_prefill)
+        # The Triton contract serves decode, extend and prefill rows from one
+        # launch; the CK entry point needs one query row per decode request.
+        self.supports_mixed_paged_batches = self._attention_backend == "triton"
         self._device_description_cache: tuple[torch.device, tuple[str, str]] | None = None
         self._split_kv_plan_cache: (
             tuple[tuple[SplitKVSpec, int, str], SplitKVExecutionPlan] | None
         ) = None
+
+    @property
+    def attention_backend(self) -> str:
+        return self._attention_backend
+
+    @property
+    def paged_entrypoint_id(self) -> str:
+        if self._attention_backend == "triton":
+            return TRITON_CHUNKED_FLASH_ATTENTION_ID
+        if self._fixed_paged_tile:
+            return f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}"
+        return "mha_batch_prefill"
+
+    @property
+    def paged_kernel_id(self) -> str:
+        if self._attention_backend == "triton":
+            return TRITON_CHUNKED_FLASH_ATTENTION_ID
+        return AITER_PAGED_KERNEL_ID
 
     def forward_with_lse(
         self,
@@ -508,11 +553,7 @@ class StrictRocmAiterCKAttentionCore:
                 self._mha_batch_prefill,
                 self._mha_bwd,
             )
-            forward_entrypoint = (
-                f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}"
-                if self._fixed_paged_tile
-                else "mha_batch_prefill"
-            )
+            forward_entrypoint = self.paged_entrypoint_id
             kv_layout = "sequential_linear_pages"
         expected_lse_shape = (q.size(0), q.size(1), q.size(2))
         if out.shape != q.shape or out.dtype != resolved_dtype:
@@ -668,11 +709,8 @@ class StrictRocmAiterCKAttentionCore:
                 "gpu_arch": gpu_arch,
                 "aiter_api_source": self.api_source,
                 "aiter_source_sha256": self.source_sha256,
-                "forward_entrypoint": (
-                    f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}"
-                    if self._fixed_paged_tile
-                    else "mha_batch_prefill"
-                ),
+                "forward_entrypoint": self.paged_entrypoint_id,
+                "paged_kernel": self.paged_kernel_id,
                 "kv_layout": "vllm_linear_paged",
                 "dense_kv_materialized": False,
                 "num_splits": self.num_splits,
@@ -820,7 +858,7 @@ class StrictRocmAiterCKAttentionCore:
             if not out_bshd.is_contiguous():
                 raise ValueError("strict BSHD decode output must expose a contiguous AITER view")
 
-        if self._fixed_paged_tile:
+        if self._fixed_paged_tile or self._attention_backend == "triton":
             # Keep the same arithmetic if a caller already materialized BSHD
             # inputs (e.g. a mixed prefill/decode fallback).
             fixed_out, fixed_lse = _AiterCKPagedAttentionFn.apply(
@@ -840,7 +878,7 @@ class StrictRocmAiterCKAttentionCore:
                 lse=fixed_lse,
                 provenance={
                     "actual_backend": self.backend_id,
-                    "forward_entrypoint": f"rl_kernel_fixed_paged_ck_m{self._fixed_paged_tile}",
+                    "forward_entrypoint": self.paged_entrypoint_id,
                     "aiter_source_sha256": self.source_sha256,
                     "dense_kv_materialized": True,
                     "fallback": False,
