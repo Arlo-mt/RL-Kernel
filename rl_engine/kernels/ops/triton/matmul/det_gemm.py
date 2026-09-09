@@ -784,6 +784,7 @@ def _triton_tree_gemm(
     transpose_output: bool = False,
     out: torch.Tensor | None = None,
     preserve_a_strides: bool = False,
+    inference_schedule: bool = False,
 ) -> torch.Tensor:
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is unavailable")
@@ -819,6 +820,7 @@ def _triton_tree_gemm(
                 b,
                 transpose_output=transpose_output,
                 preserve_a_strides=preserve_a_strides,
+                inference_schedule=inference_schedule,
             )
             chunks.append(chunk)
         return torch.cat(chunks, dim=1 if transpose_output else 0)
@@ -849,6 +851,9 @@ def _triton_tree_gemm(
     )
     device_index = a.device.index if a.device.index is not None else torch.cuda.current_device()
     is_gfx942 = _device_arch(device_index) == "gfx942"
+    use_inference_schedule = (
+        torch.is_inference_mode_enabled() or inference_schedule
+    )
     leaf_config = _tree_leaf_config(
         a.device,
         m_size,
@@ -860,7 +865,7 @@ def _triton_tree_gemm(
     if (
         _ROCM_TUNE_DECODE_LEAF
         and is_gfx942
-        and torch.is_inference_mode_enabled()
+        and use_inference_schedule
         and not transpose_output
         and not preserve_a_strides
     ):
@@ -879,7 +884,7 @@ def _triton_tree_gemm(
     fuse_leaf_reduction = (
         _ROCM_FUSE_LEAF_REDUCTION
         and direct_root_output
-        and torch.is_inference_mode_enabled()
+        and use_inference_schedule
         and k_size >= 1536
         and plan.rocm_leaf_reduction is not None
     )
@@ -960,7 +965,7 @@ def _triton_tree_gemm(
                 N=n_size,
                 BLOCK=reduction_block,
             )
-    elif direct_root_output and torch.is_inference_mode_enabled():
+    elif direct_root_output and use_inference_schedule:
         blocks = triton.cdiv(m_size * n_size, reduction_block)
         for pair_index, nodes in enumerate(plan.rocm_fused_reduction_pairs):
             second_level = pair_index * 2 + 1

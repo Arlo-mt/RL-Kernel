@@ -136,11 +136,17 @@ def det_gemm_linear(
     *,
     native_op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
+    inference_schedule: bool = False,
 ) -> torch.Tensor:
     """Apply a native [N,K] weight through the strict ROCm backend."""
 
     del native_op
-    return _triton_tree_gemm(a, _cached_weight_transpose(weight), out=out)
+    return _triton_tree_gemm(
+        a,
+        _cached_weight_transpose(weight),
+        out=out,
+        inference_schedule=inference_schedule,
+    )
 
 
 @torch.library.custom_op("rl_kernel::rocm_det_gemm_linear_inference", mutates_args=())
@@ -148,7 +154,7 @@ def _det_gemm_linear_inference(
     a: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    return det_gemm_linear(a, weight)
+    return det_gemm_linear(a, weight, inference_schedule=True)
 
 
 @_det_gemm_linear_inference.register_fake
@@ -168,7 +174,7 @@ def _det_gemm_linear_inference_out(
     weight: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    det_gemm_linear(a, weight, out=out)
+    det_gemm_linear(a, weight, out=out, inference_schedule=True)
 
 
 @_det_gemm_linear_inference_out.register_fake
@@ -207,14 +213,14 @@ def _det_gemm_linear_all_reduce_inference(
             runtime_handle,
             direct_input,
         )
-        det_gemm_linear(a, weight, out=direct_input)
+        det_gemm_linear(a, weight, out=direct_input, inference_schedule=True)
         _C.deterministic_collective_rocm_ipc_all_reduce_staged(
             runtime_handle, direct_input, output
         )
         return output
     else:
         # Profiling and uncaptured prefill can exceed the decode capture bound.
-        output = det_gemm_linear(a, weight)
+        output = det_gemm_linear(a, weight, inference_schedule=True)
     _C.deterministic_collective_rocm_ipc_all_reduce_input(
         runtime_handle,
         output,
@@ -317,6 +323,17 @@ def prepare_det_gemm_linear_weight(
 
     with torch.no_grad():
         out.copy_(weight.t())
+        # Layerwise checkpoint reloads update stable Parameters through
+        # ``.data.copy_()``, which intentionally does not advance the Parameter
+        # version counter. Keep any generic inference transpose for this same
+        # source coherent with the lifecycle-managed LM-head buffer.
+        key = (weight.data_ptr(), str(weight.device), tuple(weight.shape), weight.dtype)
+        cached = _WEIGHT_TRANSPOSE_CACHE.get(key)
+        if cached is not None:
+            cached_tensor = cached[1]
+            if cached_tensor is not out:
+                cached_tensor.copy_(weight.t())
+            _WEIGHT_TRANSPOSE_CACHE[key] = (_tensor_version(weight), cached_tensor)
     return out
 
 
@@ -334,7 +351,12 @@ def det_gemm_linear_prepared(
         raise ValueError("prepared deterministic linear weight must be contiguous")
     if out is not None and (torch._C._overlaps(out, a) or torch._C._overlaps(out, weight_t)):
         raise ValueError("prepared deterministic linear output must not alias its inputs")
-    return _triton_tree_gemm(a, weight_t, out=out)
+    return _triton_tree_gemm(
+        a,
+        weight_t,
+        out=out,
+        inference_schedule=True,
+    )
 
 
 def det_gemm_linear_input_gradient(
