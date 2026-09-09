@@ -58,10 +58,10 @@ torch::Tensor project_tile(
     const torch::optional<torch::Tensor>& bias,
     int64_t vocab_start,
     int64_t vocab_count) {
-    auto weight_tile = weight.narrow(0, vocab_start, vocab_count).t();
-    auto logits = at::mm(hidden, weight_tile);
+    auto weight_tile = weight.narrow(0, vocab_start, vocab_count).to(torch::kFloat).t();
+    auto logits = at::mm(hidden.to(torch::kFloat), weight_tile);
     if (bias.has_value()) {
-        logits.add_(bias->narrow(0, vocab_start, vocab_count));
+        logits.add_(bias->narrow(0, vocab_start, vocab_count).to(torch::kFloat));
     }
     return logits;
 }
@@ -197,8 +197,8 @@ std::vector<torch::Tensor> fused_linear_logp_musa_forward(
         const int64_t vocab_count = std::min(kVocabTile, vocab - vocab_start);
         auto logits = project_tile(hidden, weight, bias, vocab_start, vocab_count);
         auto stream = at::musa::getCurrentMUSAStream();
-        merge_vocab_tile_kernel<c10::BFloat16><<<rows, 256, 0, stream>>>(
-            logits.data_ptr<c10::BFloat16>(),
+        merge_vocab_tile_kernel<float><<<rows, 256, 0, stream>>>(
+            logits.data_ptr<float>(),
             target.data_ptr<int64_t>(),
             row_max.data_ptr<float>(),
             row_sum.data_ptr<float>(),
