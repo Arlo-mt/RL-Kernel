@@ -515,7 +515,11 @@ def test_registry_dispatches_ratio_kl():
     from rl_engine.kernels.registry import kernel_registry
 
     op = kernel_registry.get_op("ratio_kl")
-    if _HAS_TRITON and torch.cuda.is_available():
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        from rl_engine.kernels.ops.musa.loss.ratio_kl import MusaRatioKLOp
+
+        assert isinstance(op, MusaRatioKLOp)
+    elif _HAS_TRITON and torch.cuda.is_available():
         assert isinstance(op, TritonRatioKLOp)
     else:
         assert isinstance(op, NativeRatioKLOp)
