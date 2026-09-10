@@ -10,34 +10,41 @@ namespace {
 
 constexpr int kBlockSize = 256;
 
-__device__ __forceinline__ float block_reduce_sum(float value) {
-  __shared__ float partial[32];
+__device__ __forceinline__ void block_reduce_sum_pair(float &left,
+                                                      float &right) {
+  __shared__ float partial_left[32];
+  __shared__ float partial_right[32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset, 32);
+    left += __shfl_down_sync(0xffffffffu, left, offset, 32);
+    right += __shfl_down_sync(0xffffffffu, right, offset, 32);
   }
   if (lane == 0) {
-    partial[warp] = value;
+    partial_left[warp] = left;
+    partial_right[warp] = right;
   }
   __syncthreads();
 
-  value = threadIdx.x < (kBlockSize / 32) ? partial[lane] : 0.0f;
+  left = threadIdx.x < (kBlockSize / 32) ? partial_left[lane] : 0.0f;
+  right = threadIdx.x < (kBlockSize / 32) ? partial_right[lane] : 0.0f;
   if (warp == 0) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-      value += __shfl_down_sync(0xffffffffu, value, offset, 32);
+      left += __shfl_down_sync(0xffffffffu, left, offset, 32);
+      right += __shfl_down_sync(0xffffffffu, right, offset, 32);
     }
   }
   if (threadIdx.x == 0) {
-    partial[0] = value;
+    partial_left[0] = left;
+    partial_right[0] = right;
   }
   __syncthreads();
-  const float result = partial[0];
+  left = partial_left[0];
+  right = partial_right[0];
   __syncthreads();
-  return result;
 }
 
 __global__ void group_advantages_kernel(const float *rewards,
@@ -65,11 +72,10 @@ __global__ void group_advantages_kernel(const float *rewards,
     local_sq_sum += value * value;
   }
 
-  const float sum = block_reduce_sum(local_sum);
-  const float sq_sum = block_reduce_sum(local_sq_sum);
+  block_reduce_sum_pair(local_sum, local_sq_sum);
   const float inv_count = 1.0f / static_cast<float>(size);
-  const float mean = sum * inv_count;
-  const float variance = fmaxf(sq_sum * inv_count - mean * mean, 0.0f);
+  const float mean = local_sum * inv_count;
+  const float variance = fmaxf(local_sq_sum * inv_count - mean * mean, 0.0f);
   const float std_value = fmaxf(sqrtf(variance), eps);
 
   for (int offset = threadIdx.x; offset < size; offset += blockDim.x) {

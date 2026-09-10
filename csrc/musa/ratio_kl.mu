@@ -10,69 +10,85 @@
 
 namespace {
 
-constexpr int kBlockSize = 256;
+constexpr int kMaxWarps = 32;
 
-__device__ __forceinline__ float block_reduce_max(float value) {
-  __shared__ float partial[32];
+template <int BlockSize>
+__device__ __forceinline__ void block_reduce_max_pair(float &left,
+                                                      float &right) {
+  __shared__ float partial_left[kMaxWarps];
+  __shared__ float partial_right[kMaxWarps];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset, 32));
+    left = fmaxf(left, __shfl_down_sync(0xffffffffu, left, offset, 32));
+    right = fmaxf(right, __shfl_down_sync(0xffffffffu, right, offset, 32));
   }
   if (lane == 0) {
-    partial[warp] = value;
+    partial_left[warp] = left;
+    partial_right[warp] = right;
   }
   __syncthreads();
 
-  value = threadIdx.x < (kBlockSize / 32) ? partial[lane] : -FLT_MAX;
+  left = threadIdx.x < (BlockSize / 32) ? partial_left[lane] : -FLT_MAX;
+  right = threadIdx.x < (BlockSize / 32) ? partial_right[lane] : -FLT_MAX;
   if (warp == 0) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-      value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset, 32));
+      left = fmaxf(left, __shfl_down_sync(0xffffffffu, left, offset, 32));
+      right = fmaxf(right, __shfl_down_sync(0xffffffffu, right, offset, 32));
     }
   }
   if (threadIdx.x == 0) {
-    partial[0] = value;
+    partial_left[0] = left;
+    partial_right[0] = right;
   }
   __syncthreads();
-  const float result = partial[0];
+  left = partial_left[0];
+  right = partial_right[0];
   __syncthreads();
-  return result;
 }
 
-__device__ __forceinline__ float block_reduce_sum(float value) {
-  __shared__ float partial[32];
+template <int BlockSize>
+__device__ __forceinline__ void block_reduce_sum_pair(float &left,
+                                                      float &right) {
+  __shared__ float partial_left[kMaxWarps];
+  __shared__ float partial_right[kMaxWarps];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset, 32);
+    left += __shfl_down_sync(0xffffffffu, left, offset, 32);
+    right += __shfl_down_sync(0xffffffffu, right, offset, 32);
   }
   if (lane == 0) {
-    partial[warp] = value;
+    partial_left[warp] = left;
+    partial_right[warp] = right;
   }
   __syncthreads();
 
-  value = threadIdx.x < (kBlockSize / 32) ? partial[lane] : 0.0f;
+  left = threadIdx.x < (BlockSize / 32) ? partial_left[lane] : 0.0f;
+  right = threadIdx.x < (BlockSize / 32) ? partial_right[lane] : 0.0f;
   if (warp == 0) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-      value += __shfl_down_sync(0xffffffffu, value, offset, 32);
+      left += __shfl_down_sync(0xffffffffu, left, offset, 32);
+      right += __shfl_down_sync(0xffffffffu, right, offset, 32);
     }
   }
   if (threadIdx.x == 0) {
-    partial[0] = value;
+    partial_left[0] = left;
+    partial_right[0] = right;
   }
   __syncthreads();
-  const float result = partial[0];
+  left = partial_left[0];
+  right = partial_right[0];
   __syncthreads();
-  return result;
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int BlockSize>
 __global__ void
 ratio_kl_forward_kernel(const scalar_t *policy, const scalar_t *reference,
                         const int64_t *action, const int32_t *mask,
@@ -101,8 +117,7 @@ ratio_kl_forward_kernel(const scalar_t *policy, const scalar_t *reference,
     max_reference = fmaxf(max_reference,
                           static_cast<float>(reference[row_offset + column]));
   }
-  max_policy = block_reduce_max(max_policy);
-  max_reference = block_reduce_max(max_reference);
+  block_reduce_max_pair<BlockSize>(max_policy, max_reference);
 
   float sum_policy = 0.0f;
   float sum_reference = 0.0f;
@@ -112,8 +127,7 @@ ratio_kl_forward_kernel(const scalar_t *policy, const scalar_t *reference,
     sum_reference += expf(static_cast<float>(reference[row_offset + column]) -
                           max_reference);
   }
-  sum_policy = block_reduce_sum(sum_policy);
-  sum_reference = block_reduce_sum(sum_reference);
+  block_reduce_sum_pair<BlockSize>(sum_policy, sum_reference);
 
   if (threadIdx.x == 0) {
     const int64_t action_id = action[row];
@@ -132,7 +146,7 @@ ratio_kl_forward_kernel(const scalar_t *policy, const scalar_t *reference,
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int BlockSize>
 __global__ void
 ratio_kl_backward_kernel(const scalar_t *policy, const int64_t *action,
                          const int32_t *mask, const float *ratio,
@@ -186,12 +200,21 @@ std::vector<torch::Tensor> ratio_kl_musa_forward_impl(torch::Tensor policy,
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, policy.scalar_type(),
       "musa_ratio_kl_forward", [&] {
-        ratio_kl_forward_kernel<scalar_t><<<rows, kBlockSize, 0, stream>>>(
-            policy.data_ptr<scalar_t>(), reference.data_ptr<scalar_t>(),
-            action.data_ptr<int64_t>(), mask.data_ptr<int32_t>(),
-            old_logp.data_ptr<float>(), ratio.data_ptr<float>(),
-            kl.data_ptr<float>(), diff.data_ptr<float>(),
-            policy_logz.data_ptr<float>(), rows, vocab);
+        if (vocab <= 32768) {
+          ratio_kl_forward_kernel<scalar_t, 256><<<rows, 256, 0, stream>>>(
+              policy.data_ptr<scalar_t>(), reference.data_ptr<scalar_t>(),
+              action.data_ptr<int64_t>(), mask.data_ptr<int32_t>(),
+              old_logp.data_ptr<float>(), ratio.data_ptr<float>(),
+              kl.data_ptr<float>(), diff.data_ptr<float>(),
+              policy_logz.data_ptr<float>(), rows, vocab);
+        } else {
+          ratio_kl_forward_kernel<scalar_t, 512><<<rows, 512, 0, stream>>>(
+              policy.data_ptr<scalar_t>(), reference.data_ptr<scalar_t>(),
+              action.data_ptr<int64_t>(), mask.data_ptr<int32_t>(),
+              old_logp.data_ptr<float>(), ratio.data_ptr<float>(),
+              kl.data_ptr<float>(), diff.data_ptr<float>(),
+              policy_logz.data_ptr<float>(), rows, vocab);
+        }
       });
   C10_MUSA_KERNEL_LAUNCH_CHECK();
   return {ratio, kl, diff, policy_logz};
@@ -213,12 +236,21 @@ ratio_kl_musa_backward_impl(torch::Tensor policy, torch::Tensor action,
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, policy.scalar_type(),
       "musa_ratio_kl_backward", [&] {
-        ratio_kl_backward_kernel<scalar_t><<<rows, kBlockSize, 0, stream>>>(
-            policy.data_ptr<scalar_t>(), action.data_ptr<int64_t>(),
-            mask.data_ptr<int32_t>(), ratio.data_ptr<float>(),
-            diff.data_ptr<float>(), policy_logz.data_ptr<float>(),
-            grad_ratio.data_ptr<float>(), grad_kl.data_ptr<float>(),
-            grad_policy.data_ptr<scalar_t>(), rows, vocab);
+        if (vocab < 32768) {
+          ratio_kl_backward_kernel<scalar_t, 256><<<rows, 256, 0, stream>>>(
+              policy.data_ptr<scalar_t>(), action.data_ptr<int64_t>(),
+              mask.data_ptr<int32_t>(), ratio.data_ptr<float>(),
+              diff.data_ptr<float>(), policy_logz.data_ptr<float>(),
+              grad_ratio.data_ptr<float>(), grad_kl.data_ptr<float>(),
+              grad_policy.data_ptr<scalar_t>(), rows, vocab);
+        } else {
+          ratio_kl_backward_kernel<scalar_t, 512><<<rows, 512, 0, stream>>>(
+              policy.data_ptr<scalar_t>(), action.data_ptr<int64_t>(),
+              mask.data_ptr<int32_t>(), ratio.data_ptr<float>(),
+              diff.data_ptr<float>(), policy_logz.data_ptr<float>(),
+              grad_ratio.data_ptr<float>(), grad_kl.data_ptr<float>(),
+              grad_policy.data_ptr<scalar_t>(), rows, vocab);
+        }
       });
   C10_MUSA_KERNEL_LAUNCH_CHECK();
   return grad_policy;
