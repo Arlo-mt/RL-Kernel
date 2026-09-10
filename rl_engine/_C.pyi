@@ -62,6 +62,30 @@ def fused_linear_logp_sm90_backward(
     compute_grad_bias: bool,
     use_global_lse: bool,
 ) -> list[torch.Tensor]: ...
+def fused_linear_ratio_kl_musa_forward(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    old_logp: torch.Tensor,
+    reference_logp: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> list[torch.Tensor]: ...
+def fused_linear_ratio_kl_musa_backward(
+    grad_ratio: torch.Tensor,
+    grad_kl: torch.Tensor,
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    ratio: torch.Tensor,
+    diff: torch.Tensor,
+    policy_lse: torch.Tensor,
+    bias: torch.Tensor | None,
+    compute_grad_hidden: bool,
+    compute_grad_weight: bool,
+    compute_grad_bias: bool,
+) -> list[torch.Tensor]: ...
 def linear_logp_probs_bf16_forward(
     logits: torch.Tensor,
     target: torch.Tensor,
