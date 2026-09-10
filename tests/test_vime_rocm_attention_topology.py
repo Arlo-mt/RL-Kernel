@@ -12,9 +12,7 @@ from rl_engine.kernels.ops.cuda.attention.cp_comm import (
     AttentionCPCommunicationPlan,
     AttentionParallelSpec,
 )
-from rl_engine.kernels.ops.rocm.attention.strict_runtime import (
-    RCCLAGRSAttentionCPCommunication,
-)
+from rl_engine.kernels.ops.rocm.attention.strict_runtime import RCCLAGRSAttentionCPCommunication
 
 ROOT = Path(__file__).parents[1]
 
@@ -115,9 +113,9 @@ def test_dashboard_cannot_overlap_ray_worker_port_range(tmp_path):
 
 
 def test_launcher_uses_pr377_torch_dist_actor_load_without_reference_model():
-    launcher = (
-        ROOT / "examples" / "vime_rocm_attention_ablation" / "launch_arm.sh"
-    ).read_text(encoding="utf-8")
+    launcher = (ROOT / "examples" / "vime_rocm_attention_ablation" / "launch_arm.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert '--load "${RLK_ABLATION_REFERENCE_CHECKPOINT}"' in launcher
     assert "--megatron-to-hf-mode" not in launcher
