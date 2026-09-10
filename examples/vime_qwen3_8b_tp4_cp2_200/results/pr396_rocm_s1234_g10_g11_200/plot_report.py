@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--g10-log", type=Path, required=True)
     parser.add_argument("--g11-log", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--include-performance-plots",
+        action="store_true",
+        help="Generate performance plots for external reporting such as W&B.",
+    )
     return parser.parse_args()
 
 
@@ -892,10 +897,10 @@ pooling actual generated tokens across steps 1–199, end-to-end throughput is
 `rounds.csv` contains every scalar RL, training, and performance field for all
 200 paired steps. `summary.json` records formulas, distribution summaries,
 bootstrap details, and the warmup-excluded token-normalized cross-check.
-`plot_report.py` regenerates the five PR #377-style PNG figures and the
-mean-logp-diff figure from the two
-authoritative launcher logs. `wandb_upload.py` uploads per-step metrics, raw
-logs, validation JSON, and this result bundle to W&B.
+`plot_report.py` regenerates the consistency and mean-logp-diff figures from
+the two authoritative launcher logs. Pass `--include-performance-plots` only
+when preparing external W&B artifacts. `wandb_upload.py` uploads per-step
+metrics, raw logs, validation JSON, and this result bundle to W&B.
 """
     path.write_text(text, encoding="utf-8", newline="\n")
 
@@ -915,10 +920,11 @@ def main() -> None:
         newline="\n",
     )
     write_readme(args.output_dir / "README.md", summary)
-    plot_performance_matrix(rows, args.output_dir)
-    plot_performance_statistics(rows, args.output_dir)
-    plot_performance_summary(rows, args.output_dir)
-    plot_performance_trajectories(rows, args.output_dir)
+    if args.include_performance_plots:
+        plot_performance_matrix(rows, args.output_dir)
+        plot_performance_statistics(rows, args.output_dir)
+        plot_performance_summary(rows, args.output_dir)
+        plot_performance_trajectories(rows, args.output_dir)
     plot_consistency_reward(rows, args.output_dir)
     plot_mean_logp_diff(rows, args.output_dir)
     print(

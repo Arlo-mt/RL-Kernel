@@ -32,7 +32,7 @@ pooling actual generated tokens across steps 1–199, end-to-end throughput is
 `rounds.csv` contains every scalar RL, training, and performance field for all
 200 paired steps. `summary.json` records formulas, distribution summaries,
 bootstrap details, and the warmup-excluded token-normalized cross-check.
-`plot_report.py` regenerates the five PR #377-style PNG figures and the
-mean-logp-diff figure from the two
-authoritative launcher logs. `wandb_upload.py` uploads per-step metrics, raw
-logs, validation JSON, and this result bundle to W&B.
+`plot_report.py` regenerates the consistency and mean-logp-diff figures from
+the two authoritative launcher logs. Pass `--include-performance-plots` only
+when preparing external W&B artifacts. `wandb_upload.py` uploads per-step
+metrics, raw logs, validation JSON, and this result bundle to W&B.
