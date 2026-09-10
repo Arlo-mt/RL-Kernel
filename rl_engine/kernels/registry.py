@@ -93,6 +93,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # GRPO loss (group reward normalization + clipped surrogate + KL)
     TRITON_GRPO_LOSS = "rl_engine.kernels.ops.triton.loss.grpo_loss.TritonGRPOLossOp"
     PYTORCH_GRPO_LOSS = "rl_engine.kernels.ops.pytorch.loss.grpo_loss.NativeGRPOLossOp"
+    MUSA_GRPO_LOSS = "rl_engine.kernels.ops.musa.loss.grpo_loss.MusaGRPOLossOp"
 
     # Fused linear log-prob (hidden @ W^T -> selected-token logp, no [N, V] logits)
     CUDA_FUSED_LINEAR_LOGP_SM90 = (
@@ -103,6 +104,7 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     # Fused policy-ratio + KL-penalty front-end (PPO/GRPO), logits -> (ratio, kl)
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
+    MUSA_RATIO_KL = "rl_engine.kernels.ops.musa.loss.ratio_kl.MusaRatioKLOp"
 
     # Variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
     PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
@@ -641,10 +643,10 @@ class KernelRegistry:
                 "attn": [OpBackend.PYTORCH_ATTN],
                 "attention": [OpBackend.PYTORCH_NATIVE_ATTENTION],
                 "kv_cache_attention": [OpBackend.PYTORCH_NATIVE_KV_CACHE_ATTN],
-                "grpo_loss": [OpBackend.PYTORCH_GRPO_LOSS],
+                "grpo_loss": [OpBackend.MUSA_GRPO_LOSS, OpBackend.PYTORCH_GRPO_LOSS],
                 "rope": [OpBackend.PYTORCH_NATIVE_ROPE],
                 "linear_logp": [OpBackend.PYTORCH_LINEAR_LOGP],
-                "ratio_kl": [OpBackend.PYTORCH_RATIO_KL],
+                "ratio_kl": [OpBackend.MUSA_RATIO_KL, OpBackend.PYTORCH_RATIO_KL],
                 "pack": [OpBackend.PYTORCH_PACK],
                 "det_gemm": [],
                 "batch_invariant_logp": [OpBackend.PYTORCH_BATCH_INVARIANT_LOGP],

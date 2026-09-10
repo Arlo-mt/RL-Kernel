@@ -212,7 +212,13 @@ def test_triton_backward_matches_native():
     fused = TritonGRPOLossOp()
     batch = _batch(seed=7, device="cuda")
     policy_logits, ref_logits = _logit_pair(batch, seed=107, device="cuda")
-    rest = (ref_logits, batch.token_ids, batch.old_logps, batch.rewards, batch.completion_mask)
+    rest = (
+        ref_logits,
+        batch.token_ids,
+        batch.old_logps,
+        batch.rewards,
+        batch.completion_mask,
+    )
     kwargs = dict(clip_eps=0.2, beta=0.05, samples_per_prompt=_SPP)
 
     pol_n = policy_logits.clone().requires_grad_(True)
@@ -232,7 +238,13 @@ def test_triton_backward_with_grad_scaling():
     fused = TritonGRPOLossOp()
     batch = _batch(seed=3, device="cuda")
     policy_logits, ref_logits = _logit_pair(batch, seed=103, device="cuda")
-    rest = (ref_logits, batch.token_ids, batch.old_logps, batch.rewards, batch.completion_mask)
+    rest = (
+        ref_logits,
+        batch.token_ids,
+        batch.old_logps,
+        batch.rewards,
+        batch.completion_mask,
+    )
     kwargs = dict(clip_eps=0.2, beta=0.05, samples_per_prompt=_SPP)
 
     pol1 = policy_logits.clone().requires_grad_(True)
@@ -291,7 +303,13 @@ def test_masked_tokens_do_not_affect_native_loss():
     op = NativeGRPOLossOp()
     batch = _batch(seed=8, valid_density=0.75)
     policy_logits, ref_logits = _logit_pair(batch, seed=108)
-    args = (ref_logits, batch.token_ids, batch.old_logps, batch.rewards, batch.completion_mask)
+    args = (
+        ref_logits,
+        batch.token_ids,
+        batch.old_logps,
+        batch.rewards,
+        batch.completion_mask,
+    )
     kwargs = dict(clip_eps=0.2, beta=0.05, samples_per_prompt=_SPP)
 
     base, _, _ = op.forward(policy_logits, *args, **kwargs)
@@ -304,7 +322,13 @@ def test_masked_tokens_do_not_affect_triton_loss():
     fused = TritonGRPOLossOp()
     batch = _batch(seed=8, device="cuda", valid_density=0.75)
     policy_logits, ref_logits = _logit_pair(batch, seed=108, device="cuda")
-    args = (ref_logits, batch.token_ids, batch.old_logps, batch.rewards, batch.completion_mask)
+    args = (
+        ref_logits,
+        batch.token_ids,
+        batch.old_logps,
+        batch.rewards,
+        batch.completion_mask,
+    )
     kwargs = dict(clip_eps=0.2, beta=0.05, samples_per_prompt=_SPP)
 
     base, _, _ = fused.forward(policy_logits, *args, **kwargs)
@@ -313,7 +337,13 @@ def test_masked_tokens_do_not_affect_triton_loss():
 
 
 def _descend(op, batch, policy_logits, ref_logits, *, steps=5, lr=0.05):
-    rest = (ref_logits, batch.token_ids, batch.old_logps, batch.rewards, batch.completion_mask)
+    rest = (
+        ref_logits,
+        batch.token_ids,
+        batch.old_logps,
+        batch.rewards,
+        batch.completion_mask,
+    )
     kwargs = dict(clip_eps=0.2, beta=0.05, samples_per_prompt=_SPP)
     initial = op.forward(policy_logits, *rest, **kwargs)[0]
     params = policy_logits.clone().requires_grad_(True)
@@ -349,7 +379,9 @@ def test_registry_dispatches_grpo_loss():
 
     op = kernel_registry.get_op("grpo_loss")
     assert hasattr(op, "forward") and hasattr(op, "group_advantages")
-    if _HAS_TRITON and torch.cuda.is_available():
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        assert op.__class__.__name__ == "MusaGRPOLossOp"
+    elif _HAS_TRITON and torch.cuda.is_available():
         assert isinstance(op, TritonGRPOLossOp)
     else:
         assert isinstance(op, NativeGRPOLossOp)

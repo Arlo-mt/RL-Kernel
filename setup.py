@@ -25,6 +25,17 @@ def _load_envs_module():
 envs = _load_envs_module()
 
 
+def _musa_build_available(torch) -> bool:
+    try:
+        import torch_musa  # noqa: F401
+    except ImportError:
+        return False
+    return bool(
+        hasattr(torch, "musa")
+        and (torch.musa.is_available() or bool(os.environ.get("TORCH_MUSA_ARCH_LIST", "").strip()))
+    )
+
+
 def _load_torch_extension_tools():
     try:
         import torch
@@ -32,6 +43,11 @@ def _load_torch_extension_tools():
         if exc.name != "torch":
             raise
         return None, None, None
+
+    if _musa_build_available(torch):
+        from torch_musa.utils.musa_extension import BuildExtension, MUSAExtension
+
+        return torch, BuildExtension, MUSAExtension
 
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -48,6 +64,8 @@ def _native_extension_required() -> bool:
         or bool(os.environ.get("PYTORCH_ROCM_ARCH", "").strip())
         or bool(os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip())
         or envs.env_flag("FORCE_CUDA")
+        or bool(os.environ.get("TORCH_MUSA_ARCH_LIST", "").strip())
+        or envs.env_flag("FORCE_MUSA")
     )
 
 
@@ -119,6 +137,25 @@ def get_extensions():
     if os.environ.get("KERNEL_ALIGN_DEV_RPATH") == "1":
         torch_rpath.append(f"-Wl,-rpath,{torch_lib_dir}")
     is_rocm = getattr(torch.version, "hip", None) is not None
+
+    if _musa_build_available(torch):
+        extensions.append(
+            CUDAExtension(
+                name="rl_engine._C",
+                sources=[
+                    "csrc/musa/ops.cpp",
+                    "csrc/musa/ratio_kl.mu",
+                    "csrc/musa/grpo_loss.mu",
+                ],
+                include_dirs=[],
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_MUSA"],
+                    "mcc": ["-O3", "-std=c++17", "-DKERNEL_ALIGN_WITH_MUSA"],
+                },
+                extra_link_args=list(torch_rpath),
+            )
+        )
+        return extensions
 
     # CUDAExtension is intentionally used for both CUDA and ROCm. On ROCm,
     # PyTorch's BuildExtension hipifies CUDA sources and invokes hipcc; it also

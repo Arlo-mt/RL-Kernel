@@ -2,6 +2,28 @@
 # This file is a type stub for the compiled C++ extension module.
 import torch
 
+def ratio_kl_musa_forward(
+    policy: torch.Tensor,
+    reference: torch.Tensor,
+    action: torch.Tensor,
+    mask: torch.Tensor,
+    old_logp: torch.Tensor,
+) -> list[torch.Tensor]: ...
+def ratio_kl_musa_backward(
+    policy: torch.Tensor,
+    action: torch.Tensor,
+    mask: torch.Tensor,
+    ratio: torch.Tensor,
+    diff: torch.Tensor,
+    policy_logz: torch.Tensor,
+    grad_ratio: torch.Tensor,
+    grad_kl: torch.Tensor,
+) -> torch.Tensor: ...
+def grpo_group_advantages_musa(
+    rewards: torch.Tensor,
+    bounds: torch.Tensor,
+    eps: float,
+) -> torch.Tensor: ...
 def deterministic_collective_ipc_meta(
     tensor: torch.Tensor,
 ) -> tuple[list[int], int]: ...
@@ -274,7 +296,9 @@ def rmsnorm_backward_dw(
     mask: torch.Tensor,
 ) -> torch.Tensor: ...
 def deterministic_collective_rocm_ipc_allocate(size_bytes: int) -> torch.Tensor: ...
-def deterministic_collective_rocm_ipc_meta(tensor: torch.Tensor) -> tuple[list[int], int]: ...
+def deterministic_collective_rocm_ipc_meta(
+    tensor: torch.Tensor,
+) -> tuple[list[int], int]: ...
 def deterministic_collective_rocm_ipc_create(
     staging: torch.Tensor,
     handles: list[list[int]],
