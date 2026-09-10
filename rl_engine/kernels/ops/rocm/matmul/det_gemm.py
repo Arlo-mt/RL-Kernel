@@ -13,15 +13,38 @@ import torch
 from rl_engine.kernels.ops.backward_runtime import record_backward
 from rl_engine.kernels.ops.triton.matmul.det_gemm import (
     TritonDetGemmOp,
+    _device_arch,
     _triton_gemm_fp32,
     _triton_tree_gemm,
     deterministic_gemm_triton,
+)
+from rl_engine.kernels.ops.triton.matmul.mfma_gemm import (
+    MFMA_GEMM_CONTRACT_ID,
+    MfmaGemmFn,
+    MfmaLinearFn,
+    mfma_gemm,
+    mfma_linear,
+    mfma_linear_input_gradient,
+    mfma_linear_weight_gradient,
 )
 from rl_engine.runtime_mode import rl_kernel_mode, route_report_enabled
 
 _BACKEND_ENV = "RL_KERNEL_DET_GEMM_BACKEND"
 _AUTO_BACKEND = "auto"
-_TRITON_BACKEND = "triton"
+# ``triton_tree``: scalar-FMA leaves plus the canonical BF16 midpoint K-tree
+# (TP-degree invariant, matches the native reference kernel bit for bit).
+# ``triton_mfma``: pinned-order MFMA accumulation with FP32 chunk partials
+# (batch invariant and train/rollout bitwise on one fixed TP sharding, several
+# times faster).  ``auto`` selects MFMA on gfx942 and the tree elsewhere.
+_TREE_BACKEND = "triton_tree"
+_MFMA_BACKEND = "triton_mfma"
+_TRITON_BACKEND = _TREE_BACKEND
+_BACKEND_ALIASES = {
+    "rocm": _TREE_BACKEND,
+    "triton": _TREE_BACKEND,
+    "tree": _TREE_BACKEND,
+    "mfma": _MFMA_BACKEND,
+}
 _ROUTE_REPORTED = False
 _ROUTE_REPORT_LOCK = Lock()
 _WEIGHT_TRANSPOSE_CACHE: dict[
@@ -34,22 +57,42 @@ _DIRECT_STAGING_SLOT_BY_HANDLE: dict[int, int] = {}
 
 def _requested_det_gemm_backend() -> str:
     value = os.getenv(_BACKEND_ENV, _AUTO_BACKEND).strip().lower()
-    value = {"rocm": _TRITON_BACKEND}.get(value, value)
-    if value not in {_AUTO_BACKEND, _TRITON_BACKEND}:
+    value = _BACKEND_ALIASES.get(value, value)
+    if value not in {_AUTO_BACKEND, _TREE_BACKEND, _MFMA_BACKEND}:
         raise RuntimeError(
-            f"{_BACKEND_ENV} must be '{_AUTO_BACKEND}' or "
-            f"'{_TRITON_BACKEND}' on ROCm, got {value!r}"
+            f"{_BACKEND_ENV} must be '{_AUTO_BACKEND}', '{_TREE_BACKEND}' or "
+            f"'{_MFMA_BACKEND}' on ROCm, got {value!r}"
         )
     return value
 
 
 _REQUESTED_BACKEND = _requested_det_gemm_backend()
+_RESOLVED_BACKEND: str | None = None
+
+
+def _mfma_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return _device_arch(torch.cuda.current_device()) == "gfx942"
+    except Exception:  # pragma: no cover - device query failure
+        return False
 
 
 def det_gemm_backend() -> str:
     """Return the strict ROCm GEMM implementation."""
 
-    return _TRITON_BACKEND
+    global _RESOLVED_BACKEND
+    if _RESOLVED_BACKEND is None:
+        if _REQUESTED_BACKEND == _AUTO_BACKEND:
+            _RESOLVED_BACKEND = _MFMA_BACKEND if _mfma_supported() else _TREE_BACKEND
+        else:
+            _RESOLVED_BACKEND = _REQUESTED_BACKEND
+    return _RESOLVED_BACKEND
+
+
+def _use_mfma() -> bool:
+    return det_gemm_backend() == _MFMA_BACKEND
 
 
 def det_gemm_fallback_reason() -> str | None:
@@ -57,6 +100,8 @@ def det_gemm_fallback_reason() -> str | None:
 
 
 def det_gemm_backend_id() -> str:
+    if _use_mfma():
+        return MFMA_GEMM_CONTRACT_ID
     return "rlkernel.det_gemm.triton_tree_rocm.v1"
 
 
@@ -141,6 +186,9 @@ def det_gemm_linear(
     """Apply a native [N,K] weight through the strict ROCm backend."""
 
     del native_op
+    if _use_mfma():
+        del inference_schedule
+        return mfma_linear(a, weight, out=out)
     return _triton_tree_gemm(
         a,
         _cached_weight_transpose(weight),
@@ -351,6 +399,8 @@ def det_gemm_linear_prepared(
         raise ValueError("prepared deterministic linear weight must be contiguous")
     if out is not None and (torch._C._overlaps(out, a) or torch._C._overlaps(out, weight_t)):
         raise ValueError("prepared deterministic linear output must not alias its inputs")
+    if _use_mfma():
+        return mfma_gemm(a, weight_t, out=out)
     return _triton_tree_gemm(
         a,
         weight_t,
@@ -368,6 +418,8 @@ def det_gemm_linear_input_gradient(
     """Compute ``dX = dY @ weight`` through the strict ROCm backend."""
 
     del native_op
+    if _use_mfma():
+        return mfma_linear_input_gradient(grad_output, weight)
     return deterministic_gemm_triton(grad_output, weight)
 
 
@@ -380,6 +432,8 @@ def det_gemm_linear_weight_gradient(
     """Compute ``dWeight = dY.T @ X`` through the strict ROCm backend."""
 
     del native_op
+    if _use_mfma():
+        return mfma_linear_weight_gradient(a, grad_output)
     return _triton_tree_gemm(
         a.t(),
         grad_output,
@@ -412,7 +466,7 @@ class _DetLinearFn(torch.autograd.Function):
 
 
 class RocmDetGemmOp:
-    """Batch-invariant deterministic GEMM backed by the ROCm Triton tree."""
+    """Batch-invariant deterministic GEMM backed by the selected ROCm Triton path."""
 
     def __init__(self):
         det_gemm_backend()
@@ -424,7 +478,7 @@ class RocmDetGemmOp:
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16, "BF16 only"
         assert a.is_cuda and b.is_cuda, "Inputs must be on ROCm device"
-        return deterministic_gemm_triton(a.contiguous(), b.contiguous())
+        return deterministic_gemm(a, b)
 
     def linear(
         self,
@@ -446,6 +500,8 @@ class RocmDetGemmOp:
             return out
         if not torch.is_grad_enabled() or not (a.requires_grad or weight.requires_grad):
             return _det_gemm_linear_inference(a, weight)
+        if _use_mfma():
+            return MfmaLinearFn.apply(a, weight)
         return _DetLinearFn.apply(a, weight)
 
     def linear_prepared(
@@ -486,9 +542,13 @@ DetGemmOp = RocmDetGemmOp
 
 
 def deterministic_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Functional strict ROCm GEMM entry."""
+    """Functional strict ROCm GEMM entry for ``[M, K] @ [K, N]``."""
 
-    return deterministic_gemm_triton(a, b)
+    if _use_mfma():
+        if torch.is_grad_enabled() and (a.requires_grad or b.requires_grad):
+            return MfmaGemmFn.apply(a, b)
+        return mfma_gemm(a, b)
+    return deterministic_gemm_triton(a.contiguous(), b.contiguous())
 
 
 __all__ = [
