@@ -18,6 +18,14 @@ def _gemm_fp32(a: torch.Tensor, b: torch.Tensor, family: str) -> torch.Tensor:
         return _C.det_gemm_rowwise_fwd_fp32(a.contiguous(), b.contiguous())
     if family == "triton":
         return _triton_gemm(a, b, output_dtype=torch.float32)
+    if family == "musa":
+        if _C is None or not hasattr(_C, "musa_rowwise_gemm_fp32"):
+            raise RuntimeError("MUSA canonical linear requires rowwise FP32 gemm")
+        dtype = torch.float32 if torch.float32 in (a.dtype, b.dtype) else torch.bfloat16
+        return _C.musa_rowwise_gemm_fp32(
+            a.to(dtype).contiguous(),
+            b.to(dtype).contiguous(),
+        )
     raise ValueError(f"unsupported canonical linear family {family!r}")
 
 
@@ -32,7 +40,7 @@ class _CanonicalLinearFn(torch.autograd.Function):
         ctx.parameter_id = str(parameter_id)
         ctx.family = str(family)
         ctx.slot = session.register(ctx.parameter_id, logical_keys)
-        return _gemm_fp32(a.float(), weight.float().t().contiguous(), ctx.family)
+        return _gemm_fp32(a, weight.t().contiguous(), ctx.family)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -57,6 +65,13 @@ class _CanonicalLinearFn(torch.autograd.Function):
                 kernel_id="rl_engine.kernels.ops.triton.matmul.det_gemm._triton_gemm",
                 impl="triton_det_gemm_canonical_rowfold",
                 family="triton",
+            )
+        elif ctx.family == "musa":
+            record_backward(
+                "det_gemm",
+                kernel_id="rl_engine._C.musa_rowwise_gemm_fp32",
+                impl="musa_det_gemm_canonical_rowfold",
+                family="musa",
             )
         return da, dweight, None, None, None
 

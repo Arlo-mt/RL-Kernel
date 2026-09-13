@@ -267,14 +267,17 @@ def validate_backend_provenance(
         )
     profile_contract = profile_contracts[provenance.backend_profile]
     expected_backend = str(profile_contract["backend_family"])
+    allowed_backends = {expected_backend}
+    if provenance.backend_profile == "cuda_bf16" and expected_backend == "cuda":
+        allowed_backends.add("musa")
     for field_name, actual in (
         ("requested_backend", provenance.requested_backend),
         ("actual_backend", provenance.actual_backend),
     ):
-        if actual != expected_backend:
+        if actual not in allowed_backends:
             raise ContractResolveError(
                 f"backend provenance mismatch for {field_name}: expected "
-                f"{expected_backend!r}, got {actual!r}"
+                f"one of {sorted(allowed_backends)!r}, got {actual!r}"
             )
 
     expected_dtypes = {

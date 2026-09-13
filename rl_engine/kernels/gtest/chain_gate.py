@@ -209,7 +209,12 @@ def build_model(
 ) -> Qwen3DenseBIModel:
     m = manifest if manifest is not None else load_manifest()
     spec = Qwen3DenseSpec.from_manifest(m)
-    ops = load_profile_ops(backend_profile, m, allow_pytorch_gold=allow_pytorch_gold)
+    ops = load_profile_ops(
+        backend_profile,
+        m,
+        allow_pytorch_gold=allow_pytorch_gold,
+        device=device,
+    )
     if weights_mode == "synthetic":
         weights = Qwen3DenseWeights.synthetic(spec, device=device, dtype=dtype, seed=m.seed)
     elif weights_mode in {"hf", "required"}:
@@ -257,6 +262,8 @@ def run_fp32_reference_cell(
     del reference
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif device.type == "musa" and hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.empty_cache()
     return cell
 
 
@@ -281,6 +288,8 @@ def run_chain_gate(
     torch.manual_seed(resolved_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(resolved_seed)
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        torch.musa.manual_seed_all(resolved_seed)
 
     reset_backward_runtime()
     _configure_required_gradients(model, enabled=run_backward)
@@ -581,7 +590,13 @@ def run_chain_gate(
         decode_prefill,
     )
 
-    family = str(m.backend_profiles[backend_profile]["backend_family"])
+    profile_family = str(m.backend_profiles[backend_profile]["backend_family"])
+    device = _device(model)
+    family = (
+        "musa"
+        if device.type == "musa" and backend_profile == "cuda_bf16"
+        else profile_family
+    )
     runtime_observations = model.profile_ops.validated_runtime_observations()
     observed_families = {
         _backend_family(str(value["actual_backend"])) for value in runtime_observations.values()
@@ -623,7 +638,6 @@ def run_chain_gate(
         actual_backend=family,
         output_dtype=policy.output_dtype_default,
     )
-    device = next(iter(model.weights.tensors.values())).device
     cc = None
     if device.type == "cuda" and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device)
@@ -1583,9 +1597,11 @@ def _logp_aggregate_verdict(
 
 
 def _gpu_name(device: torch.device) -> str | None:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_name(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device)
+    if device.type == "musa" and hasattr(torch, "musa") and torch.musa.is_available():
+        return torch.musa.get_device_name(device)
+    return None
 
 
 def _workflow_url() -> str | None:

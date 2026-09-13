@@ -83,9 +83,13 @@ def _file_sha(path: pathlib.Path) -> str:
 
 def main() -> int:
     args = parse_args()
-    if not torch.cuda.is_available():
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch, "musa") and torch.musa.is_available():
+        device = torch.device("musa")
+    else:
         print(
-            "ERROR: C10/C11 full-model gate requires CUDA; CPU-only is not a pass",
+            "ERROR: C10/C11 full-model gate requires CUDA or MUSA; CPU-only is not a pass",
             file=sys.stderr,
         )
         return 2
@@ -100,7 +104,6 @@ def main() -> int:
     contract = load_contract()
     execution_seed = manifest.seed if args.seed is None else int(args.seed)
     log_stream = sys.stderr if args.json else sys.stdout
-    device = torch.device("cuda")
     with contextlib.redirect_stdout(log_stream):
         reference_cell = run_fp32_reference_cell(
             backend_profile=args.backend_profile,

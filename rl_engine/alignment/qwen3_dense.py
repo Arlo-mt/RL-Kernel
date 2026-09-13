@@ -27,7 +27,11 @@ from rl_engine.kernels.ops.canonical_lm_head import (
     canonical_cuda_lm_head_fp32,
     canonical_row_lm_head,
 )
-from rl_engine.kernels.ops.canonical_rmsnorm import canonical_cuda_rmsnorm, canonical_row_rmsnorm
+from rl_engine.kernels.ops.canonical_rmsnorm import (
+    canonical_cuda_rmsnorm,
+    canonical_musa_rmsnorm,
+    canonical_row_rmsnorm,
+)
 from rl_engine.kernels.ops.pytorch.attention.stateful_kv import StatefulKVCache
 from rl_engine.testing.ws1_workload import WS1Manifest, load_manifest, weight_snapshot_hash
 
@@ -285,7 +289,7 @@ class ProfileOps:
             )
         if not isinstance(output, torch.Tensor):
             raise TypeError(f"profile node {kind!r} did not return a Tensor")
-        if declared["status"] != "gold_reference" and output.device.type != "cuda":
+        if declared["status"] != "gold_reference" and output.device.type not in {"cuda", "musa"}:
             raise RuntimeError(
                 f"profile {self.backend_profile!r} node {kind!r} returned "
                 f"non-CUDA output on {output.device}"
@@ -327,6 +331,7 @@ def load_profile_ops(
     manifest: WS1Manifest | None = None,
     *,
     allow_pytorch_gold: bool = False,
+    device: torch.device | str | None = None,
 ) -> ProfileOps:
     """Load C2-declared candidates. Missing required nodes are red, not N/A."""
 
@@ -344,8 +349,10 @@ def load_profile_ops(
         "rope": "rope",
         "attention": "attention",
         "swiglu": "swiglu",
+        "silu": "silu",
         "lm_head": "lm_head",
         "logprob": "logp",
+        "batch_invariant_logp": "batch_invariant_logp",
     }
     for kind, adapter_name in kind_to_adapter.items():
         if allow_pytorch_gold:
@@ -362,6 +369,7 @@ def load_profile_ops(
             _adapter_stub(adapter_name, kind if kind != "logprob" else "logprob"),
             backend_profile,
             m,
+            runtime_device=device,
         )
         status = str(resolved["status"])
         if status == "missing_required":
@@ -375,10 +383,17 @@ def load_profile_ops(
             raise RuntimeError(
                 f"profile {backend_profile!r} node {kind!r} has no declared candidate path"
             )
-        if _family(str(expected)) != family:
+        runtime_family = (
+            "musa"
+            if device is not None
+            and torch.device(device).type == "musa"
+            and backend_profile == "cuda_bf16"
+            else family
+        )
+        if _family(str(expected)) != runtime_family:
             raise RuntimeError(
                 f"profile {backend_profile!r} node {kind!r} candidate {expected!r} "
-                f"is not family {family!r}"
+                f"is not family {runtime_family!r}"
             )
         ops[kind] = _load_object(str(path))()
         provenance[kind] = {
@@ -628,6 +643,9 @@ class Qwen3DenseBIModel:
     def node_names(self) -> tuple[str, ...]:
         return self.spec.node_names()
 
+    def _candidate_input(self, value: torch.Tensor) -> torch.Tensor:
+        return value.to(dtype=self.execution_dtype)
+
     def allocate_cache(self, batch: int, max_seq_len: int, device: torch.device) -> StatefulKVCache:
         return StatefulKVCache.allocate(
             n_layers=self.spec.num_hidden_layers,
@@ -691,7 +709,7 @@ class Qwen3DenseBIModel:
                 segment_lengths=segment_lengths,
             )
         hidden = self._rms(
-            hidden.to(dtype=self.execution_dtype),
+            self._candidate_input(hidden),
             self.weights["norm.weight"],
             node="final_layernorm",
         )
@@ -721,6 +739,20 @@ class Qwen3DenseBIModel:
                 keys.reshape(-1, 2),
                 forward_op=lm_head_op.forward_fp32,
                 matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+            )
+        elif (
+            torch.is_grad_enabled()
+            and active_session() is not None
+            and keys is not None
+            and lm_family == "musa"
+        ):
+            score_logits = canonical_row_lm_head(
+                hidden,
+                self.weights["lm_head.weight"],
+                keys.reshape(-1, 2),
+                forward_op=lm_head_op.forward_fp32,
+                matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+                family="musa",
             )
         else:
             score_logits = lm_head_op.forward_fp32(
@@ -797,7 +829,7 @@ class Qwen3DenseBIModel:
             for hidden, (start, end) in zip(hidden_parts, chunks, strict=True):
                 self._current_logical_keys = logical_keys[:, start:end]
                 normed = self._rms(
-                    hidden.to(dtype=self.execution_dtype),
+                    self._candidate_input(hidden),
                     self.weights[f"{prefix}.input_layernorm.weight"],
                     node=f"{prefix}.input_layernorm",
                 )
@@ -863,7 +895,7 @@ class Qwen3DenseBIModel:
                     f"{prefix}.residual_attn", hidden + projected.to(dtype=hidden.dtype)
                 )
                 mlp_in = self._rms(
-                    hidden.to(dtype=self.execution_dtype),
+                    self._candidate_input(hidden),
                     self.weights[f"{prefix}.post_attention_layernorm.weight"],
                     node=f"{prefix}.post_attention_layernorm",
                 )
@@ -910,7 +942,7 @@ class Qwen3DenseBIModel:
             keys = logical_keys[:, start:end]
             self._current_logical_keys = keys
             final_hidden = self._rms(
-                hidden.to(dtype=self.execution_dtype),
+                self._candidate_input(hidden),
                 self.weights["norm.weight"],
                 node="final_layernorm",
             )
@@ -927,6 +959,15 @@ class Qwen3DenseBIModel:
                     keys.reshape(-1, 2),
                     forward_op=lm_head_op.forward_fp32,
                     matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+                )
+            elif active_session() is not None and lm_family == "musa":
+                score_logits = canonical_row_lm_head(
+                    final_hidden,
+                    self.weights["lm_head.weight"],
+                    keys.reshape(-1, 2),
+                    forward_op=lm_head_op.forward_fp32,
+                    matmul_op=self.profile_ops.get("det_gemm").forward_accum_fp32,
+                    family="musa",
                 )
             else:
                 score_logits = lm_head_op.forward_fp32(
@@ -1035,7 +1076,7 @@ class Qwen3DenseBIModel:
     ) -> torch.Tensor:
         prefix = f"layers.{layer}"
         normed = self._rms(
-            hidden.to(dtype=self.execution_dtype),
+            self._candidate_input(hidden),
             self.weights[f"{prefix}.input_layernorm.weight"],
             node=f"{prefix}.input_layernorm",
         )
@@ -1094,7 +1135,7 @@ class Qwen3DenseBIModel:
         )
         hidden = self._record(f"{prefix}.residual_attn", hidden + projected.to(dtype=hidden.dtype))
         mlp_in = self._rms(
-            hidden.to(dtype=self.execution_dtype),
+            self._candidate_input(hidden),
             self.weights[f"{prefix}.post_attention_layernorm.weight"],
             node=f"{prefix}.post_attention_layernorm",
         )
@@ -1139,10 +1180,10 @@ class Qwen3DenseBIModel:
         # projection. Public node values remain BF16; selected composite
         # edges may retain the FP32 accumulator internally.
         op = self.profile_ops.get("det_gemm")
+        family = self.profile_ops.provenance["det_gemm"]["actual_backend"]
         if self.execution_dtype == torch.bfloat16:
             keys = getattr(self, "_current_logical_keys", None)
             if torch.is_grad_enabled() and active_session() is not None and keys is not None:
-                family = self.profile_ops.provenance["det_gemm"]["actual_backend"]
                 out = canonical_linear_fp32(
                     flat,
                     weight,
@@ -1188,6 +1229,14 @@ class Qwen3DenseBIModel:
                     parameter_id=node,
                     forward_op=op.forward,
                 ).view_as(x)
+            elif family == "musa":
+                out = canonical_musa_rmsnorm(
+                    x_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=row_keys,
+                    parameter_id=node,
+                ).view_as(x)
             else:
                 out = op.forward(x, weight, eps=self.spec.rms_norm_eps)
         else:
@@ -1230,6 +1279,14 @@ class Qwen3DenseBIModel:
                     logical_keys=head_keys,
                     parameter_id=node,
                     forward_op=op.forward,
+                ).view_as(flat)
+            elif family == "musa":
+                out = canonical_musa_rmsnorm(
+                    flat_rows,
+                    weight.contiguous(),
+                    eps=self.spec.rms_norm_eps,
+                    logical_keys=head_keys,
+                    parameter_id=node,
                 ).view_as(flat)
             else:
                 out = op.forward(flat, weight, eps=self.spec.rms_norm_eps)

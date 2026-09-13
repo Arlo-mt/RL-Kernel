@@ -58,7 +58,7 @@ def canonical_cuda_rmsnorm(
     return _CanonicalCudaRMSNorm.apply(x, weight, eps, logical_keys, parameter_id)
 
 
-__all__ = ["canonical_cuda_rmsnorm"]
+__all__ = ["canonical_cuda_rmsnorm", "canonical_musa_rmsnorm"]
 
 
 class _CanonicalRowRMSNorm(torch.autograd.Function):
@@ -108,3 +108,51 @@ def canonical_row_rmsnorm(
     forward_op,
 ) -> torch.Tensor:
     return _CanonicalRowRMSNorm.apply(x, weight, eps, logical_keys, parameter_id, forward_op)
+
+
+class _CanonicalMusaRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, eps, logical_keys, parameter_id):
+        session = active_session()
+        if session is None:
+            raise RuntimeError("canonical RMSNorm requires an active backward session")
+        output, rstd = _C.musa_rmsnorm_forward(
+            x.contiguous(), weight.contiguous(), float(eps), False
+        )
+        ctx.save_for_backward(x, weight, rstd)
+        ctx.session = session
+        ctx.parameter_id = str(parameter_id)
+        ctx.slot = session.register(ctx.parameter_id, logical_keys)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, rstd = ctx.saved_tensors
+        dx, _ = _C.musa_rmsnorm_backward(
+            grad_out.to(x.dtype).contiguous(), x, weight, rstd
+        )
+        rows = grad_out.float() * x.float() * rstd.float().unsqueeze(-1)
+        dw = ctx.session.submit_rows(
+            ctx.parameter_id,
+            ctx.slot,
+            rows,
+            lambda ordered: reduce_rows_fp32(ordered).to(weight.dtype),
+        )
+        record_backward(
+            "rms_norm",
+            kernel_id="rl_engine._C.musa_rmsnorm_backward",
+            impl="musa_rmsnorm_canonical_rowfold",
+            family="musa",
+        )
+        return dx, dw, None, None, None
+
+
+def canonical_musa_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    logical_keys: torch.Tensor,
+    parameter_id: str,
+) -> torch.Tensor:
+    return _CanonicalMusaRMSNorm.apply(x, weight, eps, logical_keys, parameter_id)

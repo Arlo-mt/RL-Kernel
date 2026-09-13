@@ -10,13 +10,14 @@ from collections.abc import Callable
 import torch
 
 from rl_engine.kernels.ops.backward_runtime import record_backward
+from rl_engine.kernels.ops.base import _C
 from rl_engine.kernels.ops.canonical_backward import active_session
 
 
 def _canonical_embedding_family(family: str) -> str:
     requested = str(family)
     normalized = "cuda" if requested.startswith("cuda") else requested
-    if normalized not in {"cuda", "pytorch", "triton"}:
+    if normalized not in {"cuda", "musa", "pytorch", "triton"}:
         raise RuntimeError(f"unsupported canonical embedding backend family: {requested!r}")
     return normalized
 
@@ -38,6 +39,19 @@ def _reduce_embedding_grad_weight(
             weight_shape=weight_shape,
             weight_dtype=weight_dtype,
         )
+
+    if family == "musa":
+        if _C is None or not hasattr(_C, "musa_embedding_backward"):
+            raise RuntimeError("MUSA canonical embedding requires musa_embedding_backward")
+        ids_1d = ids.reshape(-1).to(dtype=torch.long).contiguous()
+        rows_2d = grad_rows.reshape(-1, grad_rows.shape[-1]).contiguous()
+        order = torch.argsort(ids_1d, stable=True)
+        return _C.musa_embedding_backward(
+            ids_1d.index_select(0, order),
+            rows_2d.index_select(0, order),
+            int(weight_shape[0]),
+            int(weight_shape[1]),
+        ).to(weight_dtype)
 
     if family not in {"cuda", "pytorch"}:
         raise RuntimeError(f"unsupported canonical embedding backend family: {family!r}")
@@ -121,8 +135,12 @@ class _CanonicalEmbeddingFunction(torch.autograd.Function):
                     "rl_engine.kernels.ops.triton.linear.embedding._embedding_bwd"
                     if ctx.family == "triton"
                     else (
-                        "rl_engine.kernels.ops.cuda.linear.embedding."
-                        "_deterministic_embedding_grad_weight"
+                        "rl_engine._C.musa_embedding_backward"
+                        if ctx.family == "musa"
+                        else (
+                            "rl_engine.kernels.ops.cuda.linear.embedding."
+                            "_deterministic_embedding_grad_weight"
+                        )
                     )
                 ),
                 impl=f"{ctx.family}_embedding_canonical_rowfold",

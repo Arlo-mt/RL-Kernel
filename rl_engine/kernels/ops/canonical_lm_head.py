@@ -61,7 +61,16 @@ __all__ = ["canonical_cuda_lm_head_fp32"]
 
 class _CanonicalRowLMHead(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, logical_keys, parameter_id, forward_op, matmul_op):
+    def forward(
+        ctx,
+        hidden,
+        weight,
+        logical_keys,
+        parameter_id,
+        forward_op,
+        matmul_op,
+        family,
+    ):
         session = active_session()
         if session is None:
             raise RuntimeError("canonical LM-head requires an active backward session")
@@ -72,6 +81,7 @@ class _CanonicalRowLMHead(torch.autograd.Function):
         ctx.parameter_id = str(parameter_id)
         ctx.slot = session.register(ctx.parameter_id, logical_keys)
         ctx.matmul_op = matmul_op
+        ctx.family = str(family)
         return output
 
     @staticmethod
@@ -94,11 +104,15 @@ class _CanonicalRowLMHead(torch.autograd.Function):
         )
         record_backward(
             "lm_head",
-            kernel_id="rl_engine.kernels.ops.triton.matmul.det_gemm._triton_gemm",
-            impl="triton_lm_head_canonical_rowfold",
-            family="triton",
+            kernel_id=(
+                "rl_engine._C.musa_rowwise_gemm_fp32"
+                if ctx.family == "musa"
+                else "rl_engine.kernels.ops.triton.matmul.det_gemm._triton_gemm"
+            ),
+            impl=f"{ctx.family}_lm_head_canonical_rowfold",
+            family=ctx.family,
         )
-        return grad_hidden, grad_weight, None, None, None, None
+        return grad_hidden, grad_weight, None, None, None, None, None
 
 
 def canonical_row_lm_head(
@@ -109,7 +123,14 @@ def canonical_row_lm_head(
     forward_op,
     matmul_op,
     parameter_id: str = "lm_head",
+    family: str = "triton",
 ) -> torch.Tensor:
     return _CanonicalRowLMHead.apply(
-        hidden, weight, logical_keys, parameter_id, forward_op, matmul_op
+        hidden,
+        weight,
+        logical_keys,
+        parameter_id,
+        forward_op,
+        matmul_op,
+        family,
     )

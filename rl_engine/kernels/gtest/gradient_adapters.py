@@ -1229,6 +1229,8 @@ def resolve_profile_candidate(
     adapter: GradientAdapterSpec,
     profile: str,
     manifest: WS1Manifest | None = None,
+    *,
+    runtime_device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     m = manifest if manifest is not None else load_manifest()
     if adapter.requirement == "absent_not_required":
@@ -1263,6 +1265,14 @@ def resolve_profile_candidate(
     if adapter.spec_name and expected:
         spec = OP_SPECS[adapter.spec_name]
         path = spec.candidate_paths.get(str(expected))
+        if (
+            runtime_device is not None
+            and torch.device(runtime_device).type == "musa"
+            and profile == "cuda_bf16"
+            and "musa" in spec.candidate_paths
+        ):
+            expected = "musa"
+            path = spec.candidate_paths["musa"]
     return {
         "status": status,
         "expected_backend_id": expected,

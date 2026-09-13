@@ -248,9 +248,12 @@ def make_profile_provenance(
 ) -> BackendProvenance:
     policy = resolve_dtype_policy(contract)
     family = str(contract["policy"]["backend_profile_contracts"][backend_profile]["backend_family"])
+    allowed_families = {family}
+    if backend_profile == "cuda_bf16" and family == "cuda":
+        allowed_families.add("musa")
     if (
-        _candidate_family(actual_backend) != family
-        or _candidate_family(requested_backend) != family
+        _candidate_family(actual_backend) not in allowed_families
+        or _candidate_family(requested_backend) not in allowed_families
     ):
         raise RuntimeError(
             f"silent/cross-profile fallback: requested={requested_backend!r} "
@@ -258,8 +261,8 @@ def make_profile_provenance(
         )
     provenance = BackendProvenance(
         backend_profile=backend_profile,
-        requested_backend=family,
-        actual_backend=family,
+        requested_backend=str(requested_backend),
+        actual_backend=str(actual_backend),
         execution_dtype=policy.execution_dtype,
         accumulation_dtype=policy.accumulation_dtype,
         output_dtype=policy.output_dtype_default,
