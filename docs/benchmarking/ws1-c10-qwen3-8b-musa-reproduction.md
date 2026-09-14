@@ -12,9 +12,8 @@ Commit: c2653f47850d4a86b59dd2318e632218a690905f
 
 ```bash
 git clone --branch musa-native-qwen3-8b-dense \
-  https://github.com/Arlo-mt/RL-Kernel.git \
-  /home/dist/RL-Kernel-native-qwen3-8B-dense
-cd /home/dist/RL-Kernel-native-qwen3-8B-dense
+  https://github.com/Arlo-mt/RL-Kernel.git
+cd RL-Kernel
 git switch --detach c2653f47850d4a86b59dd2318e632218a690905f
 git rev-parse HEAD
 ```
