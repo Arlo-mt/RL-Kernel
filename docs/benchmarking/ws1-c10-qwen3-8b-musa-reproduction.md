@@ -10,22 +10,9 @@ Commit: c2653f47850d4a86b59dd2318e632218a690905f
 
 ## 1. 获取代码
 
-远程服务器不能访问 GitHub 时，在可访问 GitHub 的本地机器执行：
-
 ```bash
-git clone https://github.com/Arlo-mt/RL-Kernel.git
-cd RL-Kernel
-git fetch origin musa-native-qwen3-8b-dense
-git bundle create /tmp/rl-kernel-musa-native-qwen3-8b-dense.bundle \
-  origin/musa-native-qwen3-8b-dense
-scp -P 62216 /tmp/rl-kernel-musa-native-qwen3-8b-dense.bundle \
-  root@10.20.35.3:/tmp/
-```
-
-在 MUSA 服务器执行：
-
-```bash
-git clone /tmp/rl-kernel-musa-native-qwen3-8b-dense.bundle \
+git clone --branch musa-native-qwen3-8b-dense \
+  https://github.com/Arlo-mt/RL-Kernel.git \
   /home/dist/RL-Kernel-native-qwen3-8B-dense
 cd /home/dist/RL-Kernel-native-qwen3-8B-dense
 git switch --detach c2653f47850d4a86b59dd2318e632218a690905f
